@@ -1090,6 +1090,9 @@ def test_a_bios_added_later_re_renders_the_covers(app, tmp_path, monkeypatch):
     monkeypatch.setattr(shell, "THUMB_DIR", tmp_path / "thumbnails")
     monkeypatch.setattr(shell, "COVER_DIR", tmp_path / "covers")
     monkeypatch.setattr(shell, "DEFAULT_BIOS", tmp_path / "no-such-bios.bin")
+    # Also point the clean-room HLE fallback at nothing: otherwise `_resolve_bios`
+    # returns hle_bios/bios_hle.bin and this "no BIOS at all" case never happens.
+    monkeypatch.setattr(shell, "HLE_BIOS", tmp_path / "no-such-hle.bin")
     roms = tmp_path / "roms"
     roms.mkdir()
     (roms / "Game.ngc").write_bytes(b"\xff" * 64)
