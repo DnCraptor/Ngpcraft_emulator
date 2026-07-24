@@ -1,0 +1,7 @@
+# Build intermediates -- bios_hle.bin (the distributable image) IS tracked.
+build/
+src/crt0.asm
+*.abs
+*.s24
+*.map
+*.rel

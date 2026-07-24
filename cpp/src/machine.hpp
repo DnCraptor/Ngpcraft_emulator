@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <vector>
 
 #include "ngpc_core.h"
@@ -118,6 +119,28 @@ constexpr uint32_t kAdcCyclesLowSpeed  = 320 * 2;
 /* INTAD is vector value 0x0070 (Table 3.3 (1)) => table entry 0x70/4 = 28. */
 constexpr unsigned kIrqVectorIndexIntAd = 28;
 constexpr uint8_t  kIrqLevelIntAd       = 4;
+/* SERIAL channel 0 == the LINK CABLE. Vector values 0x18/0x19 (ngpcspec.txt IRQ
+ * table; the same numbering as VBlank=0x0B, Timer0=0x10) => table entries at
+ * 0xFFFF60 and 0xFFFF64, which the retail BIOS fills with real handlers. Their
+ * programmable level lives in INTES0 (0x77), which COMINIT sets to 0xEE (both
+ * level 6).
+ *
+ * ⚠️ WE RAISE BY BEHAVIOUR, NOT BY NAME -- the handlers are CROSS-WIRED versus the
+ * SDK's "INTTX0"/"INTRX0" labels, verified by disassembling this BIOS:
+ *   vector 0x18 (SDK "INTTX0", hook 0x6FE4 -> 0xFF2D03 -> 0xFF2C4D):
+ *       `ld (RXring+W),(0x50)` -- it READS SC0BUF into the RX ring. RECEIVE.
+ *   vector 0x19 (SDK "INTRX0", hook 0x6FE8 -> 0xFF2CF9 -> 0xFF2C17):
+ *       `ld (0x50),(TXring+W)` -- it WRITES the next TX byte to SC0BUF. TRANSMIT.
+ * Raising the vector by its SDK name gets you the opposite handler: raising 0x18
+ * on a transmit made the receive handler read our own just-sent byte back into
+ * the RX ring -- a self-loopback (measured: the console received its own pad). */
+constexpr unsigned kIrqVectorSerialReceive  = 0x18;  /* handler FILLS the RX ring   */
+constexpr unsigned kIrqVectorSerialTransmit = 0x19;  /* handler DRAINS the TX ring   */
+/* One byte at 19200 bps, 8N1 (10 bit-times) with the CPU at 6.144 MHz
+ * (515 * 199 * 60): 6_144_000 / 1920 ~= 3200 cycles. APPROXIMATE -- flow control
+ * (RTS) and the 64-byte BIOS rings absorb any drift, so exact baud is not load-
+ * bearing for correctness; see PERF_TIMING_POLICY.md. */
+constexpr int32_t kSerialByteCycles = 3200;
 /* 10-bit full scale. An emulator has no cell, so we model a healthy one; a flat
  * reading would make the BIOS power the console off (see above). */
 constexpr uint16_t kAdcFullScale = 0x03FF;
@@ -319,6 +342,13 @@ inline bool irq_priority_register(unsigned vector_index, IrqPriorityReg& out) {
          * not ours to fix. */
         case 11: out = {0x0071, false}; return true;   // INT4  == VBlank
         case 12: out = {0x0071, true};  return true;   // INT5
+        /* Serial channel 0 == the link cable. Both levels live in INTES0 (0x77):
+         * high nibble = the 0x18 vector, low nibble = the 0x19 vector (INT.H:
+         * ITX0M=0x70, IRX0M=0x07). COMINIT writes 0xEE (both level 6), so the
+         * nibble split is moot here, but kept faithful. (The HANDLERS these
+         * vectors run are cross-wired vs their names -- see the vector constants.) */
+        case kIrqVectorSerialReceive:  out = {0x0077, true};  return true;  // vector 0x18
+        case kIrqVectorSerialTransmit: out = {0x0077, false}; return true;  // vector 0x19
         /* Micro-DMA transfer-end levels. The NGPC keeps INTETC01/INTETC23 at 0x79/0x7A
          * (not the generic H1 core's 0xF0/0xF1): the BIOS's INTLVSET routine writes 0x79
          * here -- observed writing 0x09 (level 1) for Ogre Battle's channel-0 raster ISR. */
@@ -578,6 +608,43 @@ struct Machine {
     bool     adc_busy = false;
     void adc_tick(uint32_t cycles);
 
+    /* --- serial channel 0 (SC0) == THE LINK CABLE, I/O 0x50-0x53 -------------
+     * The NGPC link cable is TLCS-900 serial channel 0, driven by the SNK BIOS
+     * COM routines. Games never touch SC0 directly: they call the BIOS, whose
+     * TX/RX interrupt handlers move bytes between a 64-byte ring in RAM
+     * (0x6C80 TX / 0x6CC0 RX) and SC0BUF (0x50). We model the cable as a byte
+     * pipe with two FIFOs a host bridges (in-process for 2-player-on-one-PC, or
+     * over a socket for online):
+     *   - `serial_tx` : bytes this machine has transmitted (host drains -> peer)
+     *   - `serial_rx` : bytes queued for this machine to receive (host fills)
+     * A byte the BIOS writes to SC0BUF is captured (io_action_write), pushed to
+     * serial_tx after one baud-time, then INTTX0 is raised so the BIOS fetches
+     * the next; a byte in serial_rx is presented at SC0BUF (read8) and INTRX0
+     * raised so the BIOS files it in the ring. Flow control: RTS = port 0xB2
+     * bit0 (0 = ready to receive, set by COMONRTS). Disabled by default -> the
+     * registers stay inert and the cable reads as unplugged, unchanged from
+     * before. See specs/LINK_CABLE.md and reference-ngpc-link-cable-serial-bios. */
+    bool     serial_link_enabled = false;
+    std::deque<uint8_t> serial_tx;
+    std::deque<uint8_t> serial_rx;
+    bool     serial_tx_busy = false;
+    uint8_t  serial_tx_byte = 0;
+    int32_t  serial_tx_cycles = 0;
+    /* CTS0 handshake input (TMP95C061 datasheet 3.11): when SC0MOD<CTSE> (bit6) is
+     * set, the transmitter HALTS a queued byte while CTS0 is HIGH and only shifts it
+     * out -- raising INTTX0 -- once CTS0 goes LOW. CTS0 is not a readable register; it
+     * is a hardware pin wired to the PEER's RTS (any GPIO; on NGPC RTS = 0xB2 bit0).
+     * A host bridging two machines drives this from the peer's RTS (ngpc_serial_set_cts).
+     * Default false (LOW = transferable) so a lone machine / CTSE-disabled game is
+     * unchanged. This is what lets Card Fighters' Clash's mutual handshake sync. */
+    bool     serial_cts_high = false;
+    /* Mutable: read8 is const, but the RX-buffer read is an ACKNOWLEDGE (it clears
+     * the presented byte so the next can arrive -- the hardware's overrun guard). */
+    mutable bool    serial_rx_pending = false;
+    mutable uint8_t serial_rx_byte = 0;
+    int32_t  serial_rx_cycles = 0;
+    void serial_tick(uint32_t cycles);
+
     /* --- the on-board calendar IC (RTC), I/O 0x90..0x97 --------------------
      * A Neo Geo Pocket keeps a real-time clock alive on the coin cell. The BIOS
      * reads it at power-on; a lost/invalid clock is how it decides the coin cell
@@ -826,6 +893,10 @@ struct Machine {
          * write happened to leave in the I/O page. 0x98-0x9A are the alarm's
          * day/hour/minute -- part of the same chip, so they answer from it too. */
         if (a >= 0x90 && a <= 0x9A) return rtc_read(a);
+        /* SC0BUF (0x50): when the link is presenting a received byte, reading it
+         * IS the RX handler consuming it -- return it and clear the pending flag
+         * (the overrun guard). Otherwise it is a plain I/O byte. */
+        if (a == 0x000050 && serial_rx_pending) { serial_rx_pending = false; return serial_rx_byte; }
         /* Port 0xB1: bit1 = the CR2032 SUB-BATTERY, bit2 = a must-be-1 line (drop it and
          * SNK Gals' Fighter reports a link error). Leaving them 0 is the whole
          * "SUB BATTERY DEAD" loop -- the BIOS reads a dead coin cell and never leaves
@@ -838,7 +909,26 @@ struct Machine {
          * INT0 rather than as an NMI, and a core that chose the NMI would want the
          * opposite level. Trust the render, not a polarity carried over from a
          * different model. So force only bits 1 and 2. */
-        if (a == 0x0000B1) return uint8_t(mem[a] | 0x06);
+        if (a == 0x0000B1) {
+            /* bit1 = the CR2032 sub-battery (always 1). bit2 = the link-cable DETECT
+             * line: it reads 1 when nothing is plugged (idle) and 0 when a peer console
+             * is connected through the cable. Card Fighters' Clash gates its handshake
+             * transmission on bit2 == 0 (at 0x24065A: ld A,(0xB1); and 0x04; srl 2; the
+             * coroutine does `cp A,1; ret Z`), so it can only ever become the link
+             * initiator once it detects a cable -- with bit2 stuck at 1 it waits forever
+             * ("EITHER PLAYER MUST PUSH A" never advances). Model bit2 from
+             * serial_link_enabled, which the link layer arms exactly when a cable is
+             * wired. With no cable bit2 stays 1 (SNK Gals' Fighter needs that: bit2 = 0
+             * with no peer makes it report a link error). See project memory
+             * project_ngpc_emulator_cfc_link_stall. */
+            uint8_t v = uint8_t(mem[a] | 0x02);
+            /* bit2 is an INPUT line, so force it from the cable state -- never let a
+             * value the game left in the I/O page decide it (a savestate restore can
+             * leave bit2 set in mem). Cable present => 0, absent => 1. */
+            if (serial_link_enabled) v &= uint8_t(~0x04);
+            else                     v |= 0x04;
+            return v;
+        }
         /* Slow cart flash: every byte the CPU reads from a cartridge window costs
          * wait-states. Sequential instruction fetch (inside the fetch window) is cheap;
          * a random data read pays cart_data_wait. Accumulated here and folded into the

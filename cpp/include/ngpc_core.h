@@ -344,6 +344,18 @@ typedef struct {
  * register, the compatibility palette) has to be hand-synthesised instead. */
 NGPC_API void ngpc_raise_irq(ngpc_t*, uint32_t vector_index);
 
+/* --- link cable (serial channel 0) ----------------------------------------
+ * The NGPC link cable is TLCS-900 serial channel 0, driven by the BIOS COM
+ * routines. The cable is a byte pipe: a host wires two machines together by
+ * draining each one's transmit FIFO and pushing it into the other's receive
+ * FIFO (in-process for two-players-on-one-PC, or over a socket for online).
+ * Enable is off by default (registers inert, cable unplugged). */
+NGPC_API void     ngpc_serial_set_enabled(ngpc_t*, int on);
+NGPC_API uint32_t ngpc_serial_read_tx(ngpc_t*, uint8_t* out, uint32_t max);
+NGPC_API void     ngpc_serial_write_rx(ngpc_t*, const uint8_t* data, uint32_t n);
+NGPC_API int      ngpc_serial_rts(ngpc_t*);
+NGPC_API void     ngpc_serial_set_cts(ngpc_t*, int high);
+
 /* The prescaler's phi-T1 period, in CPU cycles. THE SOURCES CONTRADICT EACH OTHER
  * BY A FACTOR OF 32 and neither yields a musical tempo, so this is a knob, not a
  * constant, until an ear or a capture settles it:

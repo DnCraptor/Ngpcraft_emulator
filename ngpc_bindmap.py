@@ -65,9 +65,10 @@ class BindMap(QWidget):
 
     changed = pyqtSignal()      # a binding was rebound; the shell re-applies input
 
-    def __init__(self, settings) -> None:
+    def __init__(self, settings, player: int = 1) -> None:
         super().__init__()
         self._settings = settings
+        self._player = player
         self._art = QPixmap(str(ART)) if ART.is_file() else QPixmap()
         self.buttons: dict[str, cfg.KeyCaptureButton] = {}
         self._captions: dict[str, QLabel] = {}
@@ -86,14 +87,15 @@ class BindMap(QWidget):
                 self._power.setObjectName("bindDead")
                 self._power.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 continue
-            code = int(settings.value(f"input/{label}",
-                                      cfg.DEFAULT_KEYS.get(label, 0), type=int))
+            code = int(settings.value(cfg._binding_key(label, self._player),
+                                      cfg._default_keys(self._player).get(label, 0),
+                                      type=int))
             btn = cfg.KeyCaptureButton(code)
             btn.setObjectName("bindField")
             btn.setParent(self)
 
             def persist(new_code: int, lbl=label) -> None:
-                cfg.set_binding(self._settings, lbl, int(new_code))
+                cfg.set_binding(self._settings, lbl, int(new_code), self._player)
                 self._settings.sync()
                 self.changed.emit()
             btn.captured.connect(persist)
@@ -213,10 +215,18 @@ class BindMap(QWidget):
     def refresh(self) -> None:
         """Re-read every binding from settings (after a 'restore defaults')."""
         for label, btn in self.buttons.items():
-            code = int(self._settings.value(f"input/{label}",
-                                            cfg.DEFAULT_KEYS.get(label, 0), type=int))
+            code = int(self._settings.value(cfg._binding_key(label, self._player),
+                                            cfg._default_keys(self._player).get(label, 0),
+                                            type=int))
             btn._key = code          # noqa: SLF001 -- same module family
             btn._render()            # noqa: SLF001
+
+    def set_player(self, player: int) -> None:
+        """Switch which player's layout this map shows and edits."""
+        if player == self._player:
+            return
+        self._player = player
+        self.refresh()
 
 
 def _spread(centres: list[float], min_gap: float, lo: float, hi: float) -> list[float]:

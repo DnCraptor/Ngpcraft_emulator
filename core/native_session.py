@@ -40,7 +40,7 @@ import sys
 import time
 from pathlib import Path
 
-from core import flash_file, native
+from core import flash_file, native, rom_loader
 from core.frame_timing import CYCLES_PER_SCANLINE, SCANLINES_PER_FRAME
 from core.renderer import RenderedFrame, render_frame
 
@@ -224,6 +224,8 @@ class NativeSession:
         self,
         rom_path: str | Path,
         *,
+        rom_bytes: bytes | None = None,
+        from_archive: bool = False,
         bios_path: str | Path | None = None,
         save_path: str | Path | None = None,
         autosave: bool = True,
@@ -239,7 +241,21 @@ class NativeSession:
                 "the native core is not built. `cmake --build cpp/build` first."
             )
         self.rom_path = Path(rom_path)
-        self._rom = self.rom_path.read_bytes()
+        # The ROM can arrive as a bare .ngc/.ngp, or packed in a .zip/.7z. The caller
+        # may pass the already-unpacked bytes (the shell does, so it can size the flash
+        # chip first); otherwise we unpack here, so every entry point -- thumbnails,
+        # CLI, tests -- gets archive support for free.
+        if rom_bytes is None:
+            loaded = rom_loader.load(self.rom_path)
+            self._rom = loaded.data
+            from_archive = loaded.from_archive
+        else:
+            self._rom = bytes(rom_bytes)
+        # An archive is read-only: a game's flash save can never be written back into
+        # the .zip/.7z, so it goes to the standard sidecar .flash instead.
+        self.from_archive = from_archive
+        if from_archive:
+            save_to_rom = False
         self._orig_rom = self._rom          # pristine baseline for a full sidecar diff
         bios = Path(bios_path).read_bytes() if bios_path else None
         self.machine = native.NativeMachine(self._rom, bios=bios)
@@ -272,9 +288,16 @@ class NativeSession:
         # launches the way the hardware's does.
         self.rtc_path = SYSTEM_RTC_PATH
         self.clock_mode = clock_mode if clock_mode in CLOCK_MODES else CLOCK_HARDWARE
+        # The console's own settings -- language, date, colour theme -- live in the coin
+        # cell, and the player configured them once through Boot BIOS. Load that cell here
+        # for BOTH boot modes: the fast hand-off is meant to skip the BIOS INTRO, not the
+        # player's settings. (Only the WRITE-BACK differs -- see commit_system_ram: a game's
+        # work RAM must never be persisted back as console settings.)
+        if self.ram_path.exists():
+            self.system_ram_baseline = self.ram_path.read_bytes()
+
         if self.real_bios:
-            if self.ram_path.exists():
-                self.system_ram_baseline = self.ram_path.read_bytes()
+            if self.system_ram_baseline is not None:
                 self.machine.set_battery_ram(self.system_ram_baseline)
             # BEFORE the reset, like the RAM: the BIOS reads the chip during its own boot.
             # With a configured cell it leaves what it finds; with a blank one it resets
@@ -289,6 +312,12 @@ class NativeSession:
             # dead-battery path and stamps 1998-01-01 over the chip. Restoring before the
             # reset would hand the player's clock straight to that warm-up to be wiped.
             apply_saved_clock(self.machine, self.rtc_path, self.clock_mode)
+            # The player's language/date, laid back over the hand-off for the same reason as
+            # the clock above: the fast boot skips the intro, not the settings. The warm-up
+            # ran on a blank cell (its captured char RAM stays deterministic); here we put
+            # the configured BIOS system page back so a dual-language cart (Match of the
+            # Millennium) reads the language the console was set to, not the power-on default.
+            self._restore_bios_settings_page()
             self._apply_bios_colour_theme()
 
         # Present the cart as a bigger flash chip than the (under-filled) ROM, so a homebrew
@@ -576,6 +605,40 @@ class NativeSession:
         # palette is an all-black screen -- keep the core's grey ramp for that case.
         if len(theme) == self._THEME_LEN and any(theme):
             self.machine.write(0x008380, theme)
+
+    # The BIOS SYSTEM PAGE (0x6C00-0x6FFF) holds the console's own settings: the LANGUAGE
+    # and date the player set, plus BIOS scratch. Sibling to _apply_bios_colour_theme, which
+    # cherry-picks the theme the same way -- except a game reads the language byte straight
+    # from this page, so we restore the whole page rather than blit one field. In hand-off
+    # mode nothing else puts the coin cell back, so without this a game reads whatever the
+    # power-on default left, and a dual-language SNK cart boots Japanese. Laid back on top of
+    # the hand-off EXCEPT the bytes the hand-off itself owns for the inserted cartridge:
+    #   0x6C58/0x6C59  the flash card-type the BIOS learnt (0 = "no cart" -> the save fails)
+    #   0x6F91/0x6F92  the colour machine-type reset stamps per the console's own mode
+    #   0x6FB8-0x6FFF  the user interrupt vector table the hand-off seeds
+    # Game work RAM (0x4000-0x6BFF) is untouched, so the boot stays as deterministic as it
+    # was: only the OS settings page is restored.
+    _SETTINGS_PAGE = (0x006C00, 0x007000)
+    _SETTINGS_SKIP = ((0x006C58, 0x006C5A), (0x006F91, 0x006F93), (0x006FB8, 0x007000))
+
+    def _restore_bios_settings_page(self) -> None:
+        base = self.system_ram_baseline
+        if base is None:
+            return
+        page_start, page_end = self._SETTINGS_PAGE
+        addr = page_start
+        for skip_start, skip_end in self._SETTINGS_SKIP:
+            if addr < skip_start:
+                self._write_from_baseline(base, addr, skip_start)
+            addr = max(addr, skip_end)
+        if addr < page_end:
+            self._write_from_baseline(base, addr, page_end)
+
+    def _write_from_baseline(self, base: bytes, start: int, end: int) -> None:
+        """Copy [start, end) of the saved coin cell into live RAM (addresses, not offsets)."""
+        chunk = base[start - native.RAM_START:end - native.RAM_START]
+        if chunk:
+            self.machine.write(start, chunk)
 
     def close(self) -> None:
         # The save is committed BEFORE the machine goes away, and a failure to write it

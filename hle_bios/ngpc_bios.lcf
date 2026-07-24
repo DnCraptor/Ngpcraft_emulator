@@ -1,0 +1,25 @@
+/*
+ * ngpc_bios.lcf - clean-room HLE BIOS image, OFFICIAL Toshiba toolchain (tulink).
+ *
+ * Unlike a cartridge (linked at 0x200000), a BIOS image owns the top of the
+ * 24-bit map: code low in the BIOS window, the CPU hardware vector table at
+ * 0xFFFF00 and the BIOS syscall table at 0xFFFE00. Modelled on Toshiba's own
+ * c91.lcf (far_code high + int_table org=0xffff00).
+ *
+ * The flat image spans the whole BIOS window 0xFF0000..0xFFFFFF (64 KiB); the
+ * packer pads it out and ngpc_load_bios takes exactly 65536 bytes.
+ */
+
+memory
+{
+    io(RW)   : org=0x000000, len=0x000100
+    ram(RW)  : org=0x004000, len=0x002C00
+    rom(RX)  : org=0xFF0000, len=0x010000
+}
+
+sections
+{
+    far_code    org=0xFF0000  : {*(f_code)}
+    syscall_tbl org=0xFFFE00  : {*(SYSCALL_TBL)}
+    int_vector  org=0xFFFF00  : {*(INT_VECTOR)}
+}

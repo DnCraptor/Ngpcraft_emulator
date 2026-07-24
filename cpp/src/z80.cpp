@@ -868,6 +868,13 @@ void io_action_write(Machine& m, uint32_t address, uint8_t value) {
         z80_control_write(m, address, value);
     } else if (address == kDacLeftRegister || address == kDacRightRegister) {
         m.apu.write_dac(value, address == kDacLeftRegister);
+    } else if (address == 0x000050 && m.serial_link_enabled) {
+        /* SC0BUF write == a byte to TRANSMIT on the link. Capture it; serial_tick
+         * puts it on the wire after one baud-time and raises INTTX0. (mem[0x50]
+         * still holds it, harmlessly -- the RX read path returns serial_rx_byte.) */
+        m.serial_tx_byte = value;
+        m.serial_tx_busy = true;
+        m.serial_tx_cycles = kSerialByteCycles;
     }
 }
 

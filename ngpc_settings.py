@@ -35,25 +35,104 @@ DEFAULT_KEYS: dict[str, int] = {
     "Option": int(Qt.Key.Key_Return),
 }
 
+# Player 2's default keyboard layout, for two-player link play on one keyboard.
+# Chosen not to overlap player 1's arrows/X/C/Return, and to avoid the hotkey
+# keys (Esc/Tab/P/F5...). Both players are fully rebindable in Controls.
+DEFAULT_KEYS_P2: dict[str, int] = {
+    "Up": int(Qt.Key.Key_W), "Down": int(Qt.Key.Key_S),
+    "Left": int(Qt.Key.Key_A), "Right": int(Qt.Key.Key_D),
+    "A": int(Qt.Key.Key_F), "B": int(Qt.Key.Key_G),
+    "Option": int(Qt.Key.Key_H),
+}
+
+# How many players the input system can bind. P1 keeps the legacy setting keys
+# (`input/<label>`) untouched; P2+ live under `input/p<N>/<label>`.
+MAX_PLAYERS = 2
+
+
+def _default_keys(player: int) -> dict[str, int]:
+    return DEFAULT_KEYS if player <= 1 else DEFAULT_KEYS_P2
+
+
+def _binding_key(label: str, player: int) -> str:
+    return f"input/{label}" if player <= 1 else f"input/p{player}/{label}"
+
 # LANGUAGES / STRINGS are built at the bottom, from lang/*.json.
 
 
 SETTINGS_FILE_ENV = "NGPCRAFT_SETTINGS"
 
+# Name of the portable INI dropped next to the emulator (PPSSPP-style portable mode).
+CONFIG_FILENAME = "config.ini"
 
-def make_settings() -> QSettings:
-    """The one way to reach stored settings: the user scope (the registry, on Windows),
-    or the .ini named by `NGPCRAFT_SETTINGS` when that is set.
 
-    The override exists because the test suite CLEARS this store around every test, and
-    there is no other way to keep it off the real one: `QSettings.setDefaultFormat` is
-    documented to steer the (organization, application) constructor and, on this Qt
-    build, does not -- only the explicit (format, scope, ...) form honours a redirect.
-    So it has to happen here. See `pytest_configure` in the root conftest."""
+def _app_dir() -> Path:
+    """Folder the emulator lives in: next to the exe when frozen, else this module."""
+    if getattr(sys, "frozen", False):            # PyInstaller / frozen build
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def config_path() -> str:
+    """Absolute path of the portable `config.ini` (next to the app).
+
+    `NGPCRAFT_SETTINGS` overrides it with an explicit .ini path (the test suite uses
+    this). The file existing at this path is what turns portable mode on -- see
+    `portable_mode()`."""
     override = os.environ.get(SETTINGS_FILE_ENV)
     if override:
-        return QSettings(override, QSettings.Format.IniFormat)
+        return override
+    return str(_app_dir() / CONFIG_FILENAME)
+
+
+def portable_mode() -> bool:
+    """True when settings should go to a local INI rather than the OS store.
+
+    Portable when `NGPCRAFT_SETTINGS` is set (the test redirect, and any explicit
+    request), OR a `config.ini` already exists next to the app. Otherwise the native
+    store (the Windows registry) is used."""
+    if os.environ.get(SETTINGS_FILE_ENV):
+        return True
+    return Path(config_path()).is_file()
+
+
+def make_settings() -> QSettings:
+    """The one way to reach stored settings: a portable INI when enabled, else the
+    user scope (the registry, on Windows).
+
+    Portable mode keeps settings in a `config.ini` beside the emulator so they travel
+    with the folder. The `NGPCRAFT_SETTINGS` .ini override also routes here -- it is how
+    the test suite keeps its `.clear()` off the real store: `QSettings.setDefaultFormat`
+    is documented to steer the (organization, application) constructor and, on this Qt
+    build, does not; only the explicit (path, IniFormat) form honours a redirect. See
+    `pytest_configure` in the root conftest."""
+    if portable_mode():
+        return QSettings(config_path(), QSettings.Format.IniFormat)
     return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+def set_portable(enabled: bool) -> None:
+    """Switch storage location, migrating the current values across so nothing is lost.
+    Enabling writes/keeps the local `config.ini`; disabling copies its values back into
+    the registry and removes the file so it stops being detected."""
+    src = make_settings()
+    if enabled == portable_mode():
+        if enabled:
+            src.sync()
+        return
+    if enabled:
+        dst = QSettings(config_path(), QSettings.Format.IniFormat)
+    else:
+        dst = QSettings(SETTINGS_ORG, SETTINGS_APP)
+    for key in src.allKeys():
+        dst.setValue(key, src.value(key))
+    dst.sync()
+    if not enabled:
+        try:
+            Path(config_path()).unlink()
+        except OSError:
+            src.clear()
+            src.sync()
 
 
 # --- typed accessors ------------------------------------------------------
@@ -299,11 +378,15 @@ def theme(s: QSettings) -> str:
     return val if val in dict(th.THEMES) else th.THEME_SYSTEM
 
 
-def key_bindings(s: QSettings) -> dict[int, int]:
-    """{Qt key code -> joypad mask}, from settings or defaults."""
+def key_bindings(s: QSettings, player: int = 1) -> dict[int, int]:
+    """{Qt key code -> joypad mask} for `player`, from settings or defaults.
+
+    Player 1 reads the legacy `input/<label>` keys (unchanged); player 2+ read
+    `input/p<N>/<label>`."""
+    defaults = _default_keys(player)
     out: dict[int, int] = {}
     for label, mask in JOYPAD_BUTTONS:
-        code = int(s.value(f"input/{label}", DEFAULT_KEYS.get(label, 0), type=int))
+        code = int(s.value(_binding_key(label, player), defaults.get(label, 0), type=int))
         if code:
             out[code] = mask
     if out.get(int(Qt.Key.Key_Return)) == 0x40:
@@ -311,8 +394,8 @@ def key_bindings(s: QSettings) -> dict[int, int]:
     return out
 
 
-def set_binding(s: QSettings, label: str, code: int) -> None:
-    s.setValue(f"input/{label}", int(code))
+def set_binding(s: QSettings, label: str, code: int, player: int = 1) -> None:
+    s.setValue(_binding_key(label, player), int(code))
 
 
 # --- turbo (autofire) -----------------------------------------------------
@@ -350,6 +433,16 @@ def gamepad_enabled(s: QSettings) -> bool:
     """Read an XInput controller alongside the keyboard. On by default: a pad
     that is not plugged in costs one cheap poll and changes nothing."""
     return bool(s.value("input/gamepad", True, type=bool))
+
+
+def player_pad_index(s: QSettings, player: int = 1) -> int:
+    """Which XInput controller (0-3) drives `player`. Default P1=0, P2=1, so two
+    players can each use their own pad. Overridable per player."""
+    return int(s.value(f"input/pad_index_p{player}", player - 1, type=int))
+
+
+def set_player_pad_index(s: QSettings, player: int, index: int) -> None:
+    s.setValue(f"input/pad_index_p{player}", int(max(0, min(3, index))))
 
 
 # --- hotkeys --------------------------------------------------------------

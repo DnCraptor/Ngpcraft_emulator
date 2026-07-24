@@ -1,2 +1,9 @@
 PyQt6>=6.5
 numpy>=1.24
+# Cross-platform game-controller support (SDL2). Optional: without it, gamepad
+# falls back to XInput on Windows and to keyboard-only elsewhere.
+pygame>=2.5
+# 7-Zip (.7z) ROM loading. Optional: .zip archives always work (stdlib), and .7z
+# falls back to a 7z/7za command-line tool if one is on PATH. Only a .7z with
+# neither py7zr nor a 7z CLI present reports a clear error.
+py7zr>=0.20

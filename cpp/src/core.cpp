@@ -402,6 +402,11 @@ static const unsigned kIrqSourceIndices[] = {
     ngpc::kIrqVectorIndexIntT0, ngpc::kIrqVectorIndexIntT0 + 1,
     ngpc::kIrqVectorIndexIntT0 + 2, ngpc::kIrqVectorIndexIntT0 + 3,
     ngpc::kIrqVectorIndexIntAd,
+    /* Serial channel 0 == the link cable. Absent from this list, INTTX0/INTRX0
+     * could be raised correctly and still never reach the BIOS COM handlers -- the
+     * same trap the RTC alarm sat in. Level-gated by INTES0 (0x77); a machine with
+     * the link disabled never raises them, so this is inert until a cable is set up. */
+    ngpc::kIrqVectorSerialReceive, ngpc::kIrqVectorSerialTransmit,
     /* Micro-DMA transfer-end (INTTC0..3): a channel raises these when its DMAC hits 0,
      * and a game re-arms the channel (and, for Ogre Battle, resets the scroll split) from
      * the completion ISR. micro_dma_service never matches a channel on THESE vectors, so
@@ -587,6 +592,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 m->adc_tick(kCyclesPerScanline);
                 m->rtc_step(kCyclesPerScanline);
                 m->timer_tick(kCyclesPerScanline);
+                m->serial_tick(kCyclesPerScanline);
                 z80_tick(*m, kCyclesPerScanline);
                 m->apu.tick(kCyclesPerScanline);
                 s.total_cycles += kCyclesPerScanline;
@@ -637,6 +643,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         m->adc_tick(rec->cycles);
         m->rtc_step(rec->cycles);
         m->timer_tick(rec->cycles);
+        m->serial_tick(rec->cycles);
         z80_tick(*m, rec->cycles);
         m->apu.tick(rec->cycles);
 
@@ -655,6 +662,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
             m->adc_tick(kIrqDeliveryCycles);
             m->rtc_step(kIrqDeliveryCycles);
             m->timer_tick(kIrqDeliveryCycles);
+            m->serial_tick(kIrqDeliveryCycles);
             z80_tick(*m, kIrqDeliveryCycles);
             m->apu.tick(kIrqDeliveryCycles);
         }
@@ -982,6 +990,62 @@ NGPC_API void ngpc_set_flash_size(ngpc_t* h, uint32_t chip, uint32_t bytes) {
 NGPC_API void ngpc_raise_irq(ngpc_t* h, uint32_t vector_index) {
     if (!h || vector_index >= 32) return;
     reinterpret_cast<Machine*>(h)->irq_pending |= (1u << vector_index);
+}
+
+/* --- link cable (serial channel 0) ----------------------------------------
+ * The cable is a byte pipe. A host wires two machines together by draining each
+ * one's transmit FIFO (ngpc_serial_read_tx) and pushing it into the other's
+ * receive FIFO (ngpc_serial_write_rx) -- in-process for two players on one PC,
+ * or across a socket for online. Enable is off by default: the serial registers
+ * stay inert and the cable reads as unplugged, unchanged from before. */
+NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
+    if (!h) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    m.serial_link_enabled = (on != 0);
+    if (!on) {
+        m.serial_tx.clear();
+        m.serial_rx.clear();
+        m.serial_tx_busy = false;
+        m.serial_rx_pending = false;
+        m.serial_tx_cycles = 0;
+        m.serial_rx_cycles = 0;
+    }
+}
+
+/* Drain up to `max` bytes this machine has transmitted; returns the count. */
+NGPC_API uint32_t ngpc_serial_read_tx(ngpc_t* h, uint8_t* out, uint32_t max) {
+    if (!h || !out) return 0;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    uint32_t n = 0;
+    while (n < max && !m.serial_tx.empty()) {
+        out[n++] = m.serial_tx.front();
+        m.serial_tx.pop_front();
+    }
+    return n;
+}
+
+/* Queue `n` bytes for this machine to receive from the peer. */
+NGPC_API void ngpc_serial_write_rx(ngpc_t* h, const uint8_t* data, uint32_t n) {
+    if (!h || !data) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    for (uint32_t i = 0; i < n; ++i) m.serial_rx.push_back(data[i]);
+}
+
+/* 1 = this machine's RTS is low (ready to receive), 0 = holding the peer off.
+ * A host may consult this to honour flow control before pushing bytes. */
+NGPC_API int ngpc_serial_rts(ngpc_t* h) {
+    if (!h) return 0;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    return (m.mem[0x0000B2] & 0x01) == 0 ? 1 : 0;
+}
+
+/* Drive this machine's CTS0 handshake input (wired to the PEER's RTS on the cable).
+ * high != 0 -> CTS0 HIGH -> if SC0MOD<CTSE> is set, this machine's transmitter is
+ * halted (byte held, no INTTX0) until the peer drops RTS. A host bridging two
+ * machines calls this each pump with the peer's RTS state. See Machine::serial_tick. */
+NGPC_API void ngpc_serial_set_cts(ngpc_t* h, int high) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->serial_cts_high = (high != 0);
 }
 
 NGPC_API void ngpc_set_apu_channel_mask(ngpc_t* h, uint32_t mask) {

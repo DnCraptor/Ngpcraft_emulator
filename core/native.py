@@ -332,6 +332,17 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_timer_base.restype = None
     lib.ngpc_raise_irq.argtypes = [c_void_p, c_uint32]
     lib.ngpc_raise_irq.restype = None
+    # --- link cable (serial channel 0) ---
+    lib.ngpc_serial_set_enabled.argtypes = [c_void_p, c_int]
+    lib.ngpc_serial_set_enabled.restype = None
+    lib.ngpc_serial_read_tx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
+    lib.ngpc_serial_read_tx.restype = c_uint32
+    lib.ngpc_serial_write_rx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
+    lib.ngpc_serial_write_rx.restype = None
+    lib.ngpc_serial_rts.argtypes = [c_void_p]
+    lib.ngpc_serial_rts.restype = c_int
+    lib.ngpc_serial_set_cts.argtypes = [c_void_p, c_int]
+    lib.ngpc_serial_set_cts.restype = None
     lib.ngpc_get_apu_state.argtypes = [c_void_p, POINTER(ApuState)]
     lib.ngpc_get_apu_state.restype = None
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
@@ -907,6 +918,37 @@ class NativeMachine:
     def set_breakpoints(self, pcs: list[int]) -> None:
         arr = (c_uint32 * len(pcs))(*pcs)
         self._lib.ngpc_set_breakpoints(self._h, arr, len(pcs))
+
+    # --- link cable (serial channel 0) -------------------------------------
+    # The cable is a byte pipe. A host bridges two machines by draining each
+    # one's transmitted bytes (serial_read_tx) and feeding them to the other
+    # (serial_write_rx). See core/link.py for the in-process / TCP bridges.
+    def serial_set_enabled(self, on: bool) -> None:
+        self._lib.ngpc_serial_set_enabled(self._h, 1 if on else 0)
+
+    def serial_read_tx(self, max_bytes: int = 64) -> bytes:
+        """Drain the bytes this machine has transmitted since the last call."""
+        out = (c_uint8 * max_bytes)()
+        n = self._lib.ngpc_serial_read_tx(self._h, out, max_bytes)
+        return bytes(out[:n])
+
+    def serial_write_rx(self, data: bytes) -> None:
+        """Queue bytes for this machine to receive from the peer."""
+        if data:
+            self._lib.ngpc_serial_write_rx(self._h, _buf(data), len(data))
+
+    def serial_rts(self) -> bool:
+        """True when this machine is ready to receive (RTS low)."""
+        return self._lib.ngpc_serial_rts(self._h) != 0
+
+    def serial_set_cts(self, high: bool) -> None:
+        """Drive this machine's CTS0 handshake input (wired to the PEER's RTS).
+
+        `high` True -> CTS0 high: if the game enabled CTSE (SC0MOD bit6), its
+        transmitter halts a queued byte until the peer drops RTS. A bridge passes
+        the peer's RTS state here each pump so the hardware handshake is modelled.
+        """
+        self._lib.ngpc_serial_set_cts(self._h, 1 if high else 0)
 
     def run_frames(self, frames: int = 1, *, max_instrs: int | None = None) -> Summary:
         """Advance whole FRAMES. The core owns the raster, so it owns the boundary.

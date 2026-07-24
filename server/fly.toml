@@ -1,0 +1,23 @@
+# Fly.io deployment for the NgpCraft lobby + relay server.
+# Rename `app` to something unique, then: fly launch --no-deploy (once) && fly deploy
+app = "ngpcraft-lobby"
+primary_region = "cdg"          # pick one near your players (fly platform regions)
+
+[build]
+
+# Raw TCP service on 7788 (the lobby protocol is not HTTP, so no http handler).
+[[services]]
+  internal_port = 7788
+  protocol = "tcp"
+  # Keep one machine always up so the lobby never goes cold. On Fly's free
+  # allowance a single shared-cpu-1x/256MB machine is enough for this tiny load.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    port = 7788
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

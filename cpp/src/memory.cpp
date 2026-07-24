@@ -314,6 +314,55 @@ void Machine::adc_tick(uint32_t cycles) {
     irq_pending |= 1u << kIrqVectorIndexIntAd;
 }
 
+/* --- serial channel 0 (the link cable) ------------------------------------
+ * A byte pipe between two machines. Disabled -> no-op (cable unplugged), which
+ * is the pre-link behaviour every existing ROM and test still gets. See
+ * machine.hpp for the model. */
+void Machine::serial_tick(uint32_t cycles) {
+    if (!serial_link_enabled) return;
+
+    /* TX: the BIOS wrote a byte to SC0BUF (captured in io_action_write). After one
+     * baud-time it is on the wire: hand it to the host to relay, and raise the
+     * TRANSMIT-buffer-empty interrupt so the BIOS transmit handler pulls the next
+     * byte from its ring. (That handler lives on the 0x19 vector on this BIOS.)
+     *
+     * CTS0 handshake (SC0MOD<CTSE>=bit6, datasheet 3.11 fig.16): when enabled, a
+     * queued byte is HELD while CTS0 is HIGH and only shifts out once CTS0 goes LOW
+     * -- so INTTX0 fires only when the PEER (whose RTS drives our CTS0) is ready to
+     * receive. Games that just blast bytes leave CTSE off / the peer's RTS low, so
+     * nothing changes for them; Card Fighters' Clash relies on this gate to keep the
+     * two consoles' handshake in step. Without it we completed every send instantly,
+     * one-sided, and CFC's mutual rendezvous never converged. */
+    if (serial_tx_busy) {
+        const bool ctse       = (mem[0x000052] & 0x40) != 0;  /* SC0MOD<CTSE> */
+        const bool cts_blocks = ctse && serial_cts_high;      /* peer not ready */
+        if (!cts_blocks) {
+            serial_tx_cycles -= int32_t(cycles);
+            if (serial_tx_cycles <= 0) {
+                serial_tx.push_back(serial_tx_byte);
+                serial_tx_busy = false;
+                irq_pending |= 1u << kIrqVectorSerialTransmit;
+            }
+        }
+    }
+
+    /* RX: present the next queued byte at SC0BUF and raise INTRX0 -- but only when
+     * the previous one has been read (serial_rx_pending clears in read8, the
+     * overrun guard) AND our RTS says we are ready to receive (0xB2 bit0 == 0, set
+     * low by COMONRTS). serial_rx_cycles starts at 0 so the first byte arrives
+     * promptly, then paces at one byte-time. */
+    if (!serial_rx_pending && !serial_rx.empty() && (mem[0x0000B2] & 0x01) == 0) {
+        serial_rx_cycles -= int32_t(cycles);
+        if (serial_rx_cycles <= 0) {
+            serial_rx_byte = serial_rx.front();
+            serial_rx.pop_front();
+            serial_rx_pending = true;
+            serial_rx_cycles = kSerialByteCycles;
+            irq_pending |= 1u << kIrqVectorSerialReceive;
+        }
+    }
+}
+
 /* --- the 8-bit timers ------------------------------------------------------
  * Same shape as core/timers.py so the two can be diffed by eye. */
 void Machine::timer_tick(uint32_t cycles) {

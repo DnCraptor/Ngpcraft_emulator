@@ -40,8 +40,15 @@ is a feature you can run yourself — see [ROM analysis](#rom-analysis).
   resume. `.` steps one frame forward. Buffer length configurable (Off / 10 / 20 / 30 s).
 - **Screenshots** (`F12`, folder configurable), **FPS overlay**, and a **player toolbar**
   that can auto-hide when the mouse goes still and reappear on the next move (optional).
-- **Controller support** — an Xbox-style (XInput) pad alongside the keyboard, plus
-  **turbo / autofire** on A and B at 5–20 presses per second.
+- **Controller support (beta, not yet hardware-tested)** — cross-platform game pads via
+  SDL2 (Xbox, PlayStation, Nintendo and generic pads on Windows / macOS / Linux),
+  one per player, alongside the keyboard, plus **turbo / autofire** on A and B at 5–20
+  presses per second. ⚠️ *The button mapping has not been validated on a real controller
+  yet — see [Known issues](#known-issues).*
+- **Two players & link cable** — the NGPC link cable is emulated end to end: play two
+  consoles **on one PC** (a second window), over your **LAN**, or **online** (a built-in
+  lobby, or share a direct address). Each player has their own controls. See
+  [Two players & link](#two-players--link-cable).
 - **Fully remappable** — console buttons *and* every in-game hotkey, with a warning when
   a binding would collide. The console buttons are bound **on a picture of the console**:
   each field sits next to the button it drives, so you pick the D-pad's *left* rather than
@@ -131,21 +138,23 @@ This produces `cpp/build/ngpc_core.{dll,so,dylib}`, which the shell loads automa
 
 ## Games & BIOS
 
-No ROMs or BIOS are included — provide your own.
+No ROMs are included — provide your own. A **BIOS is optional**: the emulator ships a small
+**clean-room HLE BIOS** (`hle_bios/`) and uses it automatically when you have no `bios.bin`,
+so games run out of the box.
 
 - Put `.ngc` / `.ngp` files in **`roms/`** (or pick any folder with **Choose ROM folder**,
   in the Library).
-- A real Neo Geo Pocket **BIOS** — place it as **`bios.bin`** next to the app (or set the
-  path in **Settings ▸ Console (BIOS)**). **It is not optional.** Both start modes below go
-  through the BIOS — even the instant hand-off boots it internally to capture the state and
-  character RAM it hands the cartridge — so with no BIOS image at all the CPU never reaches
-  the cartridge: the game sits on a blank white or black screen, and its Library cover
-  cannot be rendered either (a card with no cover is telling you exactly this).
+- **BIOS (optional).** With none supplied, the built-in clean-room BIOS runs the games — no
+  intro or setup screens, but the games play (and Library covers render). A **real** Neo Geo
+  Pocket BIOS is recommended for maximum fidelity: place it as **`bios.bin`** next to the app
+  (or set the path in **Settings ▸ Console (BIOS)**) and it takes over automatically. Only a
+  real BIOS enables the **console boot** (intro + language/clock screens) and the **link
+  cable**. The real BIOS always wins when present — the two never mix.
 
-> **A few commercial games need `bios.bin` too.** *Metal Slug — 2nd Mission* checks that the
-> console really booted through its BIOS, and quietly disables **fire and jump** when it
-> decides it did not — the game still runs and looks perfect, you simply can never shoot or
-> jump. Both start modes below satisfy the check; no BIOS at all does not.
+> **A few commercial games want a real `bios.bin`.** *Metal Slug — 2nd Mission* checks that
+> the console really booted through its BIOS, and quietly disables **fire and jump** when it
+> decides it did not. With the real BIOS both start modes satisfy the check. Under the HLE
+> BIOS the game still runs and looks perfect; you simply can never shoot or jump.
 
 ### Two ways to start a game
 
@@ -168,10 +177,10 @@ Library covers are rendered automatically (the emulator boots each game and keep
 best-looking frame), and that render is a **cache**: it lives in `thumbnails/` and is
 thrown away whenever a new version renders covers differently.
 
-Because a cover is a real boot, it needs **`bios.bin`** — with no BIOS the cards stay
-blank (the Library says so) rather than filling with white boxes, and they render by
-themselves as soon as you point at a BIOS in Settings. A game that never reaches a real
-screen is left uncovered too, and retried next launch, so a blank frame is never cached.
+A cover is a real boot, so it needs a BIOS — but the built-in clean-room HLE BIOS counts,
+so covers render **out of the box**, no `bios.bin` required. Point at a real `bios.bin` in
+Settings and covers re-render through it (maximum fidelity). A game that never reaches a
+real screen is left uncovered and retried next launch, so a blank frame is never cached.
 
 To use your own image instead, right-click a game ▸ **Choose cover image…**. The file is
 copied into **`covers/`** — a folder the emulator only ever *reads*. Nothing regenerates
@@ -310,12 +319,37 @@ so it can never shadow a console button. Because the hotkeys are matched *before
 joypad, binding a console button to a hotkey's key would silently kill that button; both
 panels detect that and say so instead of letting you wonder.
 
-**Controller** (Settings ▸ Controls) — an XInput pad is read alongside the keyboard:
-d-pad *and* left stick move, A/X and B/Y are the two console buttons, Start or Back is
-Option. Windows only; elsewhere it does nothing and the keyboard is unaffected.
+**Controller (beta)** (Settings ▸ Controls) — a game pad is read alongside the keyboard
+via **SDL2**, so it works on Windows, macOS and Linux and with most brands (Xbox,
+PlayStation, Nintendo, generic). The d-pad *and* left stick move, A/X and B/Y are the two
+console buttons, Start or Back is Option. Player 1 uses controller 1, player 2 controller 2
+(the *Controller #* selector). Requires `pygame`; without it, Windows falls back to XInput
+and elsewhere the keyboard is unaffected. ⚠️ **Not yet validated on real hardware** — the
+button mapping may need adjusting; please report what your controller does.
 
 **Turbo** — A and B can autofire while held, at 5 / 10 / 15 / 20 presses per second. The
 rate is counted in *console frames*, so it stays the same under fast-forward.
+
+## Two players & link cable
+
+The NGPC's link cable is emulated as what it really is — a byte pipe between two
+independent consoles — so there is no rollback or lockstep to worry about. From the
+player toolbar's **🔗** button:
+
+- **Two players — this PC** — opens a second window. Player 2 loads their **own** cartridge
+  (its flash save loads normally); each player has their own controls (keyboard or pad),
+  routed by player regardless of which window has focus.
+- **Online lobby…** — connect to a lobby server, set a nickname, and **create** or **join**
+  a game (public, or private with a password). The list shows each game's title, server
+  name and creator. Needs a server — run the tiny one in [`server/`](server/README.md)
+  (pure stdlib, deploy free) or your own.
+- **Host / Join (direct address)** — the simplest path: one player hosts on a port, the
+  other dials `ip:port`. Works on a LAN directly; over the internet it needs the host to
+  be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
+  The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
+  the risks of opening a port** honestly.
+
+Both players must run a **compatible game** (same title), exactly like real hardware.
 
 ## Debugging (F1)
 
@@ -527,6 +561,12 @@ tool, not a deterministic TAS engine.
 
 ## Known issues
 
+- **Controller support is not yet validated on real hardware.** The cross-platform SDL2
+  pad backend (Windows/macOS/Linux, most brands) is wired up and degrades safely when no
+  pad is present, but it has **not been tested with a physical controller** — the default
+  button mapping (A/X→A, B/Y→B, Start/Back→Option, d-pad + left stick → directions) may
+  need adjusting per model. Treat it as **beta / awaiting validation**; reports of what
+  your controller actually does are welcome.
 - **Cool Boarders Pocket freezes on the end-of-race *REWARD* screen** when **Cart flash size**
   is **Auto**. That screen saves, and this is a genuine 8 Mbit cartridge that saves in *its
   own* top block — but Auto presents any under-filled cart as 16 Mbit, which changes the

@@ -35,12 +35,13 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QGridLayout, QScrollArea, QStackedWidget, QListWidget,
     QListWidgetItem, QComboBox, QCheckBox, QSlider, QSpinBox, QLineEdit,
     QFileDialog, QSizePolicy, QFrame, QMessageBox, QMenu, QDialog,
-    QPlainTextEdit, QDialogButtonBox,
+    QPlainTextEdit, QDialogButtonBox, QInputDialog,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from core import native  # noqa: E402
+from core import rom_loader  # noqa: E402
 from core import native_session as ns  # noqa: E402  (clock-mode ids live there)
 from core.native_session import (  # noqa: E402
     NativeSession,
@@ -89,9 +90,22 @@ RAIL_TEXT_PAD = 2 * 16 + 2 * 8 + 10   # QPushButton#rail padding + rail margins 
 RAIL_INDENT = "   "                   # the nav entries' hanging indent, on every line
 DEFAULT_ROM_DIR = REPO / "roms"          # drop your .ngc/.ngp files here (or pick a folder)
 DEFAULT_BIOS = REPO / "bios.bin"         # optional: a real NGPC BIOS enables "Boot BIOS"
+HLE_BIOS = REPO / "hle_bios" / "bios_hle.bin"  # clean-room fallback: runs games with no bios.bin
 THUMB_DIR = REPO / "thumbnails"          # auto-rendered covers -- a CACHE, prunable
 COVER_DIR = REPO / "covers"              # covers the USER chose -- only ever READ
 LIBRARY_DB = REPO / "library.json"       # play counts / last played / favourites
+
+
+def _resolve_bios(configured: str) -> "Path | None":
+    """Pick the BIOS image: an explicitly configured path, else a real bios.bin
+    next to the app, else the clean-room HLE fallback (hle_bios/bios_hle.bin) so
+    games still run out of the box with no BIOS supplied. A real BIOS, when
+    present, always wins -- it gives full fidelity, the console boot, and link."""
+    if configured and Path(configured).is_file():
+        return Path(configured)
+    if DEFAULT_BIOS.is_file():
+        return DEFAULT_BIOS
+    return HLE_BIOS if HLE_BIOS.is_file() else None
 APP_ICON = BUNDLE / "assets" / "icone_ngpcraft.ico"
 STATE_DIR = REPO / "savestates"
 WATCH_DIR = REPO / "watches"             # per-ROM named memory watches (debugger)
@@ -229,11 +243,12 @@ class ThumbWorker(QObject):
                 if not img.isNull():
                     self.ready.emit(str(rom), img)
                     continue
-            # No BIOS image, no rendering. A cartridge booted without one never
-            # reaches its title screen -- it sits on a solid white or black frame
-            # forever -- so every cover would come out a blank box. Leaving the
-            # placeholder up is both honest and free; `bios.bin` is not distributed,
-            # so a fresh clone lands here until the user points at their own dump.
+            # No BIOS image at all, no rendering. A cartridge booted without one
+            # never reaches its title screen -- it sits on a solid white or black
+            # frame forever -- so every cover would come out a blank box, and the
+            # placeholder is both honest and free. This is now rare: `_bios()` falls
+            # back to the clean-room HLE image (hle_bios/bios_hle.bin), so covers
+            # render out of the box; this branch only hits if even that is missing.
             if self._bios is None:
                 continue
             try:
@@ -611,8 +626,10 @@ class LibraryPage(QWidget):
         self._open_btn.setText(cfg.tr(lang, "open_rom"))
         self._empty.setText(cfg.tr(lang, "no_roms"))
         self._bios_hint.setText(cfg.tr(lang, "covers_need_bios"))
-        # Only offer "Boot BIOS" when a BIOS image is actually available.
-        self._bios_btn.setVisible(self._bios() is not None)
+        # Only offer "Boot BIOS" when a REAL BIOS is available -- the console boot
+        # (intro + language/clock) needs it; the clean-room HLE fallback can't do it.
+        _b = self._bios()
+        self._bios_btn.setVisible(_b is not None and _b != HLE_BIOS)
         self._sync_bios_hint()
         self._view_btns[cfg.VIEW_GRID].setText(cfg.tr(lang, "view_grid"))
         self._view_btns[cfg.VIEW_LIST].setText(cfg.tr(lang, "view_list"))
@@ -656,10 +673,7 @@ class LibraryPage(QWidget):
         return None
 
     def _bios(self) -> Path | None:
-        b = cfg.bios_path(self._settings)
-        if b and Path(b).is_file():
-            return Path(b)
-        return DEFAULT_BIOS if DEFAULT_BIOS.is_file() else None
+        return _resolve_bios(cfg.bios_path(self._settings))
 
     def _sync_bios_hint(self) -> None:
         """Covers are rendered by BOOTING each ROM, which takes a BIOS. Say so when
@@ -675,7 +689,8 @@ class LibraryPage(QWidget):
         if d:
             # Recurse: point it at a whole projects tree and it finds every ROM inside.
             roms: set[Path] = set()
-            for pat in ("*.ngc", "*.ngp", "*.NGC", "*.NGP"):
+            for pat in ("*.ngc", "*.ngp", "*.NGC", "*.NGP",
+                        "*.zip", "*.ZIP", "*.7z", "*.7Z"):
                 try:
                     roms.update(d.rglob(pat))
                 except (OSError, ValueError):
@@ -960,7 +975,9 @@ class LibraryPage(QWidget):
     def _open_rom(self) -> None:
         cur = cfg.rom_folder(self._settings) or str(DEFAULT_ROM_DIR)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open ROM", cur, "NGPC ROM (*.ngc *.ngp)")
+            self, "Open ROM", cur,
+            "NGPC ROM or archive (*.ngc *.ngp *.zip *.7z);;"
+            "NGPC ROM (*.ngc *.ngp);;Archive (*.zip *.7z);;All files (*)")
         if path:
             self.play_requested.emit(path)
 
@@ -1015,6 +1032,7 @@ class SettingsPage(QWidget):
     theme_changed = pyqtSignal()
     resume_requested = pyqtSignal()
     scale_changed = pyqtSignal(int)  # window-size preset -> resize the window now
+    storage_changed = pyqtSignal()   # settings store swapped (portable <-> registry)
 
     def __init__(self, settings) -> None:
         super().__init__()
@@ -1129,6 +1147,17 @@ class SettingsPage(QWidget):
         self._cartwait_hint.setObjectName("hint")
         self._cartwait_hint.setWordWrap(True)
 
+        # Storage location: a portable config.ini next to the app vs the OS-native
+        # store (registry). Toggling migrates every setting across (cfg.set_portable)
+        # and live-swaps the store for the whole session (storage_changed).
+        self._portable = QCheckBox()
+        self._portable.setChecked(cfg.portable_mode())
+        self._portable.toggled.connect(self._on_portable_toggled)
+        self._lbl_portable = QLabel()
+        self._portable_hint = QLabel()
+        self._portable_hint.setObjectName("hint")
+        self._portable_hint.setWordWrap(True)
+
         self._rows_general = [
             _row(self._lbl_lang, self._lang),
             _row(self._lbl_theme, self._theme),
@@ -1137,11 +1166,22 @@ class SettingsPage(QWidget):
             _row(self._lbl_flashsize, self._flashsize),
             _row(self._lbl_rewind, self._rewind),
             _row(self._lbl_cartwait, self._cartwait),
+            _row(self._lbl_portable, self._portable),
         ]
         for r in self._rows_general:
             v.addWidget(r)
         v.addWidget(self._cartwait_hint)
+        v.addWidget(self._portable_hint)
         return w
+
+    def _on_portable_toggled(self, enabled: bool) -> None:
+        """Migrate settings to the chosen store and switch to it for this session."""
+        if enabled == cfg.portable_mode():
+            return
+        cfg.set_portable(enabled)
+        self._settings = cfg.make_settings()   # this page now uses the new store
+        self.storage_changed.emit()            # let the shell swap it everywhere
+        self.changed.emit()
 
     # -- Console (BIOS): the machine itself -- its boot, its clock, its coin cell.
     # Grouped here because they are one subject: all three are the CONSOLE's state
@@ -1328,10 +1368,23 @@ class SettingsPage(QWidget):
         self._ctrl_hint = QLabel(); self._ctrl_hint.setObjectName("hint")
         self._ctrl_hint.setWordWrap(True)
         v.addWidget(self._ctrl_hint)
+
+        # Player selector: the same map edits player 1 or player 2 (for two-player
+        # link play). P1 keeps the legacy bindings; P2 has its own set + its own
+        # gamepad. Defaults to P1 so the common case is unchanged.
+        self._ctrl_player = 1
+        self._player_sel = QComboBox()
+        self._player_sel.addItem("Player 1", 1)
+        self._player_sel.addItem("Player 2", 2)
+        self._player_sel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._player_sel.currentIndexChanged.connect(self._on_ctrl_player)
+        self._lbl_player = QLabel()
+        v.addWidget(_row(self._lbl_player, self._player_sel))
+
         # The bindings live on a picture of the console rather than in a list: the
         # field for "Left" sits next to the actual left of the d-pad. Same widgets,
         # same settings keys -- only the arrangement carries the meaning now.
-        self._bindmap = ngpc_bindmap.BindMap(self._settings)
+        self._bindmap = ngpc_bindmap.BindMap(self._settings, self._ctrl_player)
         self._bindmap.changed.connect(self._refresh_conflicts)
         self._bindmap.changed.connect(self.changed.emit)
         self._keybtns = self._bindmap.buttons     # `_restore_keys` still drives these
@@ -1385,10 +1438,20 @@ class SettingsPage(QWidget):
             lambda b: (self._settings.setValue("input/gamepad", b), self.changed.emit()))
         self._lbl_pad = QLabel()
         v.addWidget(_row(self._lbl_pad, self._pad_box))
+        # Which XInput controller drives the SELECTED player (1-4). P1=1, P2=2 by
+        # default, so two players can each hold their own pad.
+        self._pad_idx_spin = QSpinBox(); self._pad_idx_spin.setRange(1, 4)
+        self._pad_idx_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._pad_idx_spin.setValue(cfg.player_pad_index(self._settings, self._ctrl_player) + 1)
+        self._pad_idx_spin.valueChanged.connect(
+            lambda v: (cfg.set_player_pad_index(self._settings, self._ctrl_player, v - 1),
+                       self.changed.emit()))
+        self._lbl_pad_idx = QLabel()
+        v.addWidget(_row(self._lbl_pad_idx, self._pad_idx_spin))
         self._pad_state = QLabel(); self._pad_state.setObjectName("hint")
         v.addWidget(self._pad_state)
         # A pad can be plugged in while this page is open, so the readout polls.
-        self._pad_probe = ngpc_input.XInputPad()
+        self._pad_probe = ngpc_input.make_pad(0)
         self._pad_timer = QTimer(self)
         self._pad_timer.timeout.connect(self._refresh_pad_state)
         self._pad_timer.start(1000)
@@ -1470,12 +1533,22 @@ class SettingsPage(QWidget):
         self._refresh_conflicts()
         self.changed.emit()
 
+    def _on_ctrl_player(self, _idx: int) -> None:
+        """Switch the bindmap + pad-index field to the chosen player's layout."""
+        self._ctrl_player = int(self._player_sel.currentData() or 1)
+        self._bindmap.set_player(self._ctrl_player)
+        self._pad_idx_spin.blockSignals(True)
+        self._pad_idx_spin.setValue(
+            cfg.player_pad_index(self._settings, self._ctrl_player) + 1)
+        self._pad_idx_spin.blockSignals(False)
+
     def _restore_keys(self) -> None:
+        defaults = cfg._default_keys(self._ctrl_player)
         for label, btn in self._keybtns.items():
-            code = cfg.DEFAULT_KEYS.get(label, 0)
+            code = defaults.get(label, 0)
             btn._key = code           # noqa: SLF001
             btn._render()             # noqa: SLF001
-            cfg.set_binding(self._settings, label, code)
+            cfg.set_binding(self._settings, label, code, self._ctrl_player)
         self._settings.sync()
         self._refresh_conflicts()
         self.changed.emit()
@@ -1553,6 +1626,7 @@ class SettingsPage(QWidget):
         self._coincell_btn.setText(t("coin_cell_reset"))
         self._coincell_hint.setText(t("coin_cell_hint"))
         self._lbl_cartwait.setText(t("cart_wait")); self._cartwait_hint.setText(t("cart_wait_hint"))
+        self._lbl_portable.setText(t("portable")); self._portable_hint.setText(t("portable_hint"))
         self._lbl_scale.setText(t("lcd_scale")); self._lbl_smooth.setText(t("smoothing"))
         self._lbl_filter.setText(t("filter")); self._lbl_color.setText(t("color_profile"))
         self._lbl_aspect.setText(t("aspect")); self._lbl_fs.setText(t("fullscreen"))
@@ -1577,6 +1651,9 @@ class SettingsPage(QWidget):
         for i, hz in enumerate(cfg.TURBO_RATES):
             self._turbo_rate.setItemText(i, t("turbo_hz").format(n=hz))
         self._pad_hint.setText(t("gamepad_hint")); self._lbl_pad.setText(t("gamepad"))
+        _fr = cfg.language(self._settings) == "fr"
+        self._lbl_player.setText("Joueur" if _fr else "Player")
+        self._lbl_pad_idx.setText("Manette n°" if _fr else "Controller #")
         self._refresh_pad_state()
         self._refresh_conflicts()
 
@@ -1691,16 +1768,45 @@ class _Canvas(QLabel):
         super().mouseDoubleClickEvent(e)
 
 
+class _OverlayLabel(QLabel):
+    """The centred message strip under the game. Its 20px font means an EMPTY label
+    still reserves a line of height -- which, once the toolbar auto-hides in
+    fullscreen, is the stray blank bar left along the bottom. Collapsing to zero
+    space whenever it has nothing to say makes that bar disappear."""
+
+    def setText(self, text) -> None:  # type: ignore[override]
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
 class PlayPage(QWidget):
     exit_requested = pyqtSignal()
     debug_requested = pyqtSignal()
     options_requested = pyqtSignal(str)   # "video" | "audio" | "controls"
+    link_requested = pyqtSignal()         # 🔗 : two players on this PC (2nd window)
+    net_host_requested = pyqtSignal()     # 🔗 : host a direct network game
+    net_join_requested = pyqtSignal()     # 🔗 : join a direct network game
+    net_lobby_requested = pyqtSignal()    # 🔗 : open the online lobby (server)
 
     def __init__(self, settings, library: lib.Library) -> None:
         super().__init__()
         self.setObjectName("page")
         self._settings = settings
         self._lib = library
+        # Which player this page is, for two-player link play: it selects the
+        # input bindings + gamepad, and whose serial bytes go where. 1 = the normal
+        # single-player page; a second page (P2) is created in its own window.
+        self._player = 1
+        self._link_peer = None               # the other PlayPage, when linked (local 2P)
+        self._net_link = None                # a core.link.TcpLink, when linked online
+        # A linked guest (player 2) runs LEAN: no audio sink of its own. Two audio
+        # sinks fighting for the device both crackle AND make the 1x audio-clock
+        # pacer stall (a starved sink returns 0 frames due, freezing that console
+        # for up to ~300 ms) -- which desyncs the two consoles enough to break a
+        # game's link handshake. Lean pages pace off the wall clock instead, at a
+        # steady 60 fps, and stay silent. Player 1 keeps the audio.
+        self._lean = False
+        self._link_tx_total = 0              # bytes this console has put on the cable
         self._play_t0: float | None = None   # wall clock since the game last resumed
         self.session: NativeSession | None = None
         self.machine = None
@@ -1737,7 +1843,7 @@ class PlayPage(QWidget):
         self._bindings: dict[int, int] = {}
         self._hotkeys: dict[int, str] = {}   # key code -> hotkey action id
         # -- input beyond the keyboard: a controller, and autofire.
-        self._pad = ngpc_input.XInputPad()
+        self._pad = ngpc_input.make_pad(0)
         self._pad_on = True                # the setting; the pad may still be absent
         self._pad_held = 0                 # controller mask, merged with `self.held`
         self._turbo_mask = 0               # joypad bits that autofire while held
@@ -1779,8 +1885,9 @@ class PlayPage(QWidget):
         self.lcd.setObjectName("lcd")
         self.lcd.setAlignment(Qt.AlignmentFlag.AlignCenter)   # centres the (letterboxed) frame
         outer.addWidget(self.lcd, 1)                          # stretch 1 -> fills the page
-        self.overlay = QLabel(""); self.overlay.setObjectName("overlay")
+        self.overlay = _OverlayLabel(""); self.overlay.setObjectName("overlay")
         self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.overlay.setVisible(False)   # empty -> takes no space (no stray bottom bar)
         outer.addWidget(self.overlay, 0, Qt.AlignmentFlag.AlignCenter)
         # On-screen stats (FPS etc.), a floating child pinned top-left over the canvas.
         self.osd = QLabel("", self); self.osd.setObjectName("osd")
@@ -1808,7 +1915,7 @@ class PlayPage(QWidget):
         # A little always-visible tab to bring the bar back when it is hidden.
         self._bar_show = QPushButton("▴", self); self._bar_show.setObjectName("barShow")
         self._bar_show.setFixedSize(30, 18)
-        self._bar_tips.append((self._bar_show, "Show toolbar", cfg.HK_TOOLBAR))
+        self._bar_tips.append((self._bar_show, "tb_show_toolbar", cfg.HK_TOOLBAR))
         self._refresh_toolbar_tips()
         self._bar_show.clicked.connect(lambda: self._toggle_toolbar(True))
         self._bar_show.hide()
@@ -1872,10 +1979,13 @@ class PlayPage(QWidget):
             pass
 
     def _bios_path(self) -> Path | None:
-        b = cfg.bios_path(self._settings)
-        if b and Path(b).is_file():
-            return Path(b)
-        return DEFAULT_BIOS if DEFAULT_BIOS.is_file() else None
+        return _resolve_bios(cfg.bios_path(self._settings))
+
+    def _using_hle_bios(self) -> bool:
+        """True when the BIOS in use is the clean-room HLE fallback (no real bios.bin).
+        The HLE image only supports the instant hand-off, not the console-boot path."""
+        p = self._bios_path()
+        return p is not None and p == HLE_BIOS
 
     def start(self, rom: Path) -> None:
         """Boot a game. Default is the instant hand-off (a running console handed
@@ -1889,17 +1999,27 @@ class PlayPage(QWidget):
         self.watches.load(self._watch_path())   # this ROM's named watches, if any
         self.breaks.load(self._break_path())    # ...and its execution breakpoints
         self._crashed = False
-        self._real_bios = cfg.real_bios(self._settings) and self._bios_path() is not None
+        # Console boot needs a real BIOS; the clean-room HLE only does the hand-off.
+        self._real_bios = (cfg.real_bios(self._settings)
+                           and self._bios_path() is not None
+                           and not self._using_hle_bios())
         self._power_pressed = False
         mode = cfg.save_mode(self._settings)
-        cap = cfg.flash_capacity_bytes(self._settings, Path(rom).stat().st_size)
+        # Unpack a .zip/.7z here (once) so the flash chip is sized on the ROM's real,
+        # uncompressed length -- the archive's file size would be wrong -- and the bytes
+        # are handed straight to the session instead of being read twice.
+        loaded = rom_loader.load(self._rom_path)
+        cap = cfg.flash_capacity_bytes(self._settings, len(loaded.data))
         self.session = NativeSession(
-            rom, bios_path=self._bios_path(), real_bios=self._real_bios,
+            rom, rom_bytes=loaded.data, from_archive=loaded.from_archive,
+            bios_path=self._bios_path(), real_bios=self._real_bios,
             save_to_rom=mode in (cfg.SAVE_ROM, cfg.SAVE_BOTH),
             sidecar=mode in (cfg.SAVE_SIDECAR, cfg.SAVE_BOTH),
             flash_size=cap, clock_mode=cfg.clock_mode(self._settings),
             k1ge_console=cfg.mono_mode(self._settings) == cfg.MONO_K1GE)
         self.machine = self.session.machine
+        if self._link_peer is not None:          # keep the cable live across a restart
+            self.machine.serial_set_enabled(True)
         # Silicon-calibrated cart-flash wait-states so self-timed games run at their
         # real 30fps instead of ~2x too fast. See cfg.cart_wait_states / project memo.
         if cfg.cart_wait_states(self._settings):
@@ -1920,7 +2040,7 @@ class PlayPage(QWidget):
         clock/date). One of the NGPC's signature features. Needs a BIOS image."""
         self.stop()
         bios = self._bios_path()
-        if bios is None:
+        if bios is None or bios == HLE_BIOS:   # console boot needs a real BIOS
             self.exit_requested.emit()
             return
         self._real_bios = True
@@ -1957,8 +2077,8 @@ class PlayPage(QWidget):
         self._play_t0 = time.perf_counter()
         self.overlay.setText("")
         self.apply_settings()
-        if cfg.audio_enabled(self._settings):
-            self._open_audio()
+        if cfg.audio_enabled(self._settings) and not self._lean:
+            self._open_audio()               # lean guests stay silent (see _lean)
         self.setFocus()
         self.timer.start(4)
 
@@ -2000,7 +2120,9 @@ class PlayPage(QWidget):
         self.machine = None
 
     def apply_settings(self) -> None:
-        self._bindings = cfg.key_bindings(self._settings)
+        self._bindings = cfg.key_bindings(self._settings, self._player)
+        self._pad = ngpc_input.make_pad(
+            cfg.player_pad_index(self._settings, self._player))
         self._hotkeys = cfg.hotkey_bindings(self._settings)
         self._refresh_toolbar_tips()      # a rebind must not leave the bar naming the old key
         self._turbo_mask = cfg.turbo_mask(self._settings)
@@ -2420,43 +2542,56 @@ class PlayPage(QWidget):
             self._bar_tips.append((b, tip, action))
             h.addWidget(b); return b
 
-        btn("☰", "Menu", self.open_menu, action=cfg.HK_MENU)
-        btn("⟲", "Reset", self._do_reset, action=cfg.HK_RESET)
+        # Tooltips are lang-file KEYS (see `_refresh_toolbar_tips`), so the whole bar
+        # is translatable from lang/*.json.
+        btn("☰", "tb_menu", self.open_menu, action=cfg.HK_MENU)
+        btn("⟲", "tb_reset", self._do_reset, action=cfg.HK_RESET)
+        self._link_btn = btn("🔗", "link_btn_tip", self._show_link_menu)
         h.addSpacing(10)
-        h.addWidget(QLabel("Slot"))
+        self._slot_lbl = QLabel(cfg.tr(cfg.language(self._settings), "tb_slot"))
+        h.addWidget(self._slot_lbl)
         self._slot_spin = QSpinBox(); self._slot_spin.setRange(1, STATE_SLOTS)
         self._slot_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._slot_spin.valueChanged.connect(lambda v: setattr(self, "_slot", v - 1))
         h.addWidget(self._slot_spin)
-        btn("💾", "Save state", lambda: self.save_state(), action=cfg.HK_SAVE)
-        btn("📂", "Load state", lambda: self.load_state(), action=cfg.HK_LOAD)
+        btn("💾", "tb_save_state", lambda: self.save_state(), action=cfg.HK_SAVE)
+        btn("📂", "tb_load_state", lambda: self.load_state(), action=cfg.HK_LOAD)
         h.addSpacing(10)
-        btn("📷", "Screenshot", self.screenshot, action=cfg.HK_SHOT)
+        btn("📷", "tb_screenshot", self.screenshot, action=cfg.HK_SHOT)
         h.addSpacing(10)
         rw = QPushButton("⏪"); rw.setObjectName("barBtn")
         rw.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         rw.pressed.connect(self.start_rewind); rw.released.connect(self.stop_rewind)
-        self._bar_tips.append((rw, "Hold to rewind", cfg.HK_REWIND))
+        self._bar_tips.append((rw, "tb_rewind", cfg.HK_REWIND))
         h.addWidget(rw)
-        btn("⏵", "Step one frame forward", self.step_forward, action=cfg.HK_STEP)
+        btn("⏵", "tb_step", self.step_forward, action=cfg.HK_STEP)
         h.addSpacing(10)
-        btn("−", "Slower", lambda: self.cycle_speed(False), action=cfg.HK_SLOWER)
+        btn("−", "tb_slower", lambda: self.cycle_speed(False), action=cfg.HK_SLOWER)
         self._speed_lbl = QLabel("1×"); self._speed_lbl.setObjectName("barSpeed")
         self._speed_lbl.setFixedWidth(36)
         self._speed_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         h.addWidget(self._speed_lbl)
-        btn("+", "Faster", lambda: self.cycle_speed(True), action=cfg.HK_FASTER)
-        self._ff_btn = btn("⏩", "Fast-forward toggle (or hold)", self._set_ff,
+        btn("+", "tb_faster", lambda: self.cycle_speed(True), action=cfg.HK_FASTER)
+        self._ff_btn = btn("⏩", "tb_ff", self._set_ff,
                            checkable=True, action=cfg.HK_FF)
         h.addStretch()
-        btn("⛶", "Fullscreen", self._toggle_fullscreen, action=cfg.HK_FS)
-        btn("▾", "Hide toolbar", lambda: self._toggle_toolbar(False), action=cfg.HK_TOOLBAR)
+        btn("⛶", "tb_fullscreen", self._toggle_fullscreen, action=cfg.HK_FS)
+        btn("▾", "tb_hide_toolbar", lambda: self._toggle_toolbar(False), action=cfg.HK_TOOLBAR)
         self._refresh_toolbar_tips()
         return bar
 
     def _refresh_toolbar_tips(self) -> None:
-        """Re-stamp each toolbar tooltip with the key that is actually bound now."""
+        """Re-stamp each toolbar tooltip with the key that is actually bound now.
+
+        Each `base` is a lang-file key, translated here through `cfg.tr` (which
+        returns the string unchanged when it is not a known key, so this stays safe
+        for any plain literal). Called on build, on rebind, and on language change,
+        so switching language re-translates the whole bar live."""
+        lang = cfg.language(self._settings)
+        if getattr(self, "_slot_lbl", None) is not None:
+            self._slot_lbl.setText(cfg.tr(lang, "tb_slot"))   # the "Slot" label is not a tip
         for button, base, action in self._bar_tips:
+            base = cfg.tr(lang, base)
             if action is None:
                 button.setToolTip(base)
                 continue
@@ -3031,6 +3166,77 @@ class PlayPage(QWidget):
             held = ngpc_input.apply_turbo(held, self._turbo_mask, self._frame, self._turbo_hz)
         return held & 0x7F
 
+    # ---- link cable (two-player) ------------------------------------------
+    def _show_link_menu(self) -> None:
+        """The 🔗 button: pick how to link a second console."""
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        m = QMenu(self)
+        m.addAction(t("link_2p_local"), self.link_requested.emit)
+        m.addSeparator()
+        m.addAction(t("link_online_lobby"), self.net_lobby_requested.emit)
+        m.addSeparator()
+        m.addAction(t("link_host_direct"), self.net_host_requested.emit)
+        m.addAction(t("link_join_direct"), self.net_join_requested.emit)
+        m.exec(self._link_btn.mapToGlobal(self._link_btn.rect().bottomLeft()))
+
+    def set_player(self, n: int) -> None:
+        """Make this page player `n`: reload its input bindings + gamepad."""
+        self._player = int(n)
+        self.apply_settings()
+
+    def attach_link(self, peer: "PlayPage") -> None:
+        """Wire this console to `peer` over the emulated link cable. Each page
+        relays its own transmitted bytes to the other's receive FIFO every frame
+        (a byte pipe -- no shared clock, honouring the peer's RTS)."""
+        self._link_peer = peer
+        if self.machine is not None:
+            self.machine.serial_set_enabled(True)
+
+    def detach_link(self) -> None:
+        if self.machine is not None:
+            self.machine.serial_set_enabled(False)
+        self._link_peer = None
+
+    def attach_net_link(self, net) -> None:
+        """Wire this console to a REMOTE peer over a core.link.TcpLink (LAN/online).
+        Only the local player controls this window; the cable carries the serial
+        bytes over the socket. Serial is enabled by the TcpLink itself."""
+        self._net_link = net
+        if self.machine is not None:
+            self.machine.serial_set_enabled(True)
+
+    def detach_net_link(self) -> None:
+        if self._net_link is not None:
+            self._net_link.disconnect()
+        self._net_link = None
+        if self.machine is not None and self._link_peer is None:
+            self.machine.serial_set_enabled(False)
+
+    def _pump_link(self) -> None:
+        if self._net_link is not None:           # online: relay over the socket
+            self._net_link.pump()
+            self._link_tx_total = self._net_link.bytes_out
+            return
+        peer = self._link_peer
+        if peer is None or peer.machine is None or self.machine is None:
+            return
+        # Cross-wire the CTS0 handshake pin: our CTS0 is the PEER's RTS line (the
+        # datasheet's "RTS is any GPIO -> the peer's CTS0"). With SC0MOD<CTSE> set,
+        # the core holds our transmit until CTS0 is low (peer ready), so INTTX0 fires
+        # only when the peer can receive -- what Card Fighters' Clash's mutual
+        # handshake needs. serial_rts() is True when RTS is LOW (ready).
+        self.machine.serial_set_cts(not peer.machine.serial_rts())
+        # Drain our transmit FIFO into the peer's receive FIFO unconditionally: the
+        # core's serial_tick is the authoritative flow-control gate -- it only
+        # PRESENTS a queued byte to the peer's CPU once the peer's RTS is low, so
+        # delivering early just queues it, exactly like a real cable. (Gating here
+        # on the peer's RTS instead could strand a handshake byte and read as
+        # "no cable".)
+        data = self.machine.serial_read_tx()
+        if data:
+            peer.machine.serial_write_rx(data)
+            self._link_tx_total += len(data)
+
     def _tick(self) -> None:
         if self.machine is None:
             return
@@ -3095,6 +3301,7 @@ class PlayPage(QWidget):
                 self.machine.set_write_log(*self.access_probe)
                 self.machine.set_read_log(*self.access_probe)
             summ = self.machine.run_frames(1)
+            self._pump_link()                    # relay this frame's serial bytes
             # Console-side load. `executed` is the game's own work for this frame, and a
             # changed sprite table means the game completed a logic update -- a game that
             # has fallen behind updates on fewer frames than the LCD draws. Read straight
@@ -3243,6 +3450,108 @@ class PlayPage(QWidget):
 
 
 # ---------------------------------------------------------------- shell
+def _local_ip() -> str:
+    """Best-effort LAN address to show a host (what a peer on the same network,
+    or the same Tailscale/ZeroTier net, dials). No packet is sent -- connecting a
+    UDP socket just resolves the default-route interface. Falls back to loopback."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+class _NetConnect(QThread):
+    """Background accept (host) or connect (join) so the UI never blocks on the
+    handshake. Emits the connected socket on success."""
+
+    connected = pyqtSignal(object)     # a connected socket.socket
+    failed = pyqtSignal(str)
+
+    def __init__(self, mode: str, host: str, port: int) -> None:
+        super().__init__()
+        self._mode = mode
+        self._host = host
+        self._port = port
+        self._srv = None
+
+    def run(self) -> None:
+        import socket
+        try:
+            if self._mode == "host":
+                self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self._srv.bind(("0.0.0.0", self._port))
+                self._srv.listen(1)
+                conn, _ = self._srv.accept()
+                self._srv.close(); self._srv = None
+            else:
+                conn = socket.create_connection((self._host, self._port), timeout=60)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.connected.emit(conn)
+        except Exception as e:  # noqa: BLE001 -- any failure is just "could not link"
+            self.failed.emit(str(e))
+
+    def cancel(self) -> None:
+        if self._srv is not None:               # unblock a pending accept()
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+
+
+class _LinkInput(QObject):
+    """Global key router for two-player link play. Two windows, one keyboard: the
+    OS delivers keys only to the focused window, so this app-level filter routes
+    each key to whichever player's bindings own it -- both play at once, whichever
+    window is focused. Keys that are not a joypad binding (hotkeys, text) fall
+    through untouched."""
+
+    def __init__(self, p1: "PlayPage", p2: "PlayPage") -> None:
+        super().__init__()
+        self._pages = (p1, p2)
+
+    def eventFilter(self, obj, e) -> bool:  # noqa: N802
+        t = e.type()
+        if t in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease) \
+                and isinstance(e, QKeyEvent) and not e.isAutoRepeat():
+            press = t == QEvent.Type.KeyPress
+            k = e.key()
+            for pg in self._pages:
+                bit = pg._bindings.get(k)     # noqa: SLF001 -- sibling in this module
+                if bit:
+                    if press:
+                        pg.held |= bit
+                    else:
+                        pg.held &= ~bit
+                    return True               # consumed: the focused page won't double-handle
+        return False
+
+
+class _Link2PWindow(QMainWindow):
+    """Player 2's window: a second, full PlayPage (its own toolbar, save states,
+    and -- crucially -- its own cartridge whose flash save loads normally)."""
+
+    closed = pyqtSignal()
+
+    def __init__(self, settings, library, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("NGPC — Player 2")
+        self.play = PlayPage(settings, library)
+        self.play._link_btn.hide()            # noqa: SLF001 -- P2 never re-links
+        self.setCentralWidget(self.play)
+        self.resize(SCREEN_W * 3, SCREEN_H * 3 + 40)
+
+    def closeEvent(self, e) -> None:          # noqa: N802
+        self.play.stop()
+        self.closed.emit()
+        super().closeEvent(e)
+
+
 class Shell(QMainWindow):
     def __init__(self, rom: str | None = None) -> None:
         super().__init__()
@@ -3315,7 +3624,18 @@ class Shell(QMainWindow):
         self.play.exit_requested.connect(self._to_library)
         self.play.options_requested.connect(self._play_options)
         self.play.debug_requested.connect(self._open_debug)
+        self.play.link_requested.connect(self._launch_link_2p)
+        self.play.net_host_requested.connect(self._host_online)
+        self.play.net_join_requested.connect(self._join_online)
+        self.play.net_lobby_requested.connect(self._open_lobby)
+        self._link2p = None                # the P2 window, when 2-player is active
+        self._link_input = None            # the global key router, when active
+        self._link_status = None           # P2 title-bar link diagnostic timer
+        self._net_thread = None            # background accept/connect, when linking online
+        self._net_status = None            # online link diagnostic timer
+        self._host_info = None             # the host connection-info dialog
         self.settings.changed.connect(self._on_settings_changed)
+        self.settings.storage_changed.connect(self._on_storage_changed)
         self.settings.scale_changed.connect(self.play.set_window_scale)
         self.settings.language_changed.connect(self._retranslate)
         self.settings.theme_changed.connect(self._restyle)
@@ -3455,6 +3775,7 @@ class Shell(QMainWindow):
         self._fit_rail()               # the new labels may not be the old width
         self.library.retranslate()
         self.settings.retranslate()
+        self.play._refresh_toolbar_tips()   # noqa: SLF001 -- re-translate the bottom toolbar
 
     def _update_rail(self, idx: int) -> None:
         playing = self.play.machine is not None
@@ -3503,6 +3824,151 @@ class Shell(QMainWindow):
         self._stack.setCurrentWidget(self.settings)
         self._update_rail(1)
 
+    def _launch_link_2p(self) -> None:
+        """Open player 2's window and wire the link cable. P2 chooses its OWN
+        cartridge (its flash save loads normally); the two consoles then exchange
+        serial bytes each frame. Input is split per player via a global router."""
+        if self._link2p is not None:              # already linked -> just surface it
+            self._link2p.raise_(); self._link2p.activateWindow(); return
+        if self.play.machine is None:
+            return                                 # nothing running to link to
+        start_dir = (str(self.play._rom_path.parent) if self.play._rom_path
+                     else str(DEFAULT_ROM_DIR))
+        rom2, _ = QFileDialog.getOpenFileName(
+            self, "Player 2 — choose a cartridge (may be the same as player 1)",
+            start_dir, "NGPC ROMs (*.ngc *.ngp *.npc);;All (*)")
+        if not rom2:
+            return
+        win = _Link2PWindow(self._settings, self._library_db, self)
+        p2 = win.play
+        p2.set_player(2)                           # P2 bindings + gamepad
+        p2._lean = True                            # silent + wall-clock paced (see _lean)
+        p2.start(Path(rom2))                       # its own flash save loads here
+        self.play.attach_link(p2)                  # wire the cable both ways
+        p2.attach_link(self.play)
+        self._link_input = _LinkInput(self.play, p2)
+        QApplication.instance().installEventFilter(self._link_input)
+        win.closed.connect(self._end_link_2p)
+        self._link2p = win
+        # Live link diagnostic in P2's title bar: if both counts climb once both
+        # consoles reach the game's VS / link menu, the cable is carrying bytes and
+        # any remaining "no link" is a protocol/timing detail; if they stay 0, the
+        # games are not probing serial through this path (or not both at the menu).
+        self._link_status = QTimer(self)
+        self._link_status.timeout.connect(self._refresh_link_title)
+        self._link_status.start(500)
+        self._refresh_link_title()
+        win.show(); win.raise_()
+
+    def _refresh_link_title(self) -> None:
+        if self._link2p is None:
+            return
+        p2 = self._link2p.play
+        self._link2p.setWindowTitle(
+            f"NGPC — Player 2   ⇄ cable  P1→{self.play._link_tx_total} B  "
+            f"P2→{p2._link_tx_total} B")
+
+    def _end_link_2p(self) -> None:
+        if self._link2p is None:
+            return
+        if getattr(self, "_link_status", None) is not None:
+            self._link_status.stop(); self._link_status = None
+        QApplication.instance().removeEventFilter(self._link_input)
+        self.play.detach_link()
+        self._link_input = None
+        self._link2p = None
+
+    # ---- online link (LAN / internet) -------------------------------------
+    def _host_online(self) -> None:
+        if self.play.machine is None:
+            return
+        port, ok = QInputDialog.getInt(
+            self, "Host a network game", "Listen on port:", 7788, 1, 65535)
+        if not ok:
+            return
+        self._start_net("host", "", int(port),
+                        f"⏳ waiting for player 2 on port {port}")
+        # Show the connection info (public IP auto-detected) + port-forward/risks help.
+        from ngpc_lobby import HostInfoDialog
+        game = self.play._rom_path.stem if self.play._rom_path else "?"
+        fr = cfg.language(self._settings) == "fr"
+        self._host_info = HostInfoDialog(game, int(port), fr, self)
+        self._host_info.show()
+
+    def _join_online(self) -> None:
+        if self.play.machine is None:
+            return
+        text, ok = QInputDialog.getText(
+            self, "Join a network game",
+            "Host address (IP or Tailscale name), e.g. 192.168.1.42:7788")
+        if not ok or not text.strip():
+            return
+        host, _, p = text.strip().partition(":")
+        port = int(p) if p.strip().isdigit() else 7788
+        self._start_net("join", host.strip(), port, f"⏳ connecting to {host}:{port}")
+
+    def _start_net(self, mode: str, host: str, port: int, waiting: str) -> None:
+        if self._net_thread is not None:            # one attempt at a time
+            return
+        self.play.overlay.setText(waiting)
+        self._net_thread = _NetConnect(mode, host, port)
+        self._net_thread.connected.connect(self._on_net_connected)
+        self._net_thread.failed.connect(self._on_net_failed)
+        self._net_thread.finished.connect(self._clear_net_thread)
+        self._net_thread.start()
+
+    def _clear_net_thread(self) -> None:
+        self._net_thread = None
+
+    def _on_net_connected(self, sock) -> None:
+        from core.link import TcpLink
+        if self.play.machine is None:
+            try: sock.close()
+            except OSError: pass
+            return
+        net = TcpLink(self.play.machine, sock)
+        self.play.attach_net_link(net)
+        self.play.overlay.setText("🔗 linked — open the game's VS / link menu")
+        self._net_status = QTimer(self)
+        self._net_status.timeout.connect(
+            lambda: self.setWindowTitle(
+                f"NgpCraft — online ⇄  out {net.bytes_out} B   in {net.bytes_in} B"))
+        self._net_status.start(500)
+
+    def _on_net_failed(self, msg: str) -> None:
+        self.play.overlay.setText(f"⚠ link failed: {msg}")
+
+    def _open_lobby(self) -> None:
+        if self.play.machine is None:
+            return
+        from ngpc_lobby import LobbyDialog
+        game = self.play._rom_path.stem if self.play._rom_path else "?"
+        dlg = LobbyDialog(self._settings, game, self)
+        dlg.linked.connect(self._on_lobby_linked)
+        dlg.exec()
+
+    def _on_lobby_linked(self, client) -> None:
+        from core.lobby import LobbyLink
+        if self.play.machine is None:
+            client.close(); return
+        net = LobbyLink(self.play.machine, client)
+        self.play.attach_net_link(net)
+        self.play.overlay.setText("🔗 linked — open the game's VS / link menu")
+        self._net_status = QTimer(self)
+        self._net_status.timeout.connect(
+            lambda: self.setWindowTitle(
+                f"NgpCraft — online ⇄  out {net.bytes_out} B   in {net.bytes_in} B"))
+        self._net_status.start(500)
+
+    def _end_net_link(self) -> None:
+        if self._net_status is not None:
+            self._net_status.stop(); self._net_status = None
+            self.setWindowTitle("NgpCraft")
+        if self._net_thread is not None:
+            self._net_thread.cancel()
+            self._net_thread = None
+        self.play.detach_net_link()
+
     def _open_debug(self) -> None:
         if self._debug_win is None:
             self._debug_win = DebugWindow(self, self._settings)
@@ -3511,6 +3977,9 @@ class Shell(QMainWindow):
         self._debug_win.activateWindow()
 
     def _to_library(self) -> None:
+        if self._link2p is not None:              # tear down 2-player first
+            self._link2p.close()                  # its closeEvent -> _end_link_2p
+        self._end_net_link()                      # ...and any online link
         self.play.stop()
         if self._debug_win is not None:
             self._debug_win.attach(None)
@@ -3523,6 +3992,17 @@ class Shell(QMainWindow):
         # "hide UI in fullscreen" toggle itself changes nothing about the window state --
         # so re-sync here too, or ticking it while already fullscreen would do nothing.
         self._sync_fullscreen_chrome()
+
+    def _on_storage_changed(self) -> None:
+        # The settings store moved (portable config.ini <-> registry) and the values
+        # were already migrated. Point the shell and every page at the new store so the
+        # rest of the session reads/writes the right place -- the lambdas bound to each
+        # page read `self._settings` at call time, so reassigning it is enough.
+        s = cfg.make_settings()
+        self._settings = s
+        self.library._settings = s
+        self.settings._settings = s
+        self.play._settings = s
 
     def _sync_fullscreen_chrome(self) -> None:
         """In fullscreen, optionally hide the sidebar and player toolbar so the game gets
