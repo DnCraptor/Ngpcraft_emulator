@@ -169,6 +169,70 @@ def test_tcp_link_relays_over_socket():
         link_b.disconnect()
 
 
+# --------------------------------------------------------------------------- #
+# 3. The same cable, with NO real BIOS — the clean-room HLE image drives it.
+# --------------------------------------------------------------------------- #
+HLE_IMAGE = REPO / "hle_bios" / "bios_hle.bin"
+
+requires_hle = pytest.mark.skipif(
+    not (HLE_IMAGE.exists() and ROM.exists()),
+    reason="needs hle_bios/bios_hle.bin and the probe ROM",
+)
+
+
+@requires_hle
+def test_link_cable_works_without_a_real_bios():
+    """Two consoles on the HLE image must exchange bytes exactly as on the retail
+    BIOS. The COM vectors used to be "cable idle" stubs, so nothing was ever handed
+    to SC0BUF and NOT ONE BYTE went on the wire — while the game's own TX counter
+    kept climbing, which is why a counter inside the game proves nothing.
+
+    This needs the whole chain: COMINIT arming INTES0 and lowering IFF, the rings at
+    0x6C80/0x6CC0, the RX count at 0x6D01 the probe reads itself, and the two serial
+    ISRs — which are CROSS-WIRED versus their SDK names (0x18 receives, 0x19
+    transmits). Wire them by name instead and each console receives its OWN byte:
+    the assertions below are on the OTHER console's byte precisely so that a
+    self-loopback fails the test.
+    """
+    from core.native_session import NativeSession
+
+    a = NativeSession(ROM, bios_path=HLE_IMAGE, autosave=False)
+    b = NativeSession(ROM, bios_path=HLE_IMAGE, autosave=False)
+    link = InProcessLink(a.machine, b.machine)
+
+    for _ in range(400):
+        a.machine.write(0x00B0, bytes([0x11]))
+        b.machine.write(0x00B0, bytes([0x22]))
+        a.run_frames(1)
+        b.run_frames(1)
+        link.pump()
+
+    def rd16(m, addr):
+        d = m.read(addr, 2)
+        return d[0] | (d[1] << 8)
+
+    assert a.machine.read(G_LAST_RX, 1)[0] == 0x22, "A did not receive B's byte"
+    assert b.machine.read(G_LAST_RX, 1)[0] == 0x11, "B did not receive A's byte"
+    assert rd16(a.machine, G_RX_TOTAL) > 100
+    assert rd16(b.machine, G_RX_TOTAL) > 100
+    assert link.bytes_ab > 100 and link.bytes_ba > 100, "nothing reached the wire"
+
+
+@requires_hle
+def test_hle_link_is_not_a_loopback():
+    """Enabled, but with no peer bridging its TX: it must receive nothing."""
+    from core.native_session import NativeSession
+
+    a = NativeSession(ROM, bios_path=HLE_IMAGE, autosave=False)
+    a.machine.serial_set_enabled(True)
+    for _ in range(200):
+        a.machine.write(0x00B0, bytes([0x33]))
+        a.run_frames(1)
+
+    d = a.machine.read(G_RX_TOTAL, 2)
+    assert (d[0] | (d[1] << 8)) == 0, "the console received its own transmission"
+
+
 @requires_rom
 def test_link_cable_disabled_is_unplugged():
     """With no peer wired in, a machine must never receive its own transmission

@@ -56,6 +56,17 @@ def check(code: str, strings: dict[str, str], base: dict[str, str]) -> int:
         shown = ", ".join(missing[:8]) + (" …" if len(missing) > 8 else "")
         print(f"  note   {len(missing)} untranslated (English will show): {shown}")
 
+    # A key present but still carrying the ENGLISH text is untranslated too -- and it is
+    # the case the counts above CANNOT see. We deliberately ship the file that way (a
+    # translator gets every key, in English, rather than a file with holes in it), so
+    # without this line "266/266 strings" would read as "done" when it is not.
+    english = sorted(k for k in set(strings) & set(base)
+                     if strings[k] == base[k] and len(base[k]) > 3)
+    if english and code != SOURCE:
+        shown = ", ".join(english[:8]) + (" …" if len(english) > 8 else "")
+        print(f"  note   {len(english)} still in English (nothing to fix if identical "
+              f"on purpose): {shown}")
+
     done = len(base) - len(missing)
     print(f"  {done}/{len(base)} strings, {errors} error(s)")
     return errors

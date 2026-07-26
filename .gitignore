@@ -22,6 +22,14 @@ system_ram.bin
 /roms/*.ngc
 /roms/*.ngp
 /bios.bin
+# ...and the ORIGINAL mono NGP BIOS, under every name that dump goes by. It is SNK's,
+# exactly like bios.bin: the app READS one the user supplies and SHIPS none. The only
+# BIOS this project distributes is hle_bios/bios_hle.bin, which is our own clean-room
+# image.
+/ngp_bios.*
+/ngpbios.*
+/bios_ngp.*
+/*.ngp
 
 # standalone-exe build (PyInstaller): keep build_exe.bat, ignore everything it generates
 /build/

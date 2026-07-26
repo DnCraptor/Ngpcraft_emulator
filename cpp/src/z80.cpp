@@ -875,6 +875,7 @@ void io_action_write(Machine& m, uint32_t address, uint8_t value) {
         m.serial_tx_byte = value;
         m.serial_tx_busy = true;
         m.serial_tx_cycles = kSerialByteCycles;
+        ++m.serial_tx_count;      /* debugger: the game IS talking, even if held */
     }
 }
 

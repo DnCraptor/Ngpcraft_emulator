@@ -169,6 +169,15 @@ constexpr uint8_t kFlashDeviceId3      = 0x80;
 constexpr uint32_t kBiosFlashCardType0 = 0x006C58;   /* CS0 -- the game cartridge */
 constexpr uint32_t kBiosFlashCardType1 = 0x006C59;   /* CS1 -- the development slot */
 
+/* `Language` (SDK SysWork.txt): 0 = Japanese, 1 = English, read-only to the cart.
+ * A bilingual cartridge picks its script from this byte and nothing else -- 24 games
+ * of the corpus read it. The console's setup wizard writes it and the coin cell keeps
+ * it; we skip that wizard, so it sat at 0 and every one of those games ran in Japanese
+ * by default rather than by choice. */
+constexpr uint32_t kSysLanguage        = 0x006F87;
+constexpr uint8_t  kLanguageJapanese   = 0;
+constexpr uint8_t  kLanguageEnglish    = 1;
+
 /* --- THE SUB-BATTERY: the console's RAM is NOT volatile ---------------------
  *
  * A NGPC keeps its 12 KiB of work RAM alive with a coin cell, which is why the BIOS
@@ -643,6 +652,22 @@ struct Machine {
     mutable bool    serial_rx_pending = false;
     mutable uint8_t serial_rx_byte = 0;
     int32_t  serial_rx_cycles = 0;
+    /* --- counters, for the debugger's Link tab (ngpc_serial_state) ----------
+     * Bytes crossing the cable are visible from Python, but WHY they are not
+     * crossing is not: a byte can sit in serial_tx_busy because the peer holds
+     * CTS, sit in serial_rx because our own RTS is high, or be presented and
+     * never read because the BIOS's receive interrupt is masked. Counting each
+     * step separates "no cable" from "cable fine, nobody is draining it" --
+     * exactly the question the 2P-greyed-out hunt had to answer by guesswork.
+     * Pure observation: nothing here feeds back into emulation. */
+    uint32_t serial_tx_count = 0;        /* bytes the CPU handed to SC0BUF     */
+    uint32_t serial_wire_count = 0;      /* ...that finished shifting out      */
+    uint32_t serial_rx_queued_count = 0; /* bytes the host pushed at us        */
+    mutable uint32_t serial_rx_read_count = 0;  /* ...that the CPU read back   */
+    uint32_t serial_irq_tx_count = 0;    /* INTTX0 raised (vector 0x19)        */
+    uint32_t serial_irq_rx_count = 0;    /* INTRX0 raised (vector 0x18)        */
+    uint32_t serial_cts_hold_ticks = 0;  /* ticks a byte was held by CTS0 high */
+    uint32_t serial_rts_hold_ticks = 0;  /* ticks RX was held by our own RTS   */
     void serial_tick(uint32_t cycles);
 
     /* --- the on-board calendar IC (RTC), I/O 0x90..0x97 --------------------
@@ -768,6 +793,10 @@ struct Machine {
      * not exist on that silicon, so writes to it are ignored and the BIOS grey ramp
      * stands. Set BEFORE reset. */
     bool k1ge_console = false;
+    /* WHICH LANGUAGE THE CONSOLE IS SET TO -- `Language` at 0x6F87 (see the constants).
+     * A setting, exactly like the clock: on a console the setup wizard writes it and
+     * the coin cell keeps it. Handed to the cart at the hand-off. Set BEFORE reset. */
+    uint8_t language_code = kLanguageEnglish;
     /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1 (default 7); may be a floor
      * like MUL/DIV were. 14 reproduces Cool Boarders' silicon 30fps without touching Fatal
      * Fury. `ngpc_set_ldir_cost` is the knob; pending a clean silicon measurement. */
@@ -844,6 +873,15 @@ struct Machine {
 
     void flash_build_blocks(int chip, uint32_t size);
     void flash_adopt_capacity_from_save(int chip, uint32_t offset);
+    void flash_adopt_capacity_from_block(int chip, uint32_t block);
+    void flash_present_as(int chip, uint32_t capacity);
+    uint32_t flash_presented_capacity(int chip) const;
+    uint32_t flash_image_size(int chip) const;
+    void     flash_measure_image();           /* once, when the cartridge goes in */
+    uint32_t flash_image_bytes[2] = {0, 0};   /* data on each die, erased tail excluded */
+    /* What a game asked the BIOS for, read at the `swi 1` -- BEFORE the BIOS turns it
+     * into an address. That is the only moment the CARD NUMBER is still visible. */
+    void bios_flash_syscall_hint();
     void flash_program(int chip, uint32_t base, uint32_t addr, uint8_t data);
     void flash_erase_block(int chip, uint32_t base, uint32_t addr);
     void flash_erase_all(int chip, uint32_t base);
@@ -896,7 +934,11 @@ struct Machine {
         /* SC0BUF (0x50): when the link is presenting a received byte, reading it
          * IS the RX handler consuming it -- return it and clear the pending flag
          * (the overrun guard). Otherwise it is a plain I/O byte. */
-        if (a == 0x000050 && serial_rx_pending) { serial_rx_pending = false; return serial_rx_byte; }
+        if (a == 0x000050 && serial_rx_pending) {
+            serial_rx_pending = false;
+            ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+            return serial_rx_byte;
+        }
         /* Port 0xB1: bit1 = the CR2032 SUB-BATTERY, bit2 = a must-be-1 line (drop it and
          * SNK Gals' Fighter reports a link error). Leaving them 0 is the whole
          * "SUB BATTERY DEAD" loop -- the BIOS reads a dead coin cell and never leaves

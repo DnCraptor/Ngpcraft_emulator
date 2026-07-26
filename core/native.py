@@ -200,6 +200,29 @@ class ApuState(Structure):
     ]
 
 
+class SerialState(Structure):
+    """A read-only look at the link cable, for the debugger. Mirrors
+    `ngpc_serial_state_t`.
+
+    The bytes that DO cross the cable are already visible to whoever relays them
+    (core/link.py). What this adds is the stage a byte is stuck at when it does
+    NOT: held by the peer's CTS, queued while our own RTS is high, or presented
+    at SC0BUF and never read because nothing is draining it. That is the
+    difference between "no cable" and "cable fine, the game is not listening".
+    """
+
+    _fields_ = [(name, c_uint32) for name in (
+        "enabled", "tx_depth", "rx_depth", "tx_busy", "rx_pending",
+        "cts_high", "rts_low", "ctse",
+        "tx_count", "wire_count", "rx_queued_count", "rx_read_count",
+        "irq_tx_count", "irq_rx_count", "cts_hold_ticks", "rts_hold_ticks",
+        "sc0buf", "sc0cr", "sc0mod", "br0cr", "port_b1", "port_b2",
+    )]
+
+    def as_dict(self) -> dict[str, int]:
+        return {name: int(getattr(self, name)) for name, _ in self._fields_}
+
+
 class WriteRec(Structure):
     """One logged memory write: who wrote, where, what. Mirrors `ngpc_write_t`."""
 
@@ -343,6 +366,8 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_serial_rts.restype = c_int
     lib.ngpc_serial_set_cts.argtypes = [c_void_p, c_int]
     lib.ngpc_serial_set_cts.restype = None
+    lib.ngpc_serial_state.argtypes = [c_void_p, POINTER(SerialState)]
+    lib.ngpc_serial_state.restype = None
     lib.ngpc_get_apu_state.argtypes = [c_void_p, POINTER(ApuState)]
     lib.ngpc_get_apu_state.restype = None
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
@@ -387,6 +412,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_ldir_cost.restype = None
     lib.ngpc_set_flash_size.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_flash_size.restype = None
+    lib.ngpc_flash_capacity.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_flash_capacity.restype = c_uint32
+    lib.ngpc_set_language.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_language.restype = None
     lib.ngpc_bus_write.argtypes = [c_void_p, c_uint32, c_uint8]
     lib.ngpc_bus_write.restype = None
     lib.ngpc_flash_dirty.argtypes = [c_void_p]
@@ -554,6 +583,21 @@ class NativeMachine:
         map). Lets an under-filled homebrew ROM save in its chip's top block. See
         ngpc_set_flash_size in core.cpp."""
         self._lib.ngpc_set_flash_size(self._h, int(chip), int(size_bytes))
+
+    def flash_capacity(self, chip: int = 0) -> int:
+        """What the chip presents as NOW -- not what was set. The cartridge corrects us
+        mid-session by the block number it asks for, so this is the size to persist a
+        save at; see ngpc_flash_capacity in core.cpp for what happens if you use the
+        guess instead. 0 = no cartridge in that slot."""
+        return int(self._lib.ngpc_flash_capacity(self._h, int(chip)))
+
+    LANGUAGE_JAPANESE, LANGUAGE_ENGLISH = 0, 1
+
+    def set_language(self, code: int) -> None:
+        """The console's language setting, handed to the cart at 0x6F87 (SDK SysWork:
+        0 = Japanese, 1 = English). A bilingual cartridge reads this byte and nothing
+        else -- 24 games of the corpus do. Set BEFORE reset."""
+        self._lib.ngpc_set_language(self._h, int(code))
 
     def set_timer_base(self, cycles_per_phi_t1: int) -> None:
         """phi-T1 in CPU cycles. The docs contradict each other; see ngpc_core.h."""
@@ -949,6 +993,14 @@ class NativeMachine:
         the peer's RTS state here each pump so the hardware handshake is modelled.
         """
         self._lib.ngpc_serial_set_cts(self._h, 1 if high else 0)
+
+    def serial_state(self) -> SerialState:
+        """Snapshot the serial channel: FIFO depths, handshake lines, the SC0
+        registers and the per-stage byte/interrupt counters. Read-only -- see
+        SerialState. Feeds the debugger's Link tab."""
+        st = SerialState()
+        self._lib.ngpc_serial_state(self._h, ctypes.byref(st))
+        return st
 
     def run_frames(self, frames: int = 1, *, max_instrs: int | None = None) -> Summary:
         """Advance whole FRAMES. The core owns the raster, so it owns the boundary.

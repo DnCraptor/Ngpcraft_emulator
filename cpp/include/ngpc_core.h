@@ -356,6 +356,39 @@ NGPC_API void     ngpc_serial_write_rx(ngpc_t*, const uint8_t* data, uint32_t n)
 NGPC_API int      ngpc_serial_rts(ngpc_t*);
 NGPC_API void     ngpc_serial_set_cts(ngpc_t*, int high);
 
+/* A read-only snapshot of the serial channel, for the debugger's Link tab.
+ * How many bytes crossed is already visible to the host that relays them; what
+ * is NOT visible is why they did not -- a byte held by the peer's CTS, a byte
+ * queued while our own RTS is high, a byte presented and never read because the
+ * BIOS receive interrupt is masked. These counters name the stage each byte is
+ * stuck at. Observation only: reading this changes nothing. */
+typedef struct {
+    uint32_t enabled;         /* link armed (cable "plugged in")                */
+    uint32_t tx_depth;        /* bytes transmitted, waiting for the host to relay */
+    uint32_t rx_depth;        /* bytes the host queued, not yet presented        */
+    uint32_t tx_busy;         /* a byte is shifting out (or held by CTS)         */
+    uint32_t rx_pending;      /* a byte sits in SC0BUF, unread by the CPU        */
+    uint32_t cts_high;        /* peer says "not ready" (our CTS0 input)          */
+    uint32_t rts_low;         /* WE say "ready to receive" (0xB2 bit0 == 0)      */
+    uint32_t ctse;            /* game enabled the CTS gate (SC0MOD bit6)         */
+    uint32_t tx_count;        /* bytes the CPU wrote to SC0BUF                   */
+    uint32_t wire_count;      /* ...that finished shifting out                   */
+    uint32_t rx_queued_count; /* bytes the host pushed at us                     */
+    uint32_t rx_read_count;   /* ...that the CPU actually read back              */
+    uint32_t irq_tx_count;    /* INTTX0 raised (vector 0x19 on this BIOS)        */
+    uint32_t irq_rx_count;    /* INTRX0 raised (vector 0x18 on this BIOS)        */
+    uint32_t cts_hold_ticks;  /* ticks a byte was held by CTS0 high              */
+    uint32_t rts_hold_ticks;  /* ticks RX was held by our own RTS                */
+    uint32_t sc0buf;          /* I/O 0x50..0x53 and the two port bits, as read   */
+    uint32_t sc0cr;
+    uint32_t sc0mod;
+    uint32_t br0cr;
+    uint32_t port_b1;         /* bit2 = cable-detect the games poll             */
+    uint32_t port_b2;         /* bit0 = RTS                                      */
+} ngpc_serial_state_t;
+
+NGPC_API void ngpc_serial_state(ngpc_t*, ngpc_serial_state_t* out);
+
 /* The prescaler's phi-T1 period, in CPU cycles. THE SOURCES CONTRADICT EACH OTHER
  * BY A FACTOR OF 32 and neither yields a musical tempo, so this is a knob, not a
  * constant, until an ear or a capture settles it:

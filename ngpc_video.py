@@ -100,18 +100,41 @@ def _apply_filter(scaled: np.ndarray, filt: str, scale: int) -> np.ndarray:
     return out.astype(np.uint8)
 
 
-def render_array(fb, scale: int, filt: str, color: str) -> np.ndarray:
-    """Full pipeline -> a contiguous (H*scale, W*scale, 3) uint8 RGB array."""
+def render_array(fb, scale: int, filt: str, color: str, scaler=None) -> np.ndarray:
+    """Full pipeline -> a contiguous (H*scale, W*scale, 3) uint8 RGB array.
+
+    `scaler(rgb) -> (rgb, factor)` is an optional plugin upscaler (see ngpc_filters). It
+    runs on the SMALL picture, where a neighbour-comparing scaler has neighbours that
+    mean something, and whatever magnification it did is deducted from the plain pixel
+    repeat that follows. The scanline / LCD / CRT filters still apply on top, at the
+    final size, so the two kinds compose instead of competing.
+
+    A factor that does not divide the requested scale (x2 asked for x3) is NOT rounded
+    up: we never hand back a picture bigger than the caller asked for. It comes out at
+    the largest multiple that fits (x2 here) and `fit_pixmap` covers the remainder, the
+    same way it already does for any window that is not an exact multiple.
+    """
     scale = max(1, int(scale))
     rgb = _apply_color(_decode(fb), color)
+    if scaler is not None:
+        out, factor = scaler(rgb)
+        # A x2 scaler cannot honour a request for 1:1 -- at that size (a small window,
+        # a 1x screenshot) the plugin is simply not applicable, and growing the picture
+        # anyway would hand back something bigger than the caller asked for.
+        if out is not None and 0 < factor <= scale:
+            rgb = out
+            scale = max(1, scale // factor)
     if scale > 1:
         rgb = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
-        rgb = _apply_filter(rgb, filt, scale)
+    if filt != FILTER_NONE:
+        # The post-filter draws its grid on the FINAL picture: a scaler that already
+        # magnified must not make the scanlines twice as thick as they were asked to be.
+        rgb = _apply_filter(rgb, filt, max(1, rgb.shape[0] // SCREEN_H))
     return np.ascontiguousarray(rgb)
 
 
-def render_pixmap(fb, scale: int, filt: str, color: str, smooth: bool) -> QPixmap:
-    arr = render_array(fb, scale, filt, color)
+def render_pixmap(fb, scale: int, filt: str, color: str, smooth: bool, scaler=None) -> QPixmap:
+    arr = render_array(fb, scale, filt, color, scaler)
     h, w = arr.shape[:2]
     img = QImage(arr.data, w, h, 3 * w, QImage.Format.Format_RGB888)
     # keep the buffer alive for the QImage's lifetime by stashing it on the pixmap

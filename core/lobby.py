@@ -20,6 +20,8 @@ from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from core.link_debug import deliver_injected
+
 FRAME_CONTROL = 1
 FRAME_RELAY = 2
 _HDR = 5
@@ -173,22 +175,31 @@ class LobbyLink:
     (pump / disconnect / bytes_out / bytes_in) so PlayPage.attach_net_link reuses
     the same code path."""
 
-    def __init__(self, machine, client: LobbyClient):
+    def __init__(self, machine, client: LobbyClient, *, monitor=None):
         self.machine = machine
         self.client = client
+        # Optional core.link_debug.LinkMonitor -- the same tap the local and LAN
+        # links carry, so the debugger's Link tab reads a lobby game too.
+        self.monitor = monitor
         self.bytes_out = 0
         self.bytes_in = 0
         self.machine.serial_set_enabled(True)
 
     def pump(self) -> None:
         tx = self.machine.serial_read_tx(256)
-        if tx:
-            self.client.send_serial(tx)
-            self.bytes_out += len(tx)
+        # Call the monitor even on an empty drain: it may be holding bytes back
+        # for a simulated latency, and this is where they are released.
+        out = self.monitor.on_tx(tx) if self.monitor is not None else tx
+        if out:
+            self.client.send_serial(out)
+            self.bytes_out += len(out)
         rx = self.client.read_serial()
         if rx:
             self.machine.serial_write_rx(rx)
             self.bytes_in += len(rx)
+            if self.monitor is not None:
+                self.monitor.on_rx(rx)
+        deliver_injected(self.machine, self.monitor)
 
     def disconnect(self) -> None:
         try:

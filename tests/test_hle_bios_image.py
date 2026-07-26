@@ -93,3 +93,49 @@ class HleBiosBoots(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyscallVectorNumbers(unittest.TestCase):
+    """THE VECTOR NUMBERS ARE SYSTEM.INC'S, and nothing else's.
+
+    A second doc in this repo numbers FLASHPROTECT 9. Nine is ALARMSET. Following it
+    meant a game setting an alarm would instead have IRREVERSIBLY protected a block of
+    its own cartridge -- a save silently lost, from a one-line table. So the numbers
+    are pinned against the SDK header rather than against whichever doc was open.
+    """
+
+    SYSTEM_INC = {
+        "SHUTDOWN": 0x00, "CLOCKGEARSET": 0x01, "RTCGET": 0x02, "INTLVSET": 0x04,
+        "SYSFONTSET": 0x05, "FLASHWRITE": 0x06, "FLASHALLERS": 0x07, "FLASHERS": 0x08,
+        "ALARMSET": 0x09, "ALARMDOWNSET": 0x0B, "FLASHPROTECT": 0x0D, "GEMODESET": 0x0E,
+    }
+
+    @staticmethod
+    def _gen():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "gen_crt0", REPO / "hle_bios" / "gen_crt0.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_each_stub_sits_on_its_sdk_vector_number(self):
+        table = self._gen().SC_STUB
+        for name, vec in self.SYSTEM_INC.items():
+            stub = table.get(vec)
+            if stub is None:
+                continue                      # deliberately not implemented
+            expect = name.lower().replace("recive", "recv")
+            self.assertIn(expect[:6].lower(), stub.lower(),
+                          f"vector {vec:#04x} should be {name}, table says {stub}")
+
+    def test_flashprotect_is_not_on_the_alarm_vector(self):
+        table = self._gen().SC_STUB
+        self.assertEqual(table[0x09], "_sc_alarmset")
+        self.assertEqual(table[0x0D], "_sc_flashprotect")
+
+    def test_clockgearset_is_left_alone_on_purpose(self):
+        """49 games call it -- the most of any vector -- and it must stay a no-op:
+        this core runs at a fixed 6.144 MHz and models no clock gear at all. Answering
+        it with anything else would be inventing a machine we do not emulate."""
+        self.assertNotIn(0x01, self._gen().SC_STUB)

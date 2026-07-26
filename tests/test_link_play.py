@@ -94,3 +94,51 @@ def test_shell_link_2p_launch_and_relay(app, monkeypatch):
         if sh._link2p is not None:
             sh._link2p.close()
         sh.play.stop()
+
+
+def test_shell_link_2p_monitor_taps_the_relay(app, monkeypatch):
+    """The debugger's tap on the SHELL's own relay (PlayPage._pump_link, which is
+    a separate code path from core.link's): what P1 transmits must show up in P1's
+    monitor as TX and in P2's as RX, and cutting P1's wire must actually stop the
+    bytes reaching P2."""
+    import ngpc_shell
+    from PyQt6.QtWidgets import QFileDialog
+    from core.link_debug import RX, TX, Impairment, LinkMonitor
+
+    sh = ngpc_shell.Shell()
+    try:
+        sh._settings.setValue("paths/bios", str(BIOS))
+        sh.play._frames_due = lambda: 1
+        sh.play.start(ROM)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                            staticmethod(lambda *a, **k: (str(ROM), "")))
+        sh._launch_link_2p()
+        p2 = sh._link2p.play
+        p2._frames_due = lambda: 1
+
+        mon1, mon2 = LinkMonitor(), LinkMonitor()
+        sh.play.set_link_monitor(mon1)
+        p2.set_link_monitor(mon2)
+        sh.play.held, p2.held = 0x08, 0x01
+
+        for _ in range(300):
+            sh.play._tick()
+            p2._tick()
+
+        assert mon1.bytes_tx > 0 and mon1.bytes_rx > 0
+        assert mon1.raw(TX) == mon2.raw(RX), "P1's transmissions ARE P2's arrivals"
+        assert sh.play.link_mode() == "local2p"
+
+        # cut P1's wire: P2 stops hearing, P1 keeps hearing P2
+        mon1.impair = Impairment(cut=True)
+        before_p2 = p2.machine.serial_state().rx_queued_count
+        before_p1 = sh.play.machine.serial_state().rx_queued_count
+        for _ in range(200):
+            sh.play._tick()
+            p2._tick()
+        assert p2.machine.serial_state().rx_queued_count == before_p2
+        assert sh.play.machine.serial_state().rx_queued_count > before_p1
+    finally:
+        if sh._link2p is not None:
+            sh._link2p.close()
+        sh.play.stop()

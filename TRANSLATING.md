@@ -64,6 +64,11 @@ safe: English shows instead. Inventing a key that does not exist in `en.json` is
 not — the real key then stays untranslated forever and nobody notices, so the
 checker rejects it.
 
+**The file you receive has every key, and the ones nobody has translated yet carry
+the ENGLISH text.** That is deliberate: a file with holes in it hides how much is
+left, and a machine-translated placeholder is worse still — it looks finished, so
+nobody knows to check it. If a string reads as English, it is waiting for you.
+
 ## What the checker tells you
 
 ```
@@ -73,8 +78,11 @@ python tools/i18n_check.py pt       # just yours
 
 - `ERROR placeholders […] in en, […] here` — fix this, it is a runtime crash.
 - `ERROR not a key of en.json` — a typo in a key name; copy it from `en.json`.
-- `note N untranslated` — informational, shows how complete you are. Not a
-  failure; you can merge and finish later.
+- `note N untranslated` — keys your file does not have at all. Informational;
+  English shows for them and you can merge and finish later.
+- `note N still in English` — keys your file HAS, carrying the English text. This
+  is the real backlog (see above). Some are identical on purpose — `Audio`, `CRT`,
+  a file-name pattern — and those need nothing.
 
 The same checks run in the test suite (`tests/test_i18n.py`) against whatever
 languages the repo ships, so a PR that adds `lang/pt.json` is automatically

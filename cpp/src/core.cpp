@@ -32,6 +32,7 @@ NGPC_API int ngpc_load_rom(ngpc_t* h, const uint8_t* data, size_t len) {
     if (!h || !data || len < 0x30) return -1;   /* ROM_HEADER_SIZE */
     Machine* m = reinterpret_cast<Machine*>(h);
     m->rom.assign(data, data + len);
+    m->flash_measure_image();
     /* The cartridge IS the flash chip. Its block map comes from its size, and a game
      * saves by erasing and programming the small blocks at the top (SDK FlashMem.txt).
      *
@@ -269,7 +270,28 @@ NGPC_API void ngpc_reset(ngpc_t* h, int reset_mode) {
     m->flash_mode[0] = m->flash_mode[1] = Machine::FlashRead;
     m->flash_step[0] = m->flash_step[1] = 0;
 
+    /* ⚡ THE LANGUAGE. `Language` (0x6F87, SDK SysWork.txt): 0 = Japanese, 1 = English,
+     * read-only to the cartridge -- and READ BY 24 GAMES of the corpus. A dual-language
+     * cartridge picks its script from this byte and nothing else.
+     *
+     * ⚠️ WHO OWNS IT DEPENDS ON HOW YOU BOOTED, because the two modes are two different
+     * machines to configure:
+     *
+     *   * CONSOLE BOOT runs the real BIOS, which HAS a setup screen. That screen is the
+     *     console's own control panel: what the player sets there is written into
+     *     battery RAM and kept (`commit_system_ram` saves that page live). Stamping a
+     *     setting over it would make the BIOS screen a decoration -- you would change
+     *     the language on it and watch the emulator undo the choice at the next launch.
+     *     So here we write nothing: the coin cell answers.
+     *   * THE HAND-OFF skips that screen entirely. Nothing would ever write the byte,
+     *     and its power-on value is 0 -- Japanese, chosen by nobody. The setting is the
+     *     only control panel this mode has, so it lands here.
+     *
+     * A first console boot on a blank cell still stops at the BIOS setup, which is where
+     * the choice belongs on that path; it is now SAVED, which it was not before. */
     if (apply_bios_handoff) {
+        m->mem[kSysLanguage] = m->language_code;
+
         /* State the real BIOS leaves for the cart at entry. Without XSP a real
          * ROM cannot execute its first instruction (it is a CALL).
          *
@@ -987,6 +1009,28 @@ NGPC_API void ngpc_set_flash_size(ngpc_t* h, uint32_t chip, uint32_t bytes) {
     reinterpret_cast<Machine*>(h)->flash_build_blocks(int(chip), bytes);
 }
 
+/* The console's language setting, handed to the cartridge at 0x6F87 on the hand-off:
+ * 0 = Japanese, 1 = English (SDK SysWork.txt). 24 games of the corpus read it, and a
+ * bilingual cartridge has nothing else to go on. On real hardware the setup wizard
+ * writes it and the coin cell remembers; we skip the wizard, so this is where the
+ * choice lives. Set BEFORE reset. */
+NGPC_API void ngpc_set_language(ngpc_t* h, uint32_t code) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->language_code = uint8_t(code ? 1 : 0);
+}
+
+/* What the chip currently presents as -- WHICH IS NOT ALWAYS WHAT WAS SET. The cartridge
+ * corrects us mid-session (flash_adopt_capacity_from_block / _from_save), and whoever
+ * persists the save has to know: writing the .ngc back at the size we GUESSED pads an
+ * under-filled cart out to a size it never had, and on the next load that padding reads
+ * as image -- which is precisely what stops the cart from correcting us a second time.
+ * Measured before this existed: a 512 KiB cart saved fine, its file grew to 2 MiB, and
+ * every save from the second session on was ANDed into an unerased slot. 0 = empty slot. */
+NGPC_API uint32_t ngpc_flash_capacity(ngpc_t* h, uint32_t chip) {
+    if (!h || chip > 1) return 0;
+    return reinterpret_cast<Machine*>(h)->flash_presented_capacity(int(chip));
+}
+
 NGPC_API void ngpc_raise_irq(ngpc_t* h, uint32_t vector_index) {
     if (!h || vector_index >= 32) return;
     reinterpret_cast<Machine*>(h)->irq_pending |= (1u << vector_index);
@@ -1002,6 +1046,12 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
     if (!h) return;
     Machine& m = *reinterpret_cast<Machine*>(h);
     m.serial_link_enabled = (on != 0);
+    /* Counters are per-cable-session: plugging in starts a fresh reading, so the
+     * debugger's totals answer "since this link came up", not "since power-on". */
+    m.serial_tx_count = m.serial_wire_count = 0;
+    m.serial_rx_queued_count = m.serial_rx_read_count = 0;
+    m.serial_irq_tx_count = m.serial_irq_rx_count = 0;
+    m.serial_cts_hold_ticks = m.serial_rts_hold_ticks = 0;
     if (!on) {
         m.serial_tx.clear();
         m.serial_rx.clear();
@@ -1029,6 +1079,7 @@ NGPC_API void ngpc_serial_write_rx(ngpc_t* h, const uint8_t* data, uint32_t n) {
     if (!h || !data) return;
     Machine& m = *reinterpret_cast<Machine*>(h);
     for (uint32_t i = 0; i < n; ++i) m.serial_rx.push_back(data[i]);
+    m.serial_rx_queued_count += n;
 }
 
 /* 1 = this machine's RTS is low (ready to receive), 0 = holding the peer off.
@@ -1046,6 +1097,43 @@ NGPC_API int ngpc_serial_rts(ngpc_t* h) {
 NGPC_API void ngpc_serial_set_cts(ngpc_t* h, int high) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->serial_cts_high = (high != 0);
+}
+
+/* Read-only snapshot of the whole channel for the debugger's Link tab. Every
+ * field is either a counter incremented where the event happens or a register
+ * read straight out of the I/O page -- no state is touched, so watching costs
+ * nothing and changes nothing. See ngpc_serial_state_t for what each means. */
+NGPC_API void ngpc_serial_state(ngpc_t* h, ngpc_serial_state_t* out) {
+    if (!h || !out) return;
+    const Machine& m = *reinterpret_cast<const Machine*>(h);
+    out->enabled         = m.serial_link_enabled ? 1u : 0u;
+    out->tx_depth        = uint32_t(m.serial_tx.size());
+    out->rx_depth        = uint32_t(m.serial_rx.size());
+    out->tx_busy         = m.serial_tx_busy ? 1u : 0u;
+    out->rx_pending      = m.serial_rx_pending ? 1u : 0u;
+    out->cts_high        = m.serial_cts_high ? 1u : 0u;
+    out->rts_low         = (m.mem[0x0000B2] & 0x01) == 0 ? 1u : 0u;
+    out->ctse            = (m.mem[0x000052] & 0x40) != 0 ? 1u : 0u;
+    out->tx_count        = m.serial_tx_count;
+    out->wire_count      = m.serial_wire_count;
+    out->rx_queued_count = m.serial_rx_queued_count;
+    out->rx_read_count   = m.serial_rx_read_count;
+    out->irq_tx_count    = m.serial_irq_tx_count;
+    out->irq_rx_count    = m.serial_irq_rx_count;
+    out->cts_hold_ticks  = m.serial_cts_hold_ticks;
+    out->rts_hold_ticks  = m.serial_rts_hold_ticks;
+    out->sc0buf          = m.mem[0x000050];
+    out->sc0cr           = m.mem[0x000051];
+    out->sc0mod          = m.mem[0x000052];
+    out->br0cr           = m.mem[0x000053];
+    /* 0xB1 as the GAME sees it, not as it sits in the I/O page. read8 forces the
+     * sub-battery bit and drives bit2 -- the cable-DETECT line Card Fighters'
+     * Clash gates its handshake on -- from the cable state, so dumping the raw
+     * byte here would report "no cable" on a working one. Mirrors machine.hpp. */
+    out->port_b1         = uint32_t(uint8_t(
+        m.serial_link_enabled ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
+                              :  (m.mem[0x0000B1] | 0x02 | 0x04)));
+    out->port_b2         = m.mem[0x0000B2];
 }
 
 NGPC_API void ngpc_set_apu_channel_mask(ngpc_t* h, uint32_t mask) {

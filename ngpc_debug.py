@@ -20,6 +20,7 @@ controls.
 from __future__ import annotations
 
 import math
+import time
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +39,7 @@ from core.watches import Watch
 from core.exec_breaks import ExecBreak
 from core.ramsearch import RamSearch
 from core.symbols import SymbolTable, load_map
+from core import link_debug
 from core.vgm_export import VgmRecorder
 from core.ngps_export import NgpsRecorder
 import ngpc_theme
@@ -464,6 +466,10 @@ class DebugWindow(QMainWindow):
         self._cs_on = False                # call-stack tracking currently armed in the core
         self._vgm_rec = None               # last VGM capture, kept for saving
         self._song_rec = None              # last .ngps capture, kept for saving
+        self._link_mon = None              # LinkMonitor tapping the cable, once armed
+        self._link_log_len = -1            # log entries already rendered
+        self._link_rate_sample = (time.monotonic(), 0, 0)   # (t, tx, rx) for B/s
+        self._link_rate_shown = (0.0, 0.0)
 
         top = QWidget(); self.setCentralWidget(top)
         v = QVBoxLayout(top); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(6)
@@ -504,6 +510,7 @@ class DebugWindow(QMainWindow):
         self._tabs.addTab(self._crack_tab(), "Crack")
         self._tabs.addTab(self._pointers_tab(), "Pointers")
         self._tabs.addTab(self._compare_tab(), "Compare")
+        self._tabs.addTab(self._link_tab(), "Link")
         self._tabs.currentChanged.connect(lambda _i: self.refresh())
         v.addWidget(self._tabs, 1)
 
@@ -2592,6 +2599,348 @@ class DebugWindow(QMainWindow):
             return
         self._layer_view.setPixmap(_pixmap(rgb, self._LAYER_PREVIEW_SCALE))
 
+    # ---- Link tab (the serial cable: watch it, poke it, break it)
+    # The link is a byte pipe between two independent consoles, and every byte it
+    # carries passes through Python (core/link.py), so it can be tapped without
+    # touching emulation. What a tap alone cannot say is where a byte that is NOT
+    # moving got stuck -- that comes from the core's own counters
+    # (NativeMachine.serial_state, core/native.py). Together they answer the one
+    # question a link session actually asks: "is the cable working, and if not,
+    # which end is at fault?" -- which the two-player bring-up had to answer by
+    # deduction from a byte total in a window title.
+    #
+    # Three groups of tools, in the order you reach for them:
+    #   READ   -- live channel state, per-stage counters, a plain-language verdict
+    #   WATCH  -- a hex log of every byte, both directions, exportable
+    #   POKE   -- inject bytes as a fake peer, loop the console back on itself, or
+    #             deliberately delay/drop/cut the wire to rehearse a bad connection
+    LINK_LOG_LINES = 400          # how much of the log the view shows at once
+
+    def _link_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "The link cable, live. Bytes are tapped where they cross (no effect on "
+            "emulation); the counters come from the serial channel itself, so they "
+            "separate 'nothing was sent' from 'sent but held' from 'arrived but "
+            "never read'."))
+
+        self._link_state = QPlainTextEdit(); self._link_state.setReadOnly(True)
+        self._link_state.setFont(QFont(_MONO, 10))
+        self._link_state.setMinimumHeight(210)
+        lay.addWidget(self._link_state)
+
+        self._link_verdict = QLabel(""); self._link_verdict.setWordWrap(True)
+        lay.addWidget(self._link_verdict)
+
+        # -- POKE: stand in for the missing second console.
+        poke = QHBoxLayout()
+        poke.addWidget(QLabel("Send"))
+        self._link_inject = QLineEdit(); self._link_inject.setFont(QFont(_MONO, 10))
+        self._link_inject.setPlaceholderText("41 42 43  (hex)  or  plain text")
+        self._link_inject.setToolTip(
+            "Hand these bytes to the console as if the peer had sent them. They go "
+            "into the real receive path -- RTS gate, SC0BUF, INTRX0, the BIOS ring -- "
+            "so a game that reacts proves the whole receive chain works, with no "
+            "second console involved.")
+        self._link_inject.returnPressed.connect(self._link_send)
+        poke.addWidget(self._link_inject, 1)
+        self._link_inject_mode = QComboBox(); self._link_inject_mode.addItems(["Hex", "Text"])
+        poke.addWidget(self._link_inject_mode)
+        b = QPushButton("Inject"); b.setObjectName("ghost"); b.clicked.connect(self._link_send)
+        poke.addWidget(b)
+        lay.addLayout(poke)
+
+        # -- POKE: plug the console into itself, so one machine exercises the
+        # whole hardware path with no peer at all.
+        loop = QHBoxLayout()
+        loop.addWidget(QLabel("Loopback"))
+        self._link_loop = QComboBox()
+        self._link_loop.addItems(["off", "echo (self-link)", "sink (cable that never answers)"])
+        self._link_loop.setToolTip(
+            "echo: what the console transmits, it receives -- exercises SC0BUF → "
+            "INTTX0 → receive FIFO → RTS gate → INTRX0 → the BIOS ring on ONE "
+            "machine.\nsink: the transmit FIFO is drained and thrown away -- how the "
+            "game copes with a partner that has gone silent.\nNot a peer: a game "
+            "waiting for a partner's protocol will not be fooled for long.")
+        self._link_loop.currentIndexChanged.connect(self._link_set_loopback)
+        loop.addWidget(self._link_loop)
+        loop.addStretch()
+        lay.addLayout(loop)
+
+        # -- BREAK: the relay is instant and lossless; real connections are not.
+        imp = QHBoxLayout()
+        imp.addWidget(QLabel("Impair:  latency"))
+        self._link_delay = QSpinBox(); self._link_delay.setRange(0, 120); self._link_delay.setSuffix(" fr")
+        self._link_delay.setToolTip("Hold every outgoing byte back this many pumps "
+                                    "(1 frame ≈ 16 ms). Order is preserved.")
+        self._link_delay.valueChanged.connect(self._link_apply_impair)
+        imp.addWidget(self._link_delay)
+        imp.addWidget(QLabel("loss"))
+        self._link_drop = QSpinBox(); self._link_drop.setRange(0, 100); self._link_drop.setSuffix(" %")
+        self._link_drop.setToolTip("Throw away this share of the bytes we send. The "
+                                   "cable never loses bytes -- a flaky connection does.")
+        self._link_drop.valueChanged.connect(self._link_apply_impair)
+        imp.addWidget(self._link_drop)
+        self._link_cut = QCheckBox("✂ cut")
+        self._link_cut.setToolTip("Yank the wire: bytes are consumed and discarded, but "
+                                  "the console still believes it is plugged in.")
+        self._link_cut.toggled.connect(self._link_apply_impair)
+        imp.addWidget(self._link_cut)
+        imp.addStretch()
+        lay.addLayout(imp)
+
+        # -- WATCH: the byte log.
+        self._link_log = QPlainTextEdit(); self._link_log.setReadOnly(True)
+        self._link_log.setFont(QFont(_MONO, 10))
+        lay.addWidget(self._link_log, 1)
+
+        row = QHBoxLayout()
+        clear = QPushButton("Clear log"); clear.setObjectName("ghost")
+        clear.clicked.connect(self._link_clear)
+        row.addWidget(clear)
+        raw_tx = QPushButton("Save TX bytes…"); raw_tx.setObjectName("ghost")
+        raw_tx.clicked.connect(lambda: self._link_save_raw(link_debug.TX))
+        row.addWidget(raw_tx)
+        raw_rx = QPushButton("Save RX bytes…"); raw_rx.setObjectName("ghost")
+        raw_rx.clicked.connect(lambda: self._link_save_raw(link_debug.RX))
+        row.addWidget(raw_rx)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addLayout(self._export_row(
+            lambda: self._save_text(self._link_log.toPlainText(), "link_capture.txt")))
+        return w
+
+    # -- the tap ------------------------------------------------------------
+    def _link_tap(self):
+        """The monitor watching this console's cable, attached on demand.
+
+        Owned by this window rather than the play page: it must survive the page
+        being relinked (local 2P → online) and must go away when the debugger
+        moves to another game. Costs a deque append per frame, so it stays on
+        once armed rather than being toggled with tab focus.
+        """
+        play = self._play
+        if play is None or not hasattr(play, "set_link_monitor"):
+            return None
+        if self._link_mon is None or getattr(play, "link_monitor", None) is not self._link_mon:
+            if self._link_mon is None:
+                self._link_mon = link_debug.LinkMonitor()
+            play.set_link_monitor(self._link_mon)
+            self._link_apply_impair()
+        return self._link_mon
+
+    def _link_apply_impair(self) -> None:
+        if self._link_mon is None:
+            return
+        self._link_mon.impair = link_debug.Impairment(
+            delay_frames=self._link_delay.value(),
+            drop=self._link_drop.value() / 100.0,
+            cut=self._link_cut.isChecked())
+
+    def _link_send(self) -> None:
+        mon = self._link_tap()
+        if mon is None:
+            self._status.setText("no game running"); return
+        text = self._link_inject.text().strip()
+        if not text:
+            return
+        if self._link_inject_mode.currentText() == "Hex":
+            try:
+                data = bytes.fromhex(text.replace(",", " ").replace("0x", ""))
+            except ValueError:
+                self._link_verdict.setText("Not hex: expected bytes like  41 42 43")
+                self._link_verdict.setStyleSheet(f"color:{PALETTE.error}")
+                return
+        else:
+            data = text.encode("latin-1", errors="replace")
+        mon.inject(data)
+        self._status.setText(f"queued {len(data)} byte(s) for the console")
+
+    def _link_set_loopback(self, index: int) -> None:
+        """Attach/detach a LoopbackLink on the running console.
+
+        It goes in through attach_net_link because a loopback IS a network link
+        as far as the play page is concerned -- same pump/disconnect interface --
+        so nothing in the shell needs to know this mode exists.
+        """
+        play = self._play
+        if play is None or not hasattr(play, "attach_net_link"):
+            return
+        if play.link_mode() not in ("none", "loopback"):
+            self._link_loop.blockSignals(True); self._link_loop.setCurrentIndex(0)
+            self._link_loop.blockSignals(False)
+            self._link_verdict.setText("Already on a real cable -- unlink first.")
+            return
+        if play.link_mode() == "loopback":
+            play.detach_net_link()
+        if index == 0 or play.machine is None:
+            return
+        play.attach_net_link(link_debug.LoopbackLink(
+            play.machine, monitor=self._link_tap(), echo=(index == 1)))
+
+    def _link_clear(self) -> None:
+        if self._link_mon is not None:
+            self._link_mon.clear()
+        self._link_log.clear()
+
+    def _link_save_raw(self, direction: str) -> None:
+        if self._link_mon is None:
+            return
+        data = self._link_mon.raw(direction)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export captured bytes", f"link_{direction.lower()}.bin",
+            "Raw bytes (*.bin);;All files (*)")
+        if path:
+            Path(path).write_bytes(data)
+            self._status.setText(f"saved {len(data)} byte(s)")
+
+    # -- the reading --------------------------------------------------------
+    @staticmethod
+    def _link_verdict_text(st: dict, iff: int) -> tuple[str, bool]:
+        """Turn the counters into the sentence you actually wanted. Returns the
+        text and whether it is a fault (so it can be coloured).
+
+        The order matters: each test assumes the ones before it passed, so the
+        first one that fires names the EARLIEST stage that is stuck -- which is
+        the one worth fixing.
+        """
+        if not st["enabled"]:
+            return ("No cable: the serial channel is inert. Link two consoles "
+                    "(🔗) or switch loopback on to exercise it alone.", False)
+        if st["tx_count"] == 0 and st["rx_queued_count"] == 0:
+            return ("Cable up, total silence. Neither side has written a byte -- "
+                    "the detection handshake is byte-based, so BOTH consoles have "
+                    "to be sitting on the game's VS/link screen at the same time.",
+                    False)
+        if st["tx_busy"] and st["cts_high"] and st["ctse"]:
+            return ("Transmitter HELD: the game enabled the CTS gate and the peer "
+                    "is signalling 'not ready' (its RTS is high). The fault is at "
+                    "the other end, not here.", True)
+        if st["rx_depth"] and not st["rts_low"]:
+            return (f"{st['rx_depth']} byte(s) waiting, but THIS console holds RTS "
+                    "high (not ready to receive) -- it has not called COMONRTS, or "
+                    "it is stuck before it could.", True)
+        if st["rx_queued_count"] and st["irq_rx_count"] == 0:
+            return ("Bytes arrived but INTRX0 has never fired: they are queued and "
+                    "the receive interrupt is not being raised.", True)
+        if st["irq_rx_count"] and st["rx_read_count"] == 0:
+            extra = (f"  The interrupt mask level is {iff}: at 6 the BIOS receive "
+                     "handler cannot run (COMOFFRTS does `ei 6` -- the SDK's "
+                     "`com_rts_off(); WaitVsync();` pattern hangs on real hardware "
+                     "too)." if iff >= 6 else "")
+            return ("INTRX0 fires but the CPU never reads SC0BUF -- the handler is "
+                    "not running." + extra, True)
+        if st["tx_count"] and st["wire_count"] == 0:
+            return ("Bytes written to SC0BUF but none finished shifting out.", True)
+        return (f"Traffic flowing: {st['wire_count']} byte(s) out, "
+                f"{st['rx_read_count']} read in.", False)
+
+    def _refresh_link(self) -> None:
+        m = self._m
+        if m is None or not hasattr(m, "serial_state"):
+            self._link_state.setPlainText("(no game running)")
+            self._link_verdict.setText(""); return
+        mon = self._link_tap()
+        st = m.serial_state().as_dict()
+        iff = int(m.cpu().iff_level)
+        play = self._play
+        mode = play.link_mode() if hasattr(play, "link_mode") else "?"
+
+        # Throughput, measured against the wall clock rather than frames: what a
+        # dropping connection changes is bytes per SECOND.
+        now = time.monotonic()
+        rate_tx = rate_rx = 0.0
+        if mon is not None:
+            prev_t, prev_tx, prev_rx = self._link_rate_sample
+            dt = now - prev_t
+            if dt >= 0.5:
+                rate_tx = (mon.bytes_tx - prev_tx) / dt
+                rate_rx = (mon.bytes_rx - prev_rx) / dt
+                self._link_rate_sample = (now, mon.bytes_tx, mon.bytes_rx)
+                self._link_rate_shown = (rate_tx, rate_rx)
+            else:
+                rate_tx, rate_rx = self._link_rate_shown
+
+        yn = lambda v: "yes" if v else "no"          # noqa: E731 -- a table formatter
+        cable = "PRESENT" if not (st["port_b1"] & 0x04) else "absent"
+        rings = self._link_bios_rings(m)
+        lines = [
+            f"cable            {mode:<12} detect (0xB1 bit2): {cable}",
+            f"armed            {yn(st['enabled'])}",
+            "",
+            "-- handshake ------------------------------------------",
+            f"our RTS          {'low (ready to receive)' if st['rts_low'] else 'HIGH (holding the peer off)'}",
+            f"peer CTS0        {'HIGH (peer not ready)' if st['cts_high'] else 'low (peer ready)'}"
+            f"   gate enabled by the game (SC0MOD<CTSE>): {yn(st['ctse'])}",
+            f"held by CTS      {st['cts_hold_ticks']} tick(s)"
+            f"      by our own RTS: {st['rts_hold_ticks']} tick(s)",
+            "",
+            "-- bytes, stage by stage ------------------------------",
+            f"written to SC0BUF   {st['tx_count']:<10} shifted out: {st['wire_count']}",
+            f"queued for us       {st['rx_queued_count']:<10} read by the CPU: {st['rx_read_count']}",
+            f"waiting in the FIFOs  tx {st['tx_depth']}   rx {st['rx_depth']}"
+            f"   presented, unread: {yn(st['rx_pending'])}",
+            f"interrupts raised   INTTX0 (0x19) {st['irq_tx_count']}"
+            f"   INTRX0 (0x18) {st['irq_rx_count']}",
+            f"CPU interrupt mask  iff {iff}"
+            + ("   ← at 6 the BIOS serial/VBlank handlers are masked" if iff >= 6 else ""),
+            "",
+            "-- registers ------------------------------------------",
+            f"SC0BUF {st['sc0buf']:02X}   SC0CR {st['sc0cr']:02X}   "
+            f"SC0MOD {st['sc0mod']:02X}   BR0CR {st['br0cr']:02X}   "
+            f"P.B1 {st['port_b1']:02X}   P.B2 {st['port_b2']:02X}",
+            "",
+            "-- the BIOS's own COM rings ---------------------------",
+            rings,
+        ]
+        if mon is not None:
+            imp = mon.impair
+            broken = (f"   [impaired: {imp.delay_frames} fr latency, "
+                      f"{imp.drop * 100:.0f}% loss{', CUT' if imp.cut else ''}]"
+                      if imp.active else "")
+            lines[2] = (f"tapped traffic   TX {mon.bytes_tx} B ({rate_tx:.0f} B/s)   "
+                        f"RX {mon.bytes_rx} B ({rate_rx:.0f} B/s)   "
+                        f"dropped {mon.bytes_dropped}   injected {mon.bytes_injected}{broken}")
+        self._link_state.setPlainText("\n".join(lines))
+
+        verdict, bad = self._link_verdict_text(st, iff)
+        self._link_verdict.setText(verdict)
+        self._link_verdict.setStyleSheet(f"color:{PALETTE.error}" if bad else "")
+
+        if mon is not None:
+            seen = len(mon.log)
+            if seen != self._link_log_len:
+                self._link_log_len = seen
+                text = mon.dump()
+                lines_ = text.splitlines()[-self.LINK_LOG_LINES:]
+                bar = self._link_log.verticalScrollBar()
+                at_end = bar.value() >= bar.maximum() - 4
+                self._link_log.setPlainText("\n".join(lines_))
+                if at_end:
+                    self._link_log.verticalScrollBar().setValue(
+                        self._link_log.verticalScrollBar().maximum())
+
+    @staticmethod
+    def _link_bios_rings(m) -> str:
+        """What the BIOS's COM layer holds, as the game sees it.
+
+        The interrupt handlers move bytes between SC0BUF and two 64-byte rings in
+        RAM (0x6C80 transmit, 0x6CC0 receive) with the pending receive count at
+        0x6D01. Cable traffic without a rising count means the interrupts are not
+        landing; a rising count the game never drains means the game is not
+        calling the BIOS to read it. Layout: SNK BIOS, see the link-cable notes.
+        """
+        try:
+            rx_count = m.read(0x006D01, 1)[0]
+            tx_ring = bytes(m.read(0x006C80, 16))
+            rx_ring = bytes(m.read(0x006CC0, 16))
+        except Exception:
+            return "(RAM not readable)"
+        hexs = lambda b: " ".join(f"{x:02X}" for x in b)      # noqa: E731
+        return (f"pending receive count (0x6D01)  {rx_count}\n"
+                f"TX ring 0x6C80  {hexs(tx_ring)}\n"
+                f"RX ring 0x6CC0  {hexs(rx_ring)}")
+
     # ---- Load tab (live resource gauges)
     # What a dev actually runs out of on this hardware: the 64-sprite OAM and the 512-tile
     # character RAM. Both are read straight from VRAM, so they are exact, not estimates.
@@ -3165,4 +3514,5 @@ class DebugWindow(QMainWindow):
          self._refresh_breaks, self._refresh_ramsearch, self._refresh_audio,
          self._refresh_palette, self._refresh_tiles, self._refresh_sprites,
          self._refresh_layers, self._refresh_load, self._refresh_text,
-         self._refresh_crack, self._refresh_pointers, self._refresh_compare)[idx]()
+         self._refresh_crack, self._refresh_pointers, self._refresh_compare,
+         self._refresh_link)[idx]()

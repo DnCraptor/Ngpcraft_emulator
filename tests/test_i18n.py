@@ -133,3 +133,60 @@ def test_bios_crash_message_is_translated():
     en = cfg.tr("en", "crash_needs_bios")
     fr = cfg.tr("fr", "crash_needs_bios")
     assert "BIOS" in en and "BIOS" in fr and en != fr
+
+
+def test_no_user_visible_string_is_hardcoded_outside_the_debugger():
+    """Everything the player reads must come from lang/*.json — the debugger excepted,
+    which is English on purpose.
+
+    Two of these were found by this test's own first run and are the reason it exists:
+    the online lobby carried its French and its English side by side in the code, and
+    the Controls panel picked between "Joueur" and "Player" with an `if language == "fr"`.
+    Neither was reachable by a translator, and both gave English to every other language.
+    """
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    # The application's own name is not a translatable string.
+    PRODUCT_NAMES = {"NgpCraft Emulator", "NgpCraft"}
+    # Calls whose first arguments are shown to the user.
+    call = re.compile(
+        r'(?:QMessageBox\.(?:warning|information|critical|question)|'
+        r'QInputDialog\.getText|QFileDialog\.get\w+|setWindowTitle|setToolTip|'
+        r'setPlaceholderText)\s*\(([^\n]*)')
+    # A literal that reads like a sentence: letters and a space, four chars or more.
+    literal = re.compile(r'"([A-Za-z][^"{}]*\s[^"{}]*)"')
+    offenders = []
+    for name in ("ngpc_shell.py", "ngpc_lobby.py", "ngpc_link_play.py", "ngpc_bindmap.py"):
+        for n, line in enumerate(repo.joinpath(name).read_text(encoding="utf-8").splitlines(), 1):
+            m = call.search(line)
+            if not m or "tr(" in m.group(1) or re.search(r"\b_?t\(", m.group(1)):
+                continue
+            for lit in literal.findall(m.group(1)):
+                if lit.startswith(("background", "font", "color", "border", "QPush")):
+                    continue
+                if lit in PRODUCT_NAMES:      # a name, not a sentence: never translated
+                    continue
+                offenders.append(f"{name}:{n}  {lit!r}")
+
+    assert not offenders, "user-visible text not going through the lang files:\n  " + \
+        "\n  ".join(offenders)
+
+
+def test_a_language_is_never_translated_by_an_if_in_the_code():
+    """`if language == "fr"` is a translation no translator can reach, and it silently
+    hands English to every other language. The lang files are the only route."""
+    import re
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parents[1]
+    pattern = re.compile(r'language\([^)]*\)\s*==\s*["\'](\w+)["\']')
+    hits = []
+    for path in repo.glob("ngpc_*.py"):
+        if path.name == "ngpc_debug.py":       # English on purpose
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if pattern.search(line):
+                hits.append(f"{path.name}:{n}  {line.strip()}")
+    assert not hits, "a language branch in the code:\n  " + "\n  ".join(hits)

@@ -105,12 +105,24 @@ struct PaletteView {
     uint32_t lut, cpal;     /* K1GE compat: the level LUT and the 12-bit palette. */
 };
 
+/* THE MONO NGP'S EIGHT GREYS. On a K1GE the LUT value IS the picture: the Tech Ref's
+ * palette LUT (0x8100..) holds a 3-bit COLOUR CODE, "the smallest contrast change being
+ * the LSB and the largest the MSB", and the panel turns it into a shade. There is no
+ * colour RAM on that machine to hold a ramp -- so we do not read any, and no cartridge
+ * write can flatten it. Values are the ones the retail BIOS programs for mono output. */
+constexpr uint16_t kK1geGrey[8] = {0x0FFF, 0x0DDD, 0x0BBB, 0x0999,
+                                   0x0666, 0x0444, 0x0222, 0x0000};
+
 inline uint16_t resolve(const Machine& m, const PaletteView& pv,
                         unsigned code, unsigned value) {
     if (pv.compat) {
         /* Only the SINGLE P.C bit exists on the old machine: two palettes per plane. */
         const unsigned p_c = code & 1u;
         const unsigned level = m.mem[pv.lut + p_c * 4u + value] & 0x07u;
+        /* A REAL K1GE stops here -- level -> grey, straight out of the panel. The
+         * K2GE's compat mode instead sends that level through a 12-bit palette, which
+         * is what lets an NGPC colourise a mono cartridge. Same LUT, two machines. */
+        if (m.k1ge_console) return kK1geGrey[level];
         return color_at(m, pv.cpal + (p_c * 8u + level) * 2u);
     }
     return color_at(m, pv.base + code * 8u + value * 2u);
@@ -127,7 +139,16 @@ inline uint16_t resolve(const Machine& m, const PaletteView& pv,
 void Machine::render_scanline(uint32_t line) {
     if (line >= kVisibleScanlines) return;
     const Regs g = regs_of_line(*this, line);
-    const bool compat = (mem[kK1geMode] & 0x80) != 0;
+    /* ⚡ ON A K1GE THERE IS NO MODE BIT: the machine IS this mode.
+     *
+     * 0x87E2 is a K2GE register -- the mono NGP's own BIOS never writes it (it is not
+     * in that console's address map at all, K1GE Tech Ref §3), and anything clearing
+     * the video page puts it back to zero. Deriving the mode from that byte therefore
+     * ran the MONO console through the COLOUR path, resolving every pixel with palettes
+     * nobody had filled: the boot logo came up over the SNK wallpaper and the whole
+     * screen was two tones. The console setting decides; the register only speaks for
+     * a K2GE that was asked to imitate one. */
+    const bool compat = k1ge_console || (mem[kK1geMode] & 0x80) != 0;
 
     uint16_t* row = &framebuffer[line * kScreenWidth];
 

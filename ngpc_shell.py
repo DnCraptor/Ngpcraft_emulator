@@ -18,24 +18,27 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import os
 import re
+import stat
 import sys
 import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QSize, QObject, QThread, QEvent, pyqtSignal
+from PyQt6.QtCore import (Qt, QTimer, QSize, QObject, QThread, QEvent, QDateTime,
+                          pyqtSignal)
 from PyQt6.QtGui import (
     QImage, QPixmap, QKeyEvent, QKeySequence, QFont, QFontMetrics, QIcon,
 )
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
+    QDateTimeEdit, QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout,
     QHBoxLayout, QGridLayout, QScrollArea, QStackedWidget, QListWidget,
     QListWidgetItem, QComboBox, QCheckBox, QSlider, QSpinBox, QLineEdit,
     QFileDialog, QSizePolicy, QFrame, QMessageBox, QMenu, QDialog,
-    QPlainTextEdit, QDialogButtonBox, QInputDialog,
+    QPlainTextEdit, QDialogButtonBox, QInputDialog, QRadioButton, QButtonGroup,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -51,12 +54,19 @@ from core.native_session import (  # noqa: E402
 )
 from core.frame_pacer import FramePacer  # noqa: E402
 from core.watches import WatchSet  # noqa: E402
+from core import link_debug  # noqa: E402  (the debugger's cable tap)
 from core.exec_breaks import ExecBreakSet  # noqa: E402
 import ngpc_settings as cfg  # noqa: E402
 import ngpc_video  # noqa: E402
 import ngpc_library as lib  # noqa: E402
 import ngpc_input  # noqa: E402
 import ngpc_theme  # noqa: E402
+import ngpc_filters  # noqa: E402
+
+# Graphics filter plugins: discovered once, from the folder the user pointed at. A
+# module-level registry for the same reason PALETTE is one -- the render path is deep
+# inside the play loop and has no business carrying a plugin list around.
+FILTERS = ngpc_filters.FilterRegistry()
 import ngpc_bindmap  # noqa: E402
 import ngpc_debug  # noqa: E402
 from ngpc_debug import DebugWindow  # noqa: E402
@@ -91,6 +101,10 @@ RAIL_INDENT = "   "                   # the nav entries' hanging indent, on ever
 DEFAULT_ROM_DIR = REPO / "roms"          # drop your .ngc/.ngp files here (or pick a folder)
 DEFAULT_BIOS = REPO / "bios.bin"         # optional: a real NGPC BIOS enables "Boot BIOS"
 HLE_BIOS = REPO / "hle_bios" / "bios_hle.bin"  # clean-room fallback: runs games with no bios.bin
+# The ORIGINAL monochrome NGP's own BIOS, if the user dropped one next to the app.
+# Names people actually give that dump -- the extension says nothing about the file.
+DEFAULT_BIOS_MONO = [REPO / n for n in
+                     ("ngp_bios.bin", "ngp_bios.ngp", "bios_ngp.bin", "ngpbios.bin")]
 THUMB_DIR = REPO / "thumbnails"          # auto-rendered covers -- a CACHE, prunable
 COVER_DIR = REPO / "covers"              # covers the USER chose -- only ever READ
 LIBRARY_DB = REPO / "library.json"       # play counts / last played / favourites
@@ -100,12 +114,114 @@ def _resolve_bios(configured: str) -> "Path | None":
     """Pick the BIOS image: an explicitly configured path, else a real bios.bin
     next to the app, else the clean-room HLE fallback (hle_bios/bios_hle.bin) so
     games still run out of the box with no BIOS supplied. A real BIOS, when
-    present, always wins -- it gives full fidelity, the console boot, and link."""
+    present, always wins -- it gives full fidelity and the console boot animation.
+
+    (It no longer wins on saves or on the link cable: the HLE image drives the
+    flash chip and the COM rings itself now -- hle_bios/README.md. What it does
+    not do is the boot/setup UI, which is the point of skipping it.)"""
     if configured and Path(configured).is_file():
         return Path(configured)
     if DEFAULT_BIOS.is_file():
         return DEFAULT_BIOS
     return HLE_BIOS if HLE_BIOS.is_file() else None
+
+
+def resolve_selected_bios(settings) -> "tuple[Path | None, str]":
+    """The BIOS that will actually boot, and WHICH SLOT it came from.
+
+    Three slots, one selector (Settings ▸ BIOS): the colour NGPC dump, the mono NGP
+    dump, and our own clean-room HLE image. A slot the user selected but never filled
+    falls back rather than refusing to boot -- but the slot returned is then the one
+    that answered, so the panel can say so instead of quietly booting the other
+    machine. Returns (None, choice) only when even the HLE image is missing."""
+    choice = cfg.bios_choice(settings)
+    if choice == cfg.BIOS_USE_HLE:
+        return (HLE_BIOS if HLE_BIOS.is_file() else None), cfg.BIOS_USE_HLE
+    if choice == cfg.BIOS_USE_MONO:
+        mono = _resolve_bios_mono(cfg.bios_mono_path(settings))
+        if mono is not None:
+            return mono, cfg.BIOS_USE_MONO
+        # No mono dump: the colour BIOS still boots the game, and the K1GE console
+        # setting still applies -- close to an NGP, and `_bios_slot_note` says which.
+    found = _resolve_bios(cfg.bios_path(settings))
+    if found is None:
+        return None, cfg.BIOS_USE_COLOUR
+    return found, (cfg.BIOS_USE_HLE if found == HLE_BIOS else cfg.BIOS_USE_COLOUR)
+
+
+def console_is_mono(settings) -> bool:
+    """Is this a mono NGP? Decided by THE BIOS THAT WILL BOOT, not by the slot it sits in.
+
+    A cartridge detects its console by reading 0x6F91, and that byte is stamped by the
+    BIOS -- so "which machine am I" and "which BIOS is loaded" are the same question,
+    and the emulator must not answer them differently. We identify the image itself
+    (`bios_kind`), so a mono dump saved in the colour slot still boots a mono NGP and a
+    colour dump in the mono slot does not pretend otherwise: what is loaded is what runs.
+
+    The explicit Console setting still forces mono on top -- it is the only way to run
+    the mono machine for a user who has no NGP dump at all (our HLE image is neither
+    console's BIOS), and it is what the K1GE restrictions hung on before this existed."""
+    if cfg.mono_mode(settings) == cfg.MONO_K1GE:
+        return True
+    found, slot = resolve_selected_bios(settings)
+    kind = bios_kind(found)
+    if kind != BIOS_UNKNOWN:
+        return kind == BIOS_MONO
+    # An image we cannot identify is taken at its slot's word.
+    return slot == cfg.BIOS_USE_MONO
+
+
+def _resolve_bios_mono(configured: str) -> "Path | None":
+    """The monochrome NGP's own BIOS, or None. NO fallback on purpose: falling back
+    to the colour BIOS would boot an NGPC while the settings say NGP, which is the
+    confusion this whole setting exists to end. The caller decides what to do with
+    None (we keep the colour BIOS + the K1GE restrictions, and say so)."""
+    if configured and Path(configured).is_file():
+        return Path(configured)
+    for cand in DEFAULT_BIOS_MONO:
+        if cand.is_file():
+            return cand
+    return None
+
+
+# What tells the two BIOS images apart, proven by disassembling both dumps: each one
+# stamps the console-type byte at 0x6F91 with its own machine's id -- `ld (0x6F91),#`,
+# encoded `F1 91 6F 00 <value>` -- and only the colour one ever addresses a K2GE
+# register (0x87E2, encoded `E2 87 00`). A cartridge reads 0x6F91 and nothing else to
+# know which console it is in, so this is the same test the games do.
+_BIOS_STAMP_COLOUR = b"\xF1\x91\x6F\x00\x10"
+_BIOS_STAMP_MONO = b"\xF1\x91\x6F\x00\x00"
+_BIOS_K2GE_REG = b"\xE2\x87\x00"
+BIOS_COLOUR, BIOS_MONO, BIOS_UNKNOWN = "colour", "mono", "unknown"
+
+
+_BIOS_KIND_CACHE: dict[tuple, str] = {}
+
+
+def bios_kind(path: Path | None) -> str:
+    """Which console an image is the BIOS of: `BIOS_COLOUR` (NGPC), `BIOS_MONO` (the
+    original NGP) or `BIOS_UNKNOWN` (not a BIOS we recognise -- our own HLE image
+    included, which stamps neither byte). Used to tell the user, when they pick one,
+    that they just handed the mono slot a colour BIOS."""
+    if path is None:
+        return BIOS_UNKNOWN
+    try:
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+        cached = _BIOS_KIND_CACHE.get(key)
+        if cached is not None:
+            return cached
+        data = path.read_bytes()
+    except OSError:
+        return BIOS_UNKNOWN
+    if _BIOS_STAMP_COLOUR in data and _BIOS_K2GE_REG in data:
+        kind = BIOS_COLOUR
+    elif _BIOS_STAMP_MONO in data and _BIOS_K2GE_REG not in data:
+        kind = BIOS_MONO
+    else:
+        kind = BIOS_UNKNOWN
+    _BIOS_KIND_CACHE[key] = kind
+    return kind
 APP_ICON = BUNDLE / "assets" / "icone_ngpcraft.ico"
 STATE_DIR = REPO / "savestates"
 WATCH_DIR = REPO / "watches"             # per-ROM named memory watches (debugger)
@@ -131,7 +247,7 @@ _STATUS_DESC = {
     30: ("UNIMPLEMENTED", "a valid encoding this core has not ported yet"),
 }
 _CRASH_STATUSES = frozenset(_STATUS_DESC) - {13}   # 13 is a clean power-off, not a crash
-THUMB_VERSION = 4       # bump to invalidate the on-disk cache after a render change
+THUMB_VERSION = 5       # bump to invalidate the on-disk cache after a render change
 # Frames to sample for a thumbnail. We keep the RICHEST one so a boot logo, a
 # fade-to-black or a mono fade-to-white does not become the cover, and we sample
 # DEEP (titles/attract can be late) but STOP EARLY once a frame is clearly a real
@@ -166,6 +282,104 @@ MENU_TEXT = {
 }
 
 
+# ---------------------------------------------------------------- the ROM scan
+# Everything the library lists: a bare cartridge image, or an archive holding one.
+ROM_EXTS = frozenset({".ngc", ".ngp", ".zip", ".7z"})
+# How deep under the ROM folder we are willing to look. A collection is a handful of
+# folders deep; anything past this is a link that points back into the tree (see
+# `scan_roms`), and a depth limit is what stops us walking it forever.
+SCAN_MAX_DEPTH = 12
+# The two reparse tags that mean "this directory is really somewhere else": a
+# junction (what `mklink /J`, and every drive-sync tool, makes) and a symlink. NOT
+# every reparse point -- a OneDrive "files on-demand" folder is one too, and skipping
+# those would hide a library that lives in OneDrive, which is where many of them do.
+_LINK_TAGS = {getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003),
+              getattr(stat, "IO_REPARSE_TAG_SYMLINK", 0xA000000C)}
+
+
+def _is_link_dir(entry: os.DirEntry) -> bool:
+    """True for a directory that is a junction or a symlink.
+
+    ⚠️ `entry.is_symlink()` is FALSE for a Windows junction -- which is why
+    `os.walk(followlinks=False)` does not protect against one. The reparse TAG is
+    what actually says so."""
+    try:
+        if entry.is_symlink():
+            return True
+        return getattr(entry.stat(follow_symlinks=False), "st_reparse_tag", 0) in _LINK_TAGS
+    except OSError:
+        return False
+
+
+def _file_id(path: Path) -> object:
+    """What makes two directory entries the SAME file: the volume + inode pair
+    Windows fills in as well as Unix. Falls back to the resolved path when the
+    filesystem does not number its files."""
+    try:
+        st = path.stat()
+    except OSError:
+        return str(path)
+    if st.st_ino:
+        return (st.st_dev, st.st_ino)
+    try:
+        return os.path.realpath(path).casefold()
+    except OSError:
+        return str(path)
+
+
+def scan_roms(root: Path, max_depth: int = SCAN_MAX_DEPTH) -> list[Path]:
+    """Every ROM and archive under `root` -- each PHYSICAL file exactly ONCE.
+
+    Hand-rolled rather than `rglob`, because of the bug a user hit: ONE cartridge in
+    the folder, TWO cards in the library. A junction makes the same file reachable
+    under two paths and `rglob` walks straight through it (with one pointing back up
+    the tree it recurses until Windows refuses the path, and the `except OSError`
+    around it then swallowed the WHOLE scan, so the library came back half empty).
+    Junctions are not exotic: drive-sync clients, a `roms` folder linked into a
+    projects tree, and the legacy profile folders are all made of them.
+
+    So: shallowest-first (a file keeps the path the user would name), never descend
+    through a link, cap the depth anyway, and dedupe on file identity -- which also
+    catches hardlinks and two drive letters onto one volume. A folder that cannot be
+    read is skipped; it never takes the rest of the library with it.
+    """
+    out: list[Path] = []
+    seen: set[object] = set()
+    queue: deque[tuple[Path, int]] = deque([(Path(root), 0)])
+    visited_dirs: set[object] = {_file_id(Path(root))}
+    while queue:
+        folder, depth = queue.popleft()
+        try:
+            with os.scandir(folder) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir:
+                if depth >= max_depth or _is_link_dir(entry):
+                    continue
+                ident = _file_id(Path(entry.path))
+                if ident in visited_dirs:
+                    continue          # a loop we did not recognise as a link
+                visited_dirs.add(ident)
+                queue.append((Path(entry.path), depth + 1))
+                continue
+            if os.path.splitext(entry.name)[1].casefold() not in ROM_EXTS:
+                continue
+            path = Path(entry.path)
+            ident = _file_id(path)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            out.append(path)
+    out.sort()
+    return out
+
+
 # ---------------------------------------------------------------- thumbnails
 # Image types accepted as a hand-picked cover.
 _COVER_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
@@ -174,8 +388,6 @@ _COVER_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
 # to delete, and deleting it is exactly what used to eat a hand-placed title screen
 # on every update that bumped THUMB_VERSION.
 _AUTO_COVER_RE = re.compile(r"\.[0-9a-f]{8}\.v\d+\.png$", re.IGNORECASE)
-
-
 def _path_tag(rom: Path) -> str:
     """8 hex digits identifying a ROM by its FULL path."""
     return hashlib.md5(str(rom).encode("utf-8", "surrogatepass")).hexdigest()[:8]
@@ -212,27 +424,43 @@ class ThumbWorker(QObject):
     ready = pyqtSignal(str, QImage)
     done = pyqtSignal()
 
-    def __init__(self, roms: list[Path], bios: Path | None) -> None:
+    def __init__(self, roms: list[Path], bios: Path | None, mono: bool = False) -> None:
         super().__init__()
         self._roms = roms
         self._bios = bios if bios and bios.exists() else None
+        # A cover is rendered by booting the game, so it must boot on the console the
+        # user selected -- otherwise the library shows colour covers for a mono NGP.
+        self._mono = mono
         self._stop = False
 
     def stop(self) -> None:
         self._stop = True
 
-    def run(self) -> None:
-        THUMB_DIR.mkdir(exist_ok=True)
-        # Prune covers from older render versions so the folder does not grow a
-        # copy per THUMB_VERSION bump -- but ONLY files this worker wrote. Anything
-        # else in here was put there by hand and stays (see `_AUTO_COVER_RE`).
+    def _prune(self) -> None:
+        """Drop auto-rendered covers from an OLDER render version, so the folder does
+        not grow a copy per THUMB_VERSION bump.
+
+        ⚠️ IT NO LONGER PURGES WHEN THE BIOS CHANGES. It briefly did: a cover is named
+        after the ROM path alone, so switching BIOS kept showing the covers the previous
+        one had produced, and re-rendering looked like the correct fix. It is not worth
+        it -- re-rendering a real library is minutes of booting every game, for a picture
+        that differs by a shade. Covers are rendered ONCE, and `Regenerate covers` in the
+        Library is there for the day you actually want them redone.
+
+        Only files this worker wrote are ever removed (`_AUTO_COVER_RE`); anything else
+        in this folder was put there by hand and stays.
+        """
         keep = f".v{THUMB_VERSION}.png"
         for old in THUMB_DIR.glob("*.png"):
-            if not old.name.endswith(keep) and _AUTO_COVER_RE.search(old.name):
+            if _AUTO_COVER_RE.search(old.name) and not old.name.endswith(keep):
                 try:
                     old.unlink()
                 except OSError:
                     pass
+
+    def run(self) -> None:
+        THUMB_DIR.mkdir(exist_ok=True)
+        self._prune()
         for rom in self._roms:
             if self._stop:
                 break
@@ -275,7 +503,8 @@ class ThumbWorker(QObject):
     def _render(self, rom: Path) -> QImage | None:
         best_fb = None
         best_score = -1
-        s = NativeSession(rom, bios_path=self._bios, autosave=False)
+        s = NativeSession(rom, bios_path=self._bios, autosave=False,
+                          k1ge_console=self._mono)
         try:
             done = 0
             for target in THUMB_SAMPLE_FRAMES:
@@ -388,18 +617,23 @@ class GameCard(_RomMenuMixin, QFrame):
     cover_set_requested = pyqtSignal(str)
     cover_reset_requested = pyqtSignal(str)
 
-    def __init__(self, rom: Path, long_edge: int, sub: str, fav: bool, fav_tip: str) -> None:
+    def __init__(self, rom: Path, long_edge: int, sub: str, fav: bool, fav_tip: str,
+                 title: str | None = None) -> None:
         super().__init__()
         self.setObjectName("card")
         self.rom = rom
         w, h = _art_size(long_edge)
         self.setFixedWidth(w + 16)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        # The card is narrow and the title is capped at two lines, so a disambiguated
+        # (full) name can be clipped: the FULL PATH is always one hover away -- which
+        # is also what tells two cards that look alike apart, and where each lives.
+        self.setToolTip(str(rom))
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 10)
         lay.setSpacing(6)
         self.art = _ArtLabel(w, h)
-        name = QLabel(_pretty(rom.stem))
+        name = QLabel(title or _pretty(rom.stem))
         name.setObjectName("cardName")
         name.setWordWrap(True)
         name.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
@@ -436,11 +670,12 @@ class GameRow(_RomMenuMixin, QFrame):
     cover_reset_requested = pyqtSignal(str)
 
     def __init__(self, rom: Path, long_edge: int, show_art: bool,
-                 sub: str, fav: bool, fav_tip: str) -> None:
+                 sub: str, fav: bool, fav_tip: str, title: str | None = None) -> None:
         super().__init__()
         self.setObjectName("card")
         self.rom = rom
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip(str(rom))
         h = QHBoxLayout(self)
         h.setContentsMargins(10, 6, 14, 6)
         h.setSpacing(12)
@@ -452,7 +687,7 @@ class GameRow(_RomMenuMixin, QFrame):
             h.addWidget(self.art)
         else:
             self.setFixedHeight(40)
-        name = QLabel(_pretty(rom.stem))
+        name = QLabel(title or _pretty(rom.stem))
         name.setObjectName("cardName")
         h.addWidget(name)
         h.addStretch()
@@ -478,13 +713,35 @@ def _pretty(stem: str) -> str:
     return cut.strip() or stem
 
 
+def _titles(roms: list[Path]) -> dict[str, str]:
+    """The title each card shows, decided over the WHOLE library at once.
+
+    `_pretty` drops the dump tags, which is what makes a grid of "Faselei! (Europe)"
+    readable -- but two dumps of one game ("Biomotor Unitron (USA)" and "(USA, Europe)",
+    a translation patch and its base ROM) then read as the SAME title on two cards.
+    That is the bug a user reported as "two thumbnails for one ROM": two real files,
+    one visible name. A title that is not unique therefore keeps the full file name,
+    so the cards say what actually differs between them.
+    """
+    counts: dict[str, int] = {}
+    for rom in roms:
+        key = _pretty(rom.stem).casefold()
+        counts[key] = counts.get(key, 0) + 1
+    out: dict[str, str] = {}
+    for rom in roms:
+        short = _pretty(rom.stem)
+        out[str(rom)] = short if counts[short.casefold()] == 1 else rom.stem
+    return out
+
+
 # ---------------------------------------------------------------- library
 class RomReportDialog(QDialog):
     """The ROM analysis, as text you can read and save."""
 
-    def __init__(self, parent, title: str, text: str) -> None:
+    def __init__(self, parent, title: str, text: str, lang: str = "en") -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"ROM analysis — {title}")
+        self._lang = lang
+        self.setWindowTitle(cfg.tr(lang, "rom_report_title").format(name=title))
         self.resize(760, 560)
         lay = QVBoxLayout(self)
         view = QPlainTextEdit(text); view.setReadOnly(True)
@@ -498,8 +755,9 @@ class RomReportDialog(QDialog):
         lay.addWidget(buttons)
 
     def _save(self, text: str, title: str) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "Save report",
-                                              f"{title}_analysis.txt", "Text (*.txt)")
+        path, _ = QFileDialog.getSaveFileName(
+            self, cfg.tr(self._lang, "rom_report_save"),
+            f"{title}_analysis.txt", cfg.tr(self._lang, "filter_text_files"))
         if path:
             Path(path).write_text(text, encoding="utf-8")
 
@@ -540,11 +798,15 @@ class LibraryPage(QWidget):
         self._folder_btn = QPushButton()
         self._folder_btn.setObjectName("ghost")
         self._folder_btn.clicked.connect(self._choose_folder)
+        self._regen_btn = QPushButton()
+        self._regen_btn.setObjectName("ghost")
+        self._regen_btn.clicked.connect(self.regenerate_covers)
         self._open_btn = QPushButton()
         self._open_btn.setObjectName("primary")
         self._open_btn.clicked.connect(self._open_rom)
         header.addWidget(self._bios_btn)
         header.addWidget(self._folder_btn)
+        header.addWidget(self._regen_btn)
         header.addWidget(self._open_btn)
         root.addLayout(header)
 
@@ -623,6 +885,8 @@ class LibraryPage(QWidget):
         self._title.setText(cfg.tr(lang, "library"))
         self._bios_btn.setText(cfg.tr(lang, "boot_bios"))
         self._folder_btn.setText(cfg.tr(lang, "set_folder"))
+        self._regen_btn.setText(cfg.tr(lang, "covers_regen"))
+        self._regen_btn.setToolTip(cfg.tr(lang, "covers_regen_tip"))
         self._open_btn.setText(cfg.tr(lang, "open_rom"))
         self._empty.setText(cfg.tr(lang, "no_roms"))
         self._bios_hint.setText(cfg.tr(lang, "covers_need_bios"))
@@ -673,7 +937,7 @@ class LibraryPage(QWidget):
         return None
 
     def _bios(self) -> Path | None:
-        return _resolve_bios(cfg.bios_path(self._settings))
+        return resolve_selected_bios(self._settings)[0]
 
     def _sync_bios_hint(self) -> None:
         """Covers are rendered by BOOTING each ROM, which takes a BIOS. Say so when
@@ -685,17 +949,7 @@ class LibraryPage(QWidget):
         # What the covers about to be rendered were rendered WITH (see showEvent).
         self._rendered_with = self._bios()
         d = self._rom_dir()
-        self._all_roms = []
-        if d:
-            # Recurse: point it at a whole projects tree and it finds every ROM inside.
-            roms: set[Path] = set()
-            for pat in ("*.ngc", "*.ngp", "*.NGC", "*.NGP",
-                        "*.zip", "*.ZIP", "*.7z", "*.7Z"):
-                try:
-                    roms.update(d.rglob(pat))
-                except (OSError, ValueError):
-                    pass
-            self._all_roms = sorted(p for p in roms if p.is_file())
+        self._all_roms = scan_roms(d) if d else []
         self._images.clear()
         self._arrange()
         self._sync_bios_hint()
@@ -745,7 +999,7 @@ class LibraryPage(QWidget):
             text = f"The analysis itself failed:\n\n{type(exc).__name__}: {exc}"
         finally:
             QApplication.restoreOverrideCursor()
-        RomReportDialog(self, rom.stem, text).exec()
+        RomReportDialog(self, rom.stem, text, cfg.language(self._settings)).exec()
 
     def set_cover(self, rom_str: str) -> None:
         """Pick an image and make it this game's cover, for good. It is COPIED into
@@ -855,6 +1109,9 @@ class LibraryPage(QWidget):
         self._empty.setVisible(not self._roms)
         self._empty.setText(cfg.tr(lang, "no_roms" if not self._all_roms else "no_match"))
         fav_add, fav_rm = cfg.tr(lang, "fav_add"), cfg.tr(lang, "fav_remove")
+        # Decided over the WHOLE library, not the filtered view, so a search or a
+        # favourites filter never changes the name a card goes by.
+        titles = _titles(self._all_roms)
 
         def decorate(rom: Path) -> tuple[str, bool, str]:
             fav = self._lib.is_favorite(rom)
@@ -869,7 +1126,7 @@ class LibraryPage(QWidget):
             cols = self._cols_for_width(self._scroll.viewport().width())
             cards = []
             for i, rom in enumerate(self._roms):
-                card = GameCard(rom, size, *decorate(rom))
+                card = GameCard(rom, size, *decorate(rom), title=titles.get(str(rom)))
                 card.clicked.connect(self.play_requested.emit)
                 card.fav_toggled.connect(self._on_fav)
                 card.analyze_requested.connect(self.analyze_rom)
@@ -887,7 +1144,8 @@ class LibraryPage(QWidget):
             show_art = (view == cfg.VIEW_LIST)
             row_size = min(size, 96)     # list covers are capped so rows stay tidy
             for rom in self._roms:
-                row = GameRow(rom, row_size, show_art, *decorate(rom))
+                row = GameRow(rom, row_size, show_art, *decorate(rom),
+                              title=titles.get(str(rom)))
                 row.clicked.connect(self.play_requested.emit)
                 row.fav_toggled.connect(self._on_fav)
                 row.analyze_requested.connect(self.analyze_rom)
@@ -940,12 +1198,58 @@ class LibraryPage(QWidget):
 
     def _start_worker(self, roms: list[Path]) -> None:
         self._thread = QThread(self)
-        self._worker = ThumbWorker(roms, self._bios())
+        self._worker = ThumbWorker(roms, self._bios(), console_is_mono(self._settings))
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.ready.connect(self._on_thumb)
         self._worker.done.connect(self._thread.quit)
         self._thread.start()
+
+    def _resume_missing_covers(self) -> None:
+        """Render the covers that are MISSING, and only those.
+
+        This is what makes a new ROM dropped in the folder cost one boot instead of a
+        whole library: everything already on disk is served from the cache, and a game
+        whose cover could not be rendered (no BIOS at the time, a game that never
+        reached a real screen) is simply retried. Nothing is thrown away here."""
+        if self._worker is not None or not self._all_roms:
+            return
+        todo = [r for r in self._all_roms
+                if str(r) not in self._images
+                and not (custom_cover(r) or _cover_path(r)).exists()]
+        # ...plus the ones whose cover exists on disk but is not in memory yet: those
+        # cost a file read, not a boot, and the card would otherwise stay blank.
+        todo += [r for r in self._all_roms
+                 if str(r) not in self._images and r not in todo]
+        if todo:
+            self._start_worker(todo)
+
+    def regenerate_covers(self) -> None:
+        """Throw the rendered covers away and make them again, for the whole library.
+
+        The one place that costs a full re-render, and it is a button because it should
+        be a DECISION: booting every game in a real collection is minutes of work. Covers
+        the user chose (`covers/`) are untouched -- this only drops what the emulator
+        itself rendered."""
+        lang = cfg.language(self._settings)
+        if not self._all_roms:
+            return
+        if QMessageBox.question(
+                self, cfg.tr(lang, "covers_regen"),
+                cfg.tr(lang, "covers_regen_ask").format(n=len(self._all_roms))
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._stop_worker()
+        for rom in self._all_roms:
+            cache = _cover_path(rom)
+            try:
+                if cache.is_file():
+                    cache.unlink()
+            except OSError:
+                pass
+        self._images.clear()
+        self._rebuild()
+        self._start_worker(self._all_roms)
 
     def _stop_worker(self) -> None:
         """Fully stop the thumbnail worker and JOIN it before returning. It renders
@@ -967,7 +1271,8 @@ class LibraryPage(QWidget):
 
     def _choose_folder(self) -> None:
         cur = cfg.rom_folder(self._settings) or str(DEFAULT_ROM_DIR)
-        path = QFileDialog.getExistingDirectory(self, "ROM folder", cur)
+        path = QFileDialog.getExistingDirectory(
+            self, cfg.tr(cfg.language(self._settings), "rom_folder_pick"), cur)
         if path:
             self._settings.setValue("paths/rom_folder", path)
             self.reload()
@@ -975,9 +1280,8 @@ class LibraryPage(QWidget):
     def _open_rom(self) -> None:
         cur = cfg.rom_folder(self._settings) or str(DEFAULT_ROM_DIR)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open ROM", cur,
-            "NGPC ROM or archive (*.ngc *.ngp *.zip *.7z);;"
-            "NGPC ROM (*.ngc *.ngp);;Archive (*.zip *.7z);;All files (*)")
+            self, cfg.tr(cfg.language(self._settings), "open_rom_pick"), cur,
+            cfg.tr(cfg.language(self._settings), "filter_rom_files"))
         if path:
             self.play_requested.emit(path)
 
@@ -992,8 +1296,12 @@ class LibraryPage(QWidget):
         # return from Settings or from a game. `reload` re-arranges and re-starts the
         # worker itself, so there is nothing left for the rest of this handler to do.
         if self._bios() != self._rendered_with:
-            self.retranslate()
-            self.reload()
+            # A BIOS appearing UNBLOCKS the covers that could not be rendered without
+            # one. It does not invalidate the ones already on disk: the worker reuses
+            # every cover it finds, so this pass costs one boot per MISSING cover and
+            # nothing at all for a library that is already complete.
+            self._rendered_with = self._bios()
+            self._resume_missing_covers()
             QTimer.singleShot(0, self._reflow_grid)
             return
         # A game just ended: its play count / playtime / last-played changed, so the
@@ -1002,12 +1310,10 @@ class LibraryPage(QWidget):
         # At construction the scroll area has no real width yet, so the first layout
         # uses a fallback and may not fill the window. Re-flow now we are on screen.
         QTimer.singleShot(0, self._reflow_grid)
-        # Resume rendering the covers we have not made yet. It was stopped on hide so
-        # it never shared the native core with a running game.
-        if self._worker is None and self._all_roms:
-            todo = [r for r in self._all_roms if str(r) not in self._images]
-            if todo:
-                self._start_worker(todo)
+        # Resume rendering the covers we have not made yet -- including any ROM that
+        # appeared in the folder since the last visit. Stopped on hide, so it never
+        # shares the native core with a running game.
+        self._resume_missing_covers()
 
     def hideEvent(self, e) -> None:  # type: ignore[override]
         self._stop_worker()
@@ -1189,15 +1495,50 @@ class SettingsPage(QWidget):
     def _bios_panel(self) -> QWidget:
         w, v = self._panel()
 
+        # THREE BIOS IMAGES, ONE SELECTOR. The colour NGPC dump and the mono NGP dump
+        # are two different machines (the mono one stamps 0x6F91 = 0x00, the colour one
+        # 0x10, which is how a cartridge knows where it is); the third is our own
+        # clean-room HLE image, which needs no path because it ships with the emulator.
+        # A radio in front of each says which one boots -- so "which BIOS am I running?"
+        # is answered by looking, not by deducing it from three other settings.
+        # NOTHING here ships a BIOS dump: both paths point at files the USER supplies.
+        self._bios_group = QButtonGroup(self)
+        self._bios_radios: dict[str, QRadioButton] = {}
         self._bios_edit = QLineEdit(cfg.bios_path(self._settings))
         self._bios_edit.editingFinished.connect(
-            lambda: self._settings.setValue("paths/bios", self._bios_edit.text()))
+            lambda: (self._settings.setValue("paths/bios", self._bios_edit.text()),
+                     self._sync_bios_slots()))
         self._bios_browse = QPushButton(); self._bios_browse.setObjectName("ghost")
         self._bios_browse.clicked.connect(self._pick_bios)
-        biosw = QWidget(); bh = QHBoxLayout(biosw); bh.setContentsMargins(0, 0, 0, 0)
-        self._bios_edit.setFixedWidth(220)
-        bh.addWidget(self._bios_edit); bh.addWidget(self._bios_browse)
+        self._bios_mono_edit = QLineEdit(cfg.bios_mono_path(self._settings))
+        self._bios_mono_edit.editingFinished.connect(
+            lambda: (self._settings.setValue("paths/bios_mono", self._bios_mono_edit.text()),
+                     self._sync_bios_slots()))
+        self._bios_mono_browse = QPushButton(); self._bios_mono_browse.setObjectName("ghost")
+        self._bios_mono_browse.clicked.connect(self._pick_bios_mono)
+
+        def slot(choice: str, edit: QLineEdit | None, browse: QPushButton | None) -> QWidget:
+            row = QWidget(); h = QHBoxLayout(row); h.setContentsMargins(0, 0, 0, 0)
+            radio = QRadioButton()
+            radio.setChecked(cfg.bios_choice(self._settings) == choice)
+            radio.toggled.connect(
+                lambda on, c=choice: self._on_bios_choice(c) if on else None)
+            self._bios_group.addButton(radio)
+            self._bios_radios[choice] = radio
+            radio.setMinimumWidth(210)
+            h.addWidget(radio)
+            if edit is not None:
+                edit.setFixedWidth(220)
+                h.addWidget(edit); h.addWidget(browse)
+            h.addStretch()
+            return row
+
         self._lbl_bios = QLabel()
+        bios_rows = [slot(cfg.BIOS_USE_COLOUR, self._bios_edit, self._bios_browse),
+                     slot(cfg.BIOS_USE_MONO, self._bios_mono_edit, self._bios_mono_browse),
+                     slot(cfg.BIOS_USE_HLE, None, None)]
+        self._bios_hint2 = QLabel(); self._bios_hint2.setObjectName("hint")
+        self._bios_hint2.setWordWrap(True)
 
         self._realbios = QCheckBox()
         self._realbios.setChecked(cfg.real_bios(self._settings))
@@ -1210,13 +1551,38 @@ class SettingsPage(QWidget):
 
         self._clock_items = [
             (ns.CLOCK_HARDWARE, "clk_hardware"), (ns.CLOCK_HOST, "clk_host"),
-            (ns.CLOCK_PAUSED, "clk_paused")]
+            (ns.CLOCK_PAUSED, "clk_paused"), (ns.CLOCK_MANUAL, "clk_manual")]
         self._clockmode = self._combo("bios/clock_mode", self._clock_items,
                                       cfg.clock_mode(self._settings))
         self._lbl_clockmode = QLabel()
+        # The date/time MANUAL mode uses. Shown only for that mode: a field that does
+        # nothing in the other three is a question the panel should not be asking.
+        self._clockset = QDateTimeEdit()
+        self._clockset.setDisplayFormat("yyyy-MM-dd  HH:mm:ss")
+        self._clockset.setCalendarPopup(True)
+        self._clockset.setDateTime(QDateTime.fromString(
+            cfg.clock_manual(self._settings), Qt.DateFormat.ISODate))
+        self._clockset.dateTimeChanged.connect(
+            lambda dt: (self._settings.setValue(
+                "bios/clock_manual", dt.toString(Qt.DateFormat.ISODate)),
+                self.changed.emit()))
+        self._lbl_clockset = QLabel()
+        self._clockmode.currentIndexChanged.connect(lambda _i: self._sync_clock_rows())
         self._clockmode_hint = QLabel()
         self._clockmode_hint.setObjectName("hint")
         self._clockmode_hint.setWordWrap(True)
+
+        # THE CONSOLE'S LANGUAGE -- not the emulator's. A bilingual cartridge reads
+        # 0x6F87 to pick its script (SDK SysWork.txt), and on hardware the BIOS setup
+        # wizard is what sets it. We skip that wizard, so the choice belongs here.
+        self._cartlang_items = [(cfg.CART_LANG_EN, "cart_lang_en"),
+                                (cfg.CART_LANG_JA, "cart_lang_ja")]
+        self._cartlang = self._combo("general/cart_language", self._cartlang_items,
+                                     cfg.cart_language(self._settings))
+        self._lbl_cartlang = QLabel()
+        self._cartlang_hint = QLabel()
+        self._cartlang_hint.setObjectName("hint")
+        self._cartlang_hint.setWordWrap(True)
 
         # Pulling the coin cell. Destructive and not undoable, so it asks first.
         self._coincell_btn = QPushButton(); self._coincell_btn.setObjectName("ghost")
@@ -1226,12 +1592,18 @@ class SettingsPage(QWidget):
         self._coincell_hint.setObjectName("hint")
         self._coincell_hint.setWordWrap(True)
 
-        for r in (_row(self._lbl_bios, biosw),
-                  _row(self._lbl_realbios, self._realbios)):
+        v.addWidget(self._lbl_bios)
+        for r in bios_rows:
             v.addWidget(r)
+        v.addWidget(self._bios_hint2)
+        v.addWidget(_row(self._lbl_realbios, self._realbios))
         v.addWidget(self._realbios_hint)
         v.addWidget(_row(self._lbl_clockmode, self._clockmode))
+        self._clockset_row = _row(self._lbl_clockset, self._clockset)
+        v.addWidget(self._clockset_row)
         v.addWidget(self._clockmode_hint)
+        v.addWidget(_row(self._lbl_cartlang, self._cartlang))
+        v.addWidget(self._cartlang_hint)
         v.addWidget(_row(self._lbl_coincell, self._coincell_btn))
         v.addWidget(self._coincell_hint)
         return w
@@ -1291,11 +1663,25 @@ class SettingsPage(QWidget):
         self._scale.valueChanged.connect(
             lambda n: (self._settings.setValue("gfx/lcd_scale", n), self.scale_changed.emit(n)))
 
+        # GRAPHICS FILTER PLUGINS. The list is built-ins + whatever the plugin folder
+        # holds; see ngpc_filters.py for why the good scalers are loaded, not shipped.
         self._filter_items = [
             (vid.FILTER_NONE, "flt_none"), (vid.FILTER_SCANLINES, "flt_scanlines"),
             (vid.FILTER_LCD_GRID, "flt_lcdgrid"), (vid.FILTER_CRT, "flt_crt")]
         self._filter = self._combo("gfx/filter", self._filter_items,
                                    cfg.video_filter(self._settings))
+        self._plug_edit = QLineEdit(cfg.filters_dir(self._settings))
+        self._plug_edit.setFixedWidth(220)
+        self._plug_edit.editingFinished.connect(
+            lambda: self._set_filters_dir(self._plug_edit.text()))
+        self._plug_browse = QPushButton(); self._plug_browse.setObjectName("ghost")
+        self._plug_browse.clicked.connect(self._pick_filters_dir)
+        plugw = QWidget(); ph = QHBoxLayout(plugw); ph.setContentsMargins(0, 0, 0, 0)
+        ph.addWidget(self._plug_edit); ph.addWidget(self._plug_browse)
+        self._lbl_plugins = QLabel()
+        self._plug_hint = QLabel(); self._plug_hint.setObjectName("hint")
+        self._plug_hint.setWordWrap(True)
+        self._plugw = plugw
         self._color_items = [
             (vid.COLOR_RAW, "col_raw"), (vid.COLOR_LCD, "col_lcd"),
             (vid.COLOR_VIVID, "col_vivid")]
@@ -1336,6 +1722,7 @@ class SettingsPage(QWidget):
         for r in (_row(self._lbl_scale, self._scale),
                   _row(self._lbl_mono, self._monobox),
                   _row(self._lbl_filter, self._filter),
+                  _row(self._lbl_plugins, self._plugw),
                   _row(self._lbl_color, self._colorbox),
                   _row(self._lbl_aspect, self._aspectbox),
                   _row(self._lbl_smooth, self._smooth),
@@ -1344,6 +1731,7 @@ class SettingsPage(QWidget):
                   _row(self._lbl_fshide, self._fshide),
                   _row(self._lbl_tbautohide, self._tbautohide)):
             v.addWidget(r)
+        v.addWidget(self._plug_hint)
         v.addWidget(self._mono_hint)
         return w
 
@@ -1374,8 +1762,8 @@ class SettingsPage(QWidget):
         # gamepad. Defaults to P1 so the common case is unchanged.
         self._ctrl_player = 1
         self._player_sel = QComboBox()
-        self._player_sel.addItem("Player 1", 1)
-        self._player_sel.addItem("Player 2", 2)
+        self._player_sel.addItem("", 1)      # labelled in retranslate: "Player N"
+        self._player_sel.addItem("", 2)
         self._player_sel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._player_sel.currentIndexChanged.connect(self._on_ctrl_player)
         self._lbl_player = QLabel()
@@ -1555,14 +1943,136 @@ class SettingsPage(QWidget):
 
     def _pick_bios(self) -> None:
         cur = cfg.bios_path(self._settings) or str(DEFAULT_ROM_DIR)
-        path, _ = QFileDialog.getOpenFileName(self, "BIOS image", cur, "BIOS (*.bin *.rom);;All (*)")
+        lang = cfg.language(self._settings)
+        path, _ = QFileDialog.getOpenFileName(self, cfg.tr(lang, "bios_slot_colour"), cur,
+                                              cfg.tr(lang, "filter_bios_files"))
         if path:
             self._bios_edit.setText(path)
             self._settings.setValue("paths/bios", path)
+            self._sync_bios_slots()
+
+    def _pick_bios_mono(self) -> None:
+        cur = cfg.bios_mono_path(self._settings) or str(REPO)
+        lang = cfg.language(self._settings)
+        path, _ = QFileDialog.getOpenFileName(
+            self, cfg.tr(lang, "bios_mono"), cur,
+            "BIOS (*.bin *.rom *.ngp);;All (*)")
+        if not path:
+            return
+        self._bios_mono_edit.setText(path)
+        self._settings.setValue("paths/bios_mono", path)
+        self._sync_bios_slots()
+
+    def _on_bios_choice(self, choice: str) -> None:
+        """Pick the BIOS -- and, when that choice names a machine, pick the machine too.
+
+        The mono NGP BIOS only exists on mono silicon and the colour one only on an
+        NGPC, so leaving the Console setting behind is how a user ends up watching the
+        NGP boot intro and then playing in colour. The HLE slot names no machine: it
+        leaves the Console setting alone."""
+        self._settings.setValue("bios/active", choice)
+        implied = {cfg.BIOS_USE_MONO: cfg.MONO_K1GE,
+                   cfg.BIOS_USE_COLOUR: cfg.MONO_K2GE}.get(choice)
+        if implied is not None and cfg.mono_mode(self._settings) != implied:
+            self._settings.setValue("gfx/mono_mode", implied)
+            box = getattr(self, "_monobox", None)
+            if box is not None:
+                idx = box.findData(implied)
+                if idx >= 0:
+                    box.setCurrentIndex(idx)
+        self._sync_bios_slots()
+        self.changed.emit()
+
+    def _sync_bios_slots(self) -> None:
+        """Say, under the three slots, WHICH image will actually boot and what it is.
+
+        The check is the same one a cartridge makes: an NGPC BIOS stamps 0x6F91 = 0x10,
+        the mono NGP's stamps 0x00. So a colour dump dropped in the mono slot is caught
+        here rather than three settings later, when a game 'mysteriously' still thinks
+        it is on an NGPC."""
+        lang = cfg.language(self._settings)
+        found, slot = resolve_selected_bios(self._settings)
+        choice = cfg.bios_choice(self._settings)
+        if found is None:
+            self._bios_hint2.setText(cfg.tr(lang, "bios_none"))
+            return
+        if slot != choice:
+            # The selected slot was empty; something else answered for it.
+            self._bios_hint2.setText(
+                cfg.tr(lang, "bios_fallback").format(name=found.name))
+            return
+        if choice == cfg.BIOS_USE_HLE:
+            self._bios_hint2.setText(cfg.tr(lang, "bios_hle_hint"))
+            return
+        kind = bios_kind(found)
+        want = BIOS_MONO if choice == cfg.BIOS_USE_MONO else BIOS_COLOUR
+        if kind == BIOS_UNKNOWN:
+            key = "bios_slot_unknown"
+        elif kind == want:
+            key = "bios_slot_ok_mono" if want == BIOS_MONO else "bios_slot_ok_colour"
+        else:
+            key = "bios_slot_wrong_mono" if want == BIOS_MONO else "bios_slot_wrong_colour"
+        self._bios_hint2.setText(cfg.tr(lang, key).format(name=found.name))
+
+    def _set_filters_dir(self, path: str) -> None:
+        self._settings.setValue("paths/filters", path)
+        FILTERS.sync(path, force=True)
+        self._sync_filter_items()
+        self.changed.emit()
+
+    def _sync_clock_rows(self) -> None:
+        """The manual date/time only exists for the manual mode."""
+        self._clockset_row.setVisible(
+            cfg.clock_mode(self._settings) == ns.CLOCK_MANUAL)
+
+    def _pick_filters_dir(self) -> None:
+        lang = cfg.language(self._settings)
+        cur = cfg.filters_dir(self._settings) or str(REPO)
+        path = QFileDialog.getExistingDirectory(self, cfg.tr(lang, "filter_plugins"), cur)
+        if path:
+            self._plug_edit.setText(path)
+            self._set_filters_dir(path)
+
+    def _sync_filter_items(self) -> None:
+        """Rebuild the filter list (built-ins + plugins) and say what the folder holds.
+
+        The rejected files are listed too, with their reason. A plugin that simply does
+        not appear is a bug report we would receive as "your filter list is broken"."""
+        lang = cfg.language(self._settings)
+        current = cfg.video_filter(self._settings)
+        self._filter.blockSignals(True)
+        self._filter.clear()
+        for ident, key in self._filter_items:
+            self._filter.addItem(cfg.tr(lang, key), ident)
+        for plug in FILTERS.plugins:
+            self._filter.addItem(plug.name, plug.ident)
+        idx = self._filter.findData(current)
+        self._filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self._filter.blockSignals(False)
+        if idx < 0 and current.startswith("plugin:"):
+            # The selected plugin is gone (folder moved, file deleted): fall back rather
+            # than leave a setting pointing at nothing.
+            self._settings.setValue("gfx/filter", vid.FILTER_NONE)
+
+        if not cfg.filters_dir(self._settings):
+            self._plug_hint.setText(cfg.tr(lang, "filter_plugins_hint"))
+            return
+        bits = []
+        if FILTERS.plugins:
+            bits.append(cfg.tr(lang, "filter_plugins_found").format(
+                n=len(FILTERS.plugins),
+                names=", ".join(p.name for p in FILTERS.plugins)))
+        else:
+            bits.append(cfg.tr(lang, "filter_plugins_none"))
+        for bad in FILTERS.rejected:
+            bits.append(cfg.tr(lang, "filter_plugins_bad").format(
+                name=bad.source.name, why=bad.reason))
+        self._plug_hint.setText("\n".join(bits))
 
     def _pick_shots(self) -> None:
         cur = cfg.screenshot_dir(self._settings) or str(REPO / "screenshots")
-        path = QFileDialog.getExistingDirectory(self, "Screenshots folder", cur)
+        path = QFileDialog.getExistingDirectory(
+            self, cfg.tr(cfg.language(self._settings), "screenshots"), cur)
         if path:
             self._shot_edit.setText(path)
             self._settings.setValue("paths/screenshots", path)
@@ -1606,6 +2116,12 @@ class SettingsPage(QWidget):
         for i, (_tid, key) in enumerate(ngpc_theme.THEMES):
             self._theme.setItemText(i, t(key))
         self._lbl_realbios.setText(t("console_boot")); self._bios_browse.setText(t("browse"))
+        self._bios_mono_browse.setText(t("browse"))
+        for choice, key in ((cfg.BIOS_USE_COLOUR, "bios_slot_colour"),
+                            (cfg.BIOS_USE_MONO, "bios_slot_mono"),
+                            (cfg.BIOS_USE_HLE, "bios_slot_hle")):
+            self._bios_radios[choice].setText(t(key))
+        self._sync_bios_slots()
         self._lbl_shots.setText(t("screenshots")); self._shot_browse.setText(t("browse"))
         self._lbl_savemode.setText(t("save_mode"))
         for i, (_id, key) in enumerate([(cfg.SAVE_ROM, "save_rom"),
@@ -1619,9 +2135,17 @@ class SettingsPage(QWidget):
             self._rewind.setItemText(i, t(key))
         self._realbios_hint.setText(t("console_boot_hint"))
         self._lbl_clockmode.setText(t("clock_mode"))
+        self._lbl_clockset.setText(t("clock_manual"))
+        if cfg.clock_mode(self._settings) == ns.CLOCK_MANUAL:
+            self._clockmode_hint.setText(t("clock_manual_hint"))
+        self._sync_clock_rows()
         for i, (_val, key) in enumerate(self._clock_items):
             self._clockmode.setItemText(i, t(key))
         self._clockmode_hint.setText(t("clock_mode_hint"))
+        self._lbl_cartlang.setText(t("cart_lang"))
+        for i, (_val, key) in enumerate(self._cartlang_items):
+            self._cartlang.setItemText(i, t(key))
+        self._cartlang_hint.setText(t("cart_lang_hint"))
         self._lbl_coincell.setText(t("coin_cell"))
         self._coincell_btn.setText(t("coin_cell_reset"))
         self._coincell_hint.setText(t("coin_cell_hint"))
@@ -1634,8 +2158,10 @@ class SettingsPage(QWidget):
         self._lbl_tbautohide.setText(t("toolbar_autohide"))
         self._lbl_showfps.setText(t("show_fps"))
         self._lbl_mono.setText(t("mono_mode")); self._mono_hint.setText(t("mono_mode_hint"))
-        for box, items in ((self._filter, self._filter_items),
-                           (self._colorbox, self._color_items),
+        self._lbl_plugins.setText(t("filter_plugins"))
+        self._plug_browse.setText(t("browse"))
+        self._sync_filter_items()
+        for box, items in ((self._colorbox, self._color_items),
                            (self._monobox, self._mono_items),
                            (self._aspectbox, self._aspect_items)):
             for i, (_val, key) in enumerate(items):
@@ -1651,9 +2177,13 @@ class SettingsPage(QWidget):
         for i, hz in enumerate(cfg.TURBO_RATES):
             self._turbo_rate.setItemText(i, t("turbo_hz").format(n=hz))
         self._pad_hint.setText(t("gamepad_hint")); self._lbl_pad.setText(t("gamepad"))
-        _fr = cfg.language(self._settings) == "fr"
-        self._lbl_player.setText("Joueur" if _fr else "Player")
-        self._lbl_pad_idx.setText("Manette n°" if _fr else "Controller #")
+        # These two used to be a hardcoded `"Joueur" if french else "Player"` in the
+        # code -- a translation no translator could ever reach, invisible to the lang
+        # files, and wrong in every other language. Same route as everything else now.
+        self._lbl_player.setText(t("player"))
+        self._lbl_pad_idx.setText(t("pad_index"))
+        for i in range(self._player_sel.count()):
+            self._player_sel.setItemText(i, t("player_n").format(n=i + 1))
         self._refresh_pad_state()
         self._refresh_conflicts()
 
@@ -1807,6 +2337,11 @@ class PlayPage(QWidget):
         # steady 60 fps, and stay silent. Player 1 keeps the audio.
         self._lean = False
         self._link_tx_total = 0              # bytes this console has put on the cable
+        # A core.link_debug.LinkMonitor when the debugger's Link tab is watching:
+        # it taps every byte the cable carries, delivers hand-injected ones, and
+        # applies any latency/loss the user dialled in. None = untapped, and the
+        # relay below runs exactly as it did before.
+        self.link_monitor = None
         self._play_t0: float | None = None   # wall clock since the game last resumed
         self.session: NativeSession | None = None
         self.machine = None
@@ -1978,8 +2513,20 @@ class PlayPage(QWidget):
         except Exception:
             pass
 
+    def _mono_console(self) -> bool:
+        """True when this is the ORIGINAL monochrome NGP, not an NGPC. A property of the
+        CONSOLE, so it applies to every cartridge -- a colour game in an NGP is a real
+        situation, and several of them (SNK vs. Capcom) notice and show another screen.
+
+        ⚡ THE BIOS THAT BOOTS IS THE MACHINE. The two used to be independent settings,
+        and a user who selected the NGP BIOS got its boot intro followed by the game in
+        full colour -- because the silicon underneath was still an NGPC. You cannot boot
+        one console's BIOS on the other's hardware; there is no such machine."""
+        return console_is_mono(self._settings)
+
     def _bios_path(self) -> Path | None:
-        return _resolve_bios(cfg.bios_path(self._settings))
+        """The BIOS the user selected in Settings ▸ BIOS -- one of three slots."""
+        return resolve_selected_bios(self._settings)[0]
 
     def _using_hle_bios(self) -> bool:
         """True when the BIOS in use is the clean-room HLE fallback (no real bios.bin).
@@ -2016,7 +2563,12 @@ class PlayPage(QWidget):
             save_to_rom=mode in (cfg.SAVE_ROM, cfg.SAVE_BOTH),
             sidecar=mode in (cfg.SAVE_SIDECAR, cfg.SAVE_BOTH),
             flash_size=cap, clock_mode=cfg.clock_mode(self._settings),
-            k1ge_console=cfg.mono_mode(self._settings) == cfg.MONO_K1GE)
+            clock_manual=cfg.clock_manual(self._settings),
+            k1ge_console=self._mono_console(),
+            language=cfg.cart_language(self._settings),
+            # The HLE image has no BIOS setup screen, so there the UI setting is the
+            # console's only control panel. With a real BIOS, the BIOS owns it.
+            hle_bios=resolve_selected_bios(self._settings)[1] == cfg.BIOS_USE_HLE)
         self.machine = self.session.machine
         if self._link_peer is not None:          # keep the cable live across a restart
             self.machine.serial_set_enabled(True)
@@ -2352,6 +2904,19 @@ class PlayPage(QWidget):
         # launch. It becomes the session's baseline (what commit_system_ram writes) and goes
         # back in the buffer so a reboot still boots configured.
         coin = self.machine.battery_ram()
+        # ⚡ THE WIZARD WE ANSWERED FOR THEM. We auto-completed the BIOS's first-boot setup
+        # with its defaults, and this cell is about to become what the console remembers --
+        # so on a console that had never been configured, the language the player chose in
+        # Settings is written in as their answer to that screen. Exactly once: from here on
+        # the cell is configured, and only the BIOS's own setup screen (Boot BIOS) changes
+        # it. Without this the setting was dead for everyone running a real BIOS -- the
+        # wizard's default would silently become the console's language, for good.
+        if self.session is not None and self.session.started_unconfigured:
+            lang = bytes([cfg.cart_language(self._settings) & 0xFF])
+            self.machine.write(0x006F87, lang)
+            coin = bytearray(coin)
+            coin[0x006F87 - ns.native.RAM_START:0x006F88 - ns.native.RAM_START] = lang
+            coin = bytes(coin)
         if self.session is not None:
             self.session.system_ram_baseline = coin
         # ⚡ THE CLOCK IS THE OTHER HALF OF THAT COIN CELL, and it must be carried over the
@@ -2938,6 +3503,21 @@ class PlayPage(QWidget):
         return path
 
     # ---- screenshot -------------------------------------------------------
+    def _scaler(self, rgb):
+        """The plugin upscaler for the current filter setting, applied to one frame.
+
+        Returns (picture, factor) -- (None, 0) when no plugin is selected or when the
+        plugin just failed and was dropped. A filter that breaks costs the FILTER, never
+        the frame: the game keeps running, unfiltered, and the panel says why."""
+        ident = self._filter
+        if not ident.startswith("plugin:"):
+            return None, 0
+        plug = FILTERS.get(ident)
+        if plug is None:
+            return None, 0
+        out = FILTERS.run(ident, rgb)
+        return (out, plug.scale) if out is not None else (None, 0)
+
     def screenshot(self) -> None:
         if self.machine is None:
             return
@@ -2945,7 +3525,8 @@ class PlayPage(QWidget):
         d = Path(folder); d.mkdir(parents=True, exist_ok=True)
         scale = max(2, min(6, self._scale or 4))
         pix = ngpc_video.render_pixmap(
-            self.machine.framebuffer(), scale, self._filter, self._color, self._smooth)
+            self.machine.framebuffer(), scale, self._filter, self._color, self._smooth,
+            self._scaler)
         stem = self._rom_path.stem if self._rom_path else "ngpc"
         name = f"{stem}_{datetime.now():%Y%m%d_%H%M%S}.png"
         pix.save(str(d / name), "PNG")
@@ -3212,13 +3793,42 @@ class PlayPage(QWidget):
         if self.machine is not None and self._link_peer is None:
             self.machine.serial_set_enabled(False)
 
+    def set_link_monitor(self, monitor) -> None:
+        """Tap (or untap) this console's cable for the debugger's Link tab.
+
+        The monitor has to reach whichever relay is actually carrying the bytes:
+        a local 2P link is pumped here, but an online one is pumped inside the
+        TcpLink/LobbyLink, so it needs the tap handed to it directly. `None`
+        removes the tap everywhere.
+        """
+        self.link_monitor = monitor
+        if self._net_link is not None:
+            self._net_link.monitor = monitor
+
+    def link_mode(self) -> str:
+        """Which cable, if any, this console is on -- for the debugger to show."""
+        if self._net_link is not None:
+            return {"TcpLink": "lan", "LobbyLink": "lobby",
+                    "LoopbackLink": "loopback"}.get(
+                        type(self._net_link).__name__, "net")
+        if self._link_peer is not None:
+            return "local2p"
+        return "none"
+
     def _pump_link(self) -> None:
+        mon = self.link_monitor
+        if mon is not None:
+            mon.frame = self._frame              # stamp this pump's log entries
         if self._net_link is not None:           # online: relay over the socket
-            self._net_link.pump()
+            self._net_link.pump()                # (the net link carries the monitor)
             self._link_tx_total = self._net_link.bytes_out
             return
         peer = self._link_peer
         if peer is None or peer.machine is None or self.machine is None:
+            # No peer at all: a monitor can still stand in for one, feeding the
+            # console bytes the user typed by hand (fake peer, real receive path).
+            if mon is not None and self.machine is not None:
+                link_debug.deliver_injected(self.machine, mon)
             return
         # Cross-wire the CTS0 handshake pin: our CTS0 is the PEER's RTS line (the
         # datasheet's "RTS is any GPIO -> the peer's CTS0"). With SC0MOD<CTSE> set,
@@ -3233,9 +3843,18 @@ class PlayPage(QWidget):
         # on the peer's RTS instead could strand a handshake byte and read as
         # "no cable".)
         data = self.machine.serial_read_tx()
+        # The monitor watches (and may delay/drop) what leaves us; the PEER's
+        # monitor is the one that records the arrival, since a monitor belongs to
+        # a console, not to a wire. Called even on an empty drain so bytes held
+        # back for a simulated latency get released.
+        if mon is not None:
+            data = mon.on_tx(data)
         if data:
             peer.machine.serial_write_rx(data)
             self._link_tx_total += len(data)
+            if peer.link_monitor is not None:
+                peer.link_monitor.on_rx(data)
+        link_debug.deliver_injected(self.machine, mon)
 
     def _tick(self) -> None:
         if self.machine is None:
@@ -3444,7 +4063,8 @@ class PlayPage(QWidget):
         k = max(1, min(bw // SCREEN_W, bh // SCREEN_H))
         k = min(k, 8)                                    # cap the numpy cost
         pix = ngpc_video.render_pixmap(
-            self.machine.framebuffer(), k, self._filter, self._color, self._smooth)
+            self.machine.framebuffer(), k, self._filter, self._color, self._smooth,
+            self._scaler)
         pix = ngpc_video.fit_pixmap(pix, bw, bh, self._aspect, self._smooth)
         self.lcd.setPixmap(pix)
 
@@ -3540,7 +4160,7 @@ class _Link2PWindow(QMainWindow):
 
     def __init__(self, settings, library, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("NGPC — Player 2")
+        self.setWindowTitle(cfg.tr(cfg.language(settings), "window_player2"))
         self.play = PlayPage(settings, library)
         self.play._link_btn.hide()            # noqa: SLF001 -- P2 never re-links
         self.setCentralWidget(self.play)
@@ -3579,7 +4199,7 @@ class Shell(QMainWindow):
         head = QHBoxLayout(); head.setContentsMargins(0, 0, 0, 0)
         self._rail_title = QLabel("◆ NgpCraft"); self._rail_title.setObjectName("appTitle")
         self._rail_toggle = QPushButton("‹"); self._rail_toggle.setObjectName("railToggle")
-        self._rail_toggle.setFixedSize(26, 26); self._rail_toggle.setToolTip("Collapse / expand sidebar")
+        self._rail_toggle.setFixedSize(26, 26)
         self._rail_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._rail_toggle.clicked.connect(lambda: self._toggle_rail())
         head.addWidget(self._rail_title); head.addStretch(); head.addWidget(self._rail_toggle)
@@ -3772,6 +4392,7 @@ class Shell(QMainWindow):
             self._nav_set: cfg.tr(lang, "settings"),
             self._nav_dbg: cfg.tr(lang, "m_debug"),
         }
+        self._rail_toggle.setToolTip(cfg.tr(lang, "rail_toggle_tip"))
         self._fit_rail()               # the new labels may not be the old width
         self.library.retranslate()
         self.settings.retranslate()
@@ -3807,7 +4428,7 @@ class Shell(QMainWindow):
                 pass
             self._stack.setCurrentWidget(self.library)
             self._update_rail(0)
-            QMessageBox.warning(self, "Cannot start game",
+            QMessageBox.warning(self, cfg.tr(cfg.language(self._settings), "launch_failed"),
                                 f"{Path(rom_str).name}\n\n{type(exc).__name__}: {exc}")
             return
         self._update_rail(2)
@@ -3887,12 +4508,13 @@ class Shell(QMainWindow):
         if not ok:
             return
         self._start_net("host", "", int(port),
-                        f"⏳ waiting for player 2 on port {port}")
+                        cfg.tr(cfg.language(self._settings), "link_waiting")
+                        .format(port=port))
         # Show the connection info (public IP auto-detected) + port-forward/risks help.
         from ngpc_lobby import HostInfoDialog
         game = self.play._rom_path.stem if self.play._rom_path else "?"
-        fr = cfg.language(self._settings) == "fr"
-        self._host_info = HostInfoDialog(game, int(port), fr, self)
+        self._host_info = HostInfoDialog(game, int(port),
+                                         cfg.language(self._settings), self)
         self._host_info.show()
 
     def _join_online(self) -> None:
@@ -3905,7 +4527,9 @@ class Shell(QMainWindow):
             return
         host, _, p = text.strip().partition(":")
         port = int(p) if p.strip().isdigit() else 7788
-        self._start_net("join", host.strip(), port, f"⏳ connecting to {host}:{port}")
+        self._start_net("join", host.strip(), port,
+                        cfg.tr(cfg.language(self._settings), "link_connecting")
+                        .format(addr=f"{host}:{port}"))
 
     def _start_net(self, mode: str, host: str, port: int, waiting: str) -> None:
         if self._net_thread is not None:            # one attempt at a time
@@ -3928,7 +4552,7 @@ class Shell(QMainWindow):
             return
         net = TcpLink(self.play.machine, sock)
         self.play.attach_net_link(net)
-        self.play.overlay.setText("🔗 linked — open the game's VS / link menu")
+        self.play.overlay.setText(cfg.tr(cfg.language(self._settings), "link_ready"))
         self._net_status = QTimer(self)
         self._net_status.timeout.connect(
             lambda: self.setWindowTitle(
@@ -3936,7 +4560,8 @@ class Shell(QMainWindow):
         self._net_status.start(500)
 
     def _on_net_failed(self, msg: str) -> None:
-        self.play.overlay.setText(f"⚠ link failed: {msg}")
+        self.play.overlay.setText(
+            cfg.tr(cfg.language(self._settings), "link_failed").format(why=msg))
 
     def _open_lobby(self) -> None:
         if self.play.machine is None:
@@ -3953,7 +4578,7 @@ class Shell(QMainWindow):
             client.close(); return
         net = LobbyLink(self.play.machine, client)
         self.play.attach_net_link(net)
-        self.play.overlay.setText("🔗 linked — open the game's VS / link menu")
+        self.play.overlay.setText(cfg.tr(cfg.language(self._settings), "link_ready"))
         self._net_status = QTimer(self)
         self._net_status.timeout.connect(
             lambda: self.setWindowTitle(

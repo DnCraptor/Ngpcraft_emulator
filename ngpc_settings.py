@@ -144,6 +144,50 @@ def bios_path(s: QSettings) -> str:
     return s.value("paths/bios", "", type=str)
 
 
+def bios_mono_path(s: QSettings) -> str:
+    """The ORIGINAL monochrome NGP's BIOS, kept apart from the colour one.
+
+    They are two machines, not two settings of one: the mono NGP's BIOS writes 0x00
+    into the console-type byte at 0x6F91 (the NGPC's writes 0x10) and never touches a
+    K2GE colour register. A cartridge reads that byte to decide which machine it is
+    running on -- which is exactly why some games show a different screen on an NGP --
+    so booting the mono console properly needs the mono BIOS, not the colour one."""
+    return s.value("paths/bios_mono", "", type=str)
+
+
+# WHICH of the three BIOS images boots. Three slots, one choice -- rather than a path
+# that means different things depending on other settings: the user owns two dumps and
+# the emulator ships a third, and "which one am I running?" must be answerable by
+# looking at the panel.
+BIOS_USE_COLOUR, BIOS_USE_MONO, BIOS_USE_HLE = "colour", "mono", "hle"
+BIOS_CHOICES = (BIOS_USE_COLOUR, BIOS_USE_MONO, BIOS_USE_HLE)
+
+
+def bios_choice(s: QSettings) -> str:
+    """Which BIOS slot is selected. Defaults to the colour NGPC one, which is what
+    every existing install already boots."""
+    c = str(s.value("bios/active", BIOS_USE_COLOUR, type=str))
+    return c if c in BIOS_CHOICES else BIOS_USE_COLOUR
+
+
+def clock_manual(s: QSettings) -> str:
+    """The date and time the console's clock is set to in MANUAL mode, ISO-8601.
+
+    On hardware the BIOS setup screen is where you set the clock. The clean-room HLE
+    image has no such screen, so without this there was no way to choose a date at all
+    -- only to follow the PC's. Default: the console's own era rather than today, so a
+    manual clock is visibly a choice and not a silent copy of the host."""
+    return s.value("bios/clock_manual", "1999-01-01T12:00:00", type=str)
+
+
+def filters_dir(s: QSettings) -> str:
+    """A folder of GRAPHICS FILTER PLUGINS the user owns. Empty by default, and nothing
+    is created for it: the emulator already writes enough directories beside itself
+    without adding an empty one for a feature most users never enable. See
+    ngpc_filters.py for why these are loaded rather than shipped."""
+    return s.value("paths/filters", "", type=str)
+
+
 def lcd_scale(s: QSettings) -> int:
     return int(s.value("gfx/lcd_scale", 3, type=int))
 
@@ -277,6 +321,20 @@ def mono_mode(s: QSettings) -> str:
     (colourised), which is the hardware this emulator is."""
     m = str(s.value("gfx/mono_mode", MONO_K2GE, type=str))
     return m if m in MONO_MODES else MONO_K2GE
+
+
+# The CONSOLE's language -- `Language` at 0x6F87 (SDK SysWork.txt), 0 = Japanese,
+# 1 = English. Nothing to do with the emulator's own UI language: this is the switch a
+# BILINGUAL CARTRIDGE reads to pick its script, and 24 games of the corpus do read it.
+# On hardware the BIOS setup wizard writes it and the coin cell keeps it; we skip that
+# wizard, so it sat at 0 and every one of those games ran in Japanese -- by accident,
+# never by choice, which is why English is the default here.
+CART_LANG_JA, CART_LANG_EN = 0, 1
+
+
+def cart_language(s: QSettings) -> int:
+    v = s.value("general/cart_language", CART_LANG_EN, type=int)
+    return CART_LANG_JA if int(v) == CART_LANG_JA else CART_LANG_EN
 
 
 REWIND_CHOICES = (0, 10, 20, 30)          # seconds of history the UI offers
