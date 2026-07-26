@@ -36,6 +36,8 @@ from ctypes import (
 )
 from pathlib import Path
 
+from core import bios_fingerprint
+
 ABI_VERSION = 13
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
@@ -519,6 +521,7 @@ class NativeMachine:
         buf = _buf(rom)
         if self._lib.ngpc_load_rom(self._h, buf, len(rom)) != 0:
             raise ValueError("native core rejected the ROM (too small for a header?)")
+        self._rom = bytes(rom)          # kept for core.bios_fingerprint (see reset)
         if bios is not None:
             bbuf = _buf(bios)
             if self._lib.ngpc_load_bios(self._h, bbuf, len(bios)) != 0:
@@ -942,6 +945,14 @@ class NativeMachine:
         else:
             mode = RESET_HANDOFF if bios_handoff else RESET_RAW
         self._lib.ngpc_reset(self._h, mode)
+        # A game may check that the console booted from the BIOS by fingerprinting
+        # char RAM. Hand-off only: that is the path where char RAM arrives pre-filled
+        # (the core warms the loaded BIOS up to capture it), so a real bios.bin leaves
+        # the fingerprint there and this is a no-op. Under `real_bios` the BIOS is
+        # about to run for itself and char RAM is still blank -- writing there would be
+        # us pre-empting a boot that produces the data on its own.
+        if mode == RESET_HANDOFF:
+            bios_fingerprint.restore(self._rom, self.read, self.write)
 
     def cpu(self) -> CpuState:
         st = CpuState()

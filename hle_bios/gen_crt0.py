@@ -12,6 +12,8 @@ Image map (64 KiB, linked at 0xFF0000):
   0xFFFF00  INT_VECTOR   60 hardware vectors (reset/swi/IRQ)
 """
 
+import os
+
 # --- user vector table (RAM, 0x6FB8) : which hardware IRQ index maps to
 #     which 4-byte slot. Source: ngpcspec.txt "User Program Interrupt Vectors"
 #     (the "MICRO DMA START VECTOR" column IS the hardware index).
@@ -48,11 +50,30 @@ FONT_FG = 3              # 2bpp pixel index for a lit pixel (default palette)
 FONT_BG = 0
 
 
+FONT_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "font_2bpp.bin")
+
+
 def build_font_2bpp():
-    """Clean-room 8x8 font (Pillow's own public-domain default face), expanded
-    to the K2GE 2bpp CHAR-RAM tile format: 256 tiles x 16 bytes, each row a
-    big-endian word (pixel 0 in the high bits), matching the retail SYSFONTSET
-    layout. Returns 0x1000 bytes to preload at 0xA000."""
+    """The clean-room 8x8 font, expanded to the K2GE 2bpp CHAR-RAM tile format:
+    256 tiles x 16 bytes, each row a big-endian word (pixel 0 in the high bits),
+    matching the retail SYSFONTSET layout. Returns 0x1000 bytes to preload at
+    0xA000.
+
+    Read from the baked font_2bpp.bin, which is what the shipped bios_hle.bin
+    was built from. Pillow is NOT a dependency of this module -- it is optional
+    everywhere else in the tree (see core/frame_diff.py) and importing it here
+    made gen() unrunnable on a bare CI box. Regenerate the .bin with
+    `python gen_crt0.py --regen-font`, which needs Pillow and rasterises its
+    public-domain default face."""
+    with open(FONT_BIN, "rb") as f:
+        font = f.read()
+    assert len(font) == 0x1000, f"{FONT_BIN}: {len(font)} bytes, expected 0x1000"
+    return font
+
+
+def rasterise_font_2bpp():
+    """Rebuild the font bytes from Pillow's default face. Only ever called by
+    --regen-font; changing what this returns changes the shipped BIOS image."""
     from PIL import Image, ImageFont, ImageDraw
     fnt = ImageFont.load_default()
     out = bytearray()
@@ -1061,7 +1082,13 @@ def gen():
 
 
 if __name__ == "__main__":
-    import os
+    import sys
+    if "--regen-font" in sys.argv:
+        data = rasterise_font_2bpp()
+        with open(FONT_BIN, "wb") as f:
+            f.write(data)
+        print("wrote", FONT_BIN)
+        raise SystemExit(0)
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, "src", "crt0.asm")
     os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -28,6 +28,31 @@ at load time, so the legacy path is byte-for-byte unchanged.
 - **What is not reproduced** is the retail BIOS's *internal* state layout. A game
   that polls BIOS work RAM directly instead of calling the API sees ours, not SNK's.
 
+### Games that fingerprint the BIOS (`core/bios_fingerprint.py`)
+
+**Metal Slug 2nd Mission** checks that the console booted from the BIOS: it sweeps
+CHAR RAM (`0xA000..0xC000`) for 64 bytes of the retail boot-time contents, of which
+it carries its own copy at `0x28DCC4`. Miss, and it wipes the magic `"MET2"` at
+`0x6A88`; a routine then zeroes the key configuration at `0x46DC/DD` every other
+frame, so `and A,<mask>` is always `and A,0`. **The game runs, it looks perfect,
+and shoot and jump never fire again** — an anti-piracy punishment built to be
+mistaken for an emulator bug.
+
+Those 64 bytes are SNK glyphs, and the check is literally a demand for SNK's own
+expression, so this image ships none of it: **the bytes are taken out of the
+player's cartridge** at hand-off and put in the player's CHAR RAM. Our code holds
+a title, an offset and an address — facts, not data. It is gated on *behaviour*
+(nothing is written if the fingerprint is already there), so under a real
+`bios.bin` it is a no-op by construction.
+
+Adding a game is one row in that table. Whether any other game needs one was
+measured, not assumed: 30 of the 82-ROM corpus embed a run of the BIOS's boot CHAR
+RAM, but planting it changes work RAM or the screen in **exactly one** of them —
+Metal Slug 2nd Mission (18 RAM bytes, screen identical: the silent punishment).
+The rest merely ship the same SDK font. Bounded claim: 300 frames, no input, one
+matched block per game, so a check that fires later or on different data would not
+show up.
+
 ## Layout (64 KiB, linked at 0xFF0000)
 
 | region | contents |
@@ -185,13 +210,15 @@ this HLE intentionally omits.
 
 ## Build
 
-Needs the official Toshiba chain (`THOME=C:\t900`) and Pillow (font). Then:
+Needs the official Toshiba chain (`THOME=C:\t900`). Then:
 
 ```sh
 bash build.sh        # gen_crt0.py -> asm900 -> tulink -> tuconv -> pack -> bios_hle.bin
 ```
 
 `gen_crt0.py` generates `src/crt0.asm` (vectors, stubs, and the pre-expanded
-2bpp font). `pack_bios.py` turns the linker's S-record into the flat 64 KiB
+2bpp font, read from the tracked `font_2bpp.bin`). Pillow is only needed to
+re-rasterise that font — `python gen_crt0.py --regen-font`, which rewrites the
+`.bin` and so changes the shipped image. `pack_bios.py` turns the linker's S-record into the flat 64 KiB
 image. `tests/test_hle_bios_image.py` guards the structure and a deterministic
 boot without needing the toolchain.
