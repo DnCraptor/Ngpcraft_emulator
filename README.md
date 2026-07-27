@@ -94,9 +94,15 @@ is a feature you can run yourself — see [ROM analysis](#rom-analysis).
   with it. See [ROM analysis](#rom-analysis).
 - **Crash reports** — a ROM fault writes a detailed `crashes/*.txt` (reason, PC, opcode,
   registers, memory & stack dumps).
-- **Translated interface** — English and French, switchable live, no restart. One JSON
-  file per language in [`lang/`](lang), so adding one is adding a file and needs no
-  code: see [TRANSLATING.md](TRANSLATING.md). Contributions welcome.
+- **Hardware-safety findings** — two things a real console minds and the running code
+  cannot see: a cartridge stack that crossed into BIOS-owned RAM, and a watchdog left to
+  starve. The core counts them while the ROM runs — it does not halt, because neither
+  halts a real console either — and the analysis names the code that did it. See [the
+  hardware-safety contract](specs/HARDWARE_SAFETY.md).
+- **Translated interface** — English, French, Japanese (日本語) and Portuguese,
+  switchable live, no restart. One JSON file per language in [`lang/`](lang), so adding one
+  is adding a file and needs no code: see [TRANSLATING.md](TRANSLATING.md). Contributions
+  welcome — including corrections to a language already there.
 
 <img width="1073" height="768" alt="emulateur02" src="https://github.com/user-attachments/assets/051d5d43-dc43-4001-8964-7e8b757b057d" />
 

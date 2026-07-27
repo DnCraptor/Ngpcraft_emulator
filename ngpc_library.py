@@ -193,7 +193,13 @@ def _stat(rom: Path, field: str) -> float:
 # Abbreviations for the two card subtitles below. They are the only words this
 # module prints, and it stays Qt-free (see the header), so the caller hands them
 # over already translated -- `ngpc_settings.time_units(lang)` builds this dict.
-DEFAULT_UNITS: dict[str, str] = {"min": "min", "hour": "h", "day": "d"}
+# 'hm' and 'ago' are the two spots where the units are ASSEMBLED, and assembling is
+# not universal: English is happy with "3 h 04" and with a bare "5 min" for "5 minutes
+# ago", Japanese is not -- it wants the trailing unit ("3 時間 04 分") and an explicit
+# "ago" marker ("5 分前"). No abbreviation can carry that, so the joining is a
+# translatable string too. English's are the identity, so nothing moves for en/fr/pt.
+DEFAULT_UNITS: dict[str, str] = {"min": "min", "hour": "h", "day": "d",
+                                 "hm": "{h} {hour} {m}", "ago": "{t}"}
 
 
 def format_playtime(seconds: float, units: dict[str, str] | None = None) -> str:
@@ -204,24 +210,27 @@ def format_playtime(seconds: float, units: dict[str, str] | None = None) -> str:
         return "—"
     if s < 3600:
         return f"{s // 60} {u['min']}"
-    return f"{s // 3600} {u['hour']} {(s % 3600) // 60:02d}"
+    return u.get("hm", DEFAULT_UNITS["hm"]).format(
+        h=s // 3600, hour=u["hour"], m=f"{(s % 3600) // 60:02d}")
 
 
 def format_last(when: float, units: dict[str, str] | None = None) -> str:
     """Relative 'last played', short enough for a card. Deliberately terse and
     unit-only ("5 min", "3 h", "12 j") so it needs no sentence to translate --
-    just the three abbreviations in `units`."""
+    just the abbreviations in `units`, plus the 'ago' wrapper for the languages
+    that cannot leave it implicit."""
     u = units or DEFAULT_UNITS
     if not when:
         return ""
     delta = time.time() - when
     if delta < 300:
         return "· · ·"                       # minutes ago; no number worth printing
+    ago = u.get("ago", DEFAULT_UNITS["ago"])
     if delta < 3600:
-        return f"{int(delta // 60)} {u['min']}"
+        return ago.format(t=f"{int(delta // 60)} {u['min']}")
     if delta < 86400:
-        return f"{int(delta // 3600)} {u['hour']}"
+        return ago.format(t=f"{int(delta // 3600)} {u['hour']}")
     days = int(delta // 86400)
     if days < 30:
-        return f"{days} {u['day']}"
+        return ago.format(t=f"{days} {u['day']}")
     return time.strftime("%Y-%m-%d", time.localtime(when))

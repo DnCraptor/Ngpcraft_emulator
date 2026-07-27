@@ -217,6 +217,8 @@
   "unit_day": "j",
   "unit_hour": "h",
   "unit_min": "min",
+  "unit_hm": "{h} {hour} {m}",
+  "unit_ago": "{t}",
   "view_compact": "Compact",
   "view_grid": "Grille",
   "view_list": "Liste",

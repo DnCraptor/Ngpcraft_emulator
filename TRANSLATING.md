@@ -59,6 +59,14 @@ prefer a shorter wording over a correct-but-clipped one.
 **Keys ending in `_hint` are paragraphs**, shown under a setting to explain what
 it does. Translate the meaning, not the words; these are the only long ones.
 
+**`unit_hm` and `unit_ago` are shapes, not sentences.** The library card subtitle
+builds a playtime and a "last played" out of `unit_min` / `unit_hour` / `unit_day`,
+and these two say how they are put together: `unit_hm` is "3 h 04", `unit_ago` turns
+"5 min" into "5 minutes ago". English leaves both implicit (`"{h} {hour} {m}"` and a
+bare `"{t}"`) because it can; Japanese cannot, and ships `"{h} {hour} {m} 分"` and
+`"{t}前"`. If your language needs a word for *ago*, or a trailing unit, this is where
+it goes — and if it does not, copy English's and move on.
+
 **Untranslated is fine, wrong is not.** Deleting a key you are unsure about is
 safe: English shows instead. Inventing a key that does not exist in `en.json` is
 not — the real key then stays untranslated forever and nobody notices, so the

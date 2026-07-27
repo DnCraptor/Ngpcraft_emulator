@@ -73,6 +73,15 @@ def check(code: str, strings: dict[str, str], base: dict[str, str]) -> int:
 
 
 def main(argv: list[str]) -> int:
+    # A Windows console still defaults to cp1252, which cannot encode "日本語" -- the
+    # tool would die on the language NAME before checking a single string. Print what
+    # the console can and mark the rest, rather than failing the check over a glyph.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
     base_path = LANG_DIR / f"{SOURCE}.json"
     if not base_path.exists():
         print(f"no {base_path}", file=sys.stderr)

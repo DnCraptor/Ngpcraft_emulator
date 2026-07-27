@@ -226,12 +226,20 @@ APP_ICON = BUNDLE / "assets" / "icone_ngpcraft.ico"
 STATE_DIR = REPO / "savestates"
 WATCH_DIR = REPO / "watches"             # per-ROM named memory watches (debugger)
 STATE_SLOTS = 8
-# Snapshot = the whole working image (I/O + RAM + VRAM, 0x0000..0xBFFF) + the CPU. The
-# internal timing (scanline/timers/z80) re-syncs on the next VBlank, so this restores a
-# live, playable state without a full-struct C serializer. Cart flash saves live in the
-# battery file, not here.
+# Snapshot = the whole working image (I/O + RAM + VRAM, 0x0000..0xBFFF) + the CPU + the
+# machine state that is NOT memory (sound CPU, sound chip, timers -- core.native.AuxState).
+# Cart flash saves live in the battery file, not here.
+#
+# ⛔ v1 SNAPSHOTS HAD NO SOUND BLOCK, AND THE MUSIC DIED ON EVERY LOAD. The comment here
+# used to claim "the internal timing (scanline/timers/z80) re-syncs on the next VBlank".
+# It does not: the sound driver runs on a SECOND CPU whose RAM is in the image but whose
+# PC and pointers were not, so a load dropped a Z80 mid-playback onto a driver state from
+# somewhere else. The main CPU thinks it already asked for that music, so it never asks
+# again -- until the game changes scene and issues a fresh command, which is exactly the
+# "a scene change fixes it" in the bug report. v1 files still load (without the block).
 STATE_MEM_LEN = 0x00C000
-STATE_MAGIC = b"NGPCST01"
+STATE_MAGIC = b"NGPCST02"
+STATE_MAGIC_V1 = b"NGPCST01"
 CRASH_DIR = REPO / "crashes"
 # stop_status codes the core reports; the ones here mean the ROM did something the CPU
 # stopped on (a fault or a not-yet-ported encoding) -- worth a crash report.
@@ -241,6 +249,12 @@ _STATUS_DESC = {
     11: ("SILICON_UNDEFINED", "encoding whose result the hardware leaves undefined"),
     12: ("DIVISION_BY_ZERO", "divide by zero / quotient overflow"),
     13: ("BIOS_SHUTDOWN", "the BIOS powered the console off"),
+    # Only ever reached with ngpc_set_hw_guard armed -- the player never arms it, so
+    # these describe a gated run (the analyzer, a build gate), not ordinary play.
+    14: ("SYSTEM_STACK_VIOLATION",
+         "cartridge XSP entered BIOS-owned RAM at 0x6C01..0x6FFF"),
+    15: ("WATCHDOG_RESET",
+         "armed watchdog starved; the SDK asks for 0x006F ← 0x4E at least every 100 ms"),
     20: ("UNKNOWN_OPCODE", "byte the decoder does not recognise"),
     21: ("TRUNCATED", "instruction ran off the end of memory"),
     22: ("UNMAPPED", "access to an unmapped address"),
@@ -3306,16 +3320,28 @@ class PlayPage(QWidget):
             self._slot_spin.setValue(self._slot + 1)
         self._flash(cfg.tr(cfg.language(self._settings), "slot").format(n=self._slot + 1))
 
-    # A snapshot is the CPU struct + the whole working image (I/O + RAM + VRAM). The
-    # rewind ring and the save-state slots share it; slots just add a magic + go to disk.
+    # A snapshot is the CPU struct + the sound/timer block + the whole working image
+    # (I/O + RAM + VRAM). The rewind ring and the save-state slots share it; slots just
+    # add a magic + go to disk.
     def _capture_state(self) -> bytes:
-        return bytes(self.machine.cpu()) + self.machine.read(0, STATE_MEM_LEN)
+        return (bytes(self.machine.cpu())
+                + bytes(self.machine.aux_state())
+                + self.machine.read(0, STATE_MEM_LEN))
 
-    def _apply_state(self, body: bytes) -> None:
+    def _apply_state(self, body: bytes, aux: bool = True) -> None:
         cpu_len = ctypes.sizeof(type(self.machine.cpu()))
+        aux_len = ctypes.sizeof(native.AuxState) if aux else 0
         cpu = type(self.machine.cpu()).from_buffer_copy(body[:cpu_len])
-        self.machine.write(0, body[cpu_len:cpu_len + STATE_MEM_LEN])
+        mem = body[cpu_len + aux_len:cpu_len + aux_len + STATE_MEM_LEN]
+        self.machine.write(0, mem)
         self.machine.set_cpu(cpu)
+        # ⚠️ AFTER the image, never before. Writing the image goes through the control
+        # registers, and 0x00BA is a door -- "fire one NMI at the sound CPU" -- not a
+        # byte of storage. Restoring the sound CPU's own state here is what cancels that
+        # phantom NMI, on top of putting its registers and the chip's back.
+        if aux:
+            st = native.AuxState.from_buffer_copy(body[cpu_len:cpu_len + aux_len])
+            self.machine.set_aux_state(st)
 
     def save_state(self, slot: int | None = None) -> None:
         if self.machine is None:
@@ -3336,9 +3362,14 @@ class PlayPage(QWidget):
             self._flash(cfg.tr(cfg.language(self._settings), "state_empty").format(n=slot + 1))
             return
         blob = path.read_bytes()
-        if not blob.startswith(STATE_MAGIC):
+        # A v1 file predates the sound block: load it as it was written (the music will
+        # still need a scene change), rather than refuse a state the user already has.
+        if blob.startswith(STATE_MAGIC):
+            self._apply_state(blob[len(STATE_MAGIC):])
+        elif blob.startswith(STATE_MAGIC_V1):
+            self._apply_state(blob[len(STATE_MAGIC_V1):], aux=False)
+        else:
             self._flash("bad state"); return
-        self._apply_state(blob[len(STATE_MAGIC):])
         self._rewind.clear(); self._rw_pos = None      # a loaded state starts a new timeline
         self._blit()
         self._flash(cfg.tr(cfg.language(self._settings), "state_loaded").format(n=slot + 1))

@@ -708,7 +708,9 @@ def tr(lang: str, key: str) -> str:
 
 
 def time_units(lang: str) -> dict[str, str]:
-    """The min/hour/day abbreviations `ngpc_library`'s card subtitles need. That
-    module stays Qt-free, so it cannot reach the table itself."""
-    return {u: tr(lang, f"unit_{u}") for u in ("min", "hour", "day")}
+    """The min/hour/day abbreviations `ngpc_library`'s card subtitles need, plus the
+    two templates that ASSEMBLE them ('hm', 'ago') -- see DEFAULT_UNITS over there for
+    why the joining has to be translatable and not an f-string. That module stays
+    Qt-free, so it cannot reach the table itself."""
+    return {u: tr(lang, f"unit_{u}") for u in ("min", "hour", "day", "hm", "ago")}
 

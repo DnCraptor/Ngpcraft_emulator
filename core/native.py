@@ -38,7 +38,7 @@ from pathlib import Path
 
 from core import bios_fingerprint
 
-ABI_VERSION = 13
+ABI_VERSION = 15
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -71,6 +71,8 @@ STATUS = {
     11: "silicon-undefined",
     12: "division-by-zero",
     13: "bios-shutdown",
+    14: "system-stack-violation",
+    15: "watchdog-reset",
     20: "unknown-opcode",
     21: "truncated",
     22: "unmapped",
@@ -81,6 +83,8 @@ STATUS = {
 
 STATUS_OK = 0
 STATUS_HALTED = 1
+STATUS_SYSTEM_STACK_VIOLATION = 14
+STATUS_WATCHDOG_RESET = 15
 STATUS_BREAKPOINT = 40
 STATUS_COUNT_REACHED = 41
 
@@ -202,6 +206,70 @@ class ApuState(Structure):
     ]
 
 
+AUX_STATE_VERSION = 1
+
+
+class AuxState(Structure):
+    """The machine state a SAVESTATE needs that is not in the memory image.
+
+    The sound CPU's registers, the T6W28's, and the timer up-counters that pace
+    them. A snapshot of "main CPU + memory" alone loses all three, which is why
+    loading a state used to kill the music until the game changed scene and sent
+    its driver a fresh command. Layout mirrors `ngpc_aux_state_t` FIELD FOR FIELD --
+    see the contract in cpp/include/ngpc_core.h.
+    """
+
+    _fields_ = [
+        ("version", c_uint32),
+        ("size", c_uint32),
+        # the sound CPU
+        ("z80_a", c_uint8), ("z80_f", c_uint8), ("z80_b", c_uint8), ("z80_c", c_uint8),
+        ("z80_d", c_uint8), ("z80_e", c_uint8), ("z80_h", c_uint8), ("z80_l", c_uint8),
+        ("z80_a2", c_uint8), ("z80_f2", c_uint8), ("z80_b2", c_uint8), ("z80_c2", c_uint8),
+        ("z80_d2", c_uint8), ("z80_e2", c_uint8), ("z80_h2", c_uint8), ("z80_l2", c_uint8),
+        ("z80_ix", c_uint16), ("z80_iy", c_uint16),
+        ("z80_sp", c_uint16), ("z80_pc", c_uint16),
+        ("z80_i", c_uint8), ("z80_r", c_uint8), ("z80_im", c_uint8), ("z80_iff1", c_uint8),
+        ("z80_iff2", c_uint8), ("z80_halted", c_uint8),
+        ("z80_running", c_uint8), ("z80_nmi_pending", c_uint8),
+        ("z80_int_pending", c_uint8), ("z80_trapped", c_uint8),
+        ("z80_trap_prefix", c_uint8), ("z80_trap_opcode", c_uint8),
+        ("z80_trap_pc", c_uint16),
+        ("z80_int_ack", c_uint8), ("_pad0", c_uint8),
+        ("z80_cycle_credit", c_int32),
+        ("z80_executed", c_uint64),
+        # the T6W28's registers
+        ("square_vol_left", c_int32 * 3),
+        ("square_vol_right", c_int32 * 3),
+        ("square_period", c_int32 * 3),
+        ("square_phase", c_int32 * 3),
+        ("square_counter", c_int32 * 3),
+        ("noise_vol_left", c_int32),
+        ("noise_vol_right", c_int32),
+        ("noise_shifter", c_int32),
+        ("noise_tap", c_int32),
+        ("noise_period_select", c_int32),
+        ("noise_period_extra", c_int32),
+        ("noise_counter", c_int32),
+        ("latch_left", c_uint8), ("latch_right", c_uint8),
+        ("dac_left", c_uint8), ("dac_right", c_uint8),
+        ("apu_main_residue", c_uint32),
+        ("apu_step_fp", c_uint32),
+        ("_pad1", c_uint32),
+        ("apu_chip_residue", c_uint64),
+        # the timers that pace the sound CPU, and the pending-interrupt mask
+        ("timer_count", c_uint32 * 4),
+        ("timer_clock", c_uint32 * 4),
+        ("to3_half_periods", c_uint32),
+        ("ti0_pending_pulses", c_uint32),
+        ("irq_pending", c_uint64),
+        ("scanline", c_uint32),
+        ("frame_count", c_uint32),
+        ("cycle_residue", c_uint32),
+        ("_pad2", c_uint32),
+    ]
+
+
 class SerialState(Structure):
     """A read-only look at the link cable, for the debugger. Mirrors
     `ngpc_serial_state_t`.
@@ -245,6 +313,32 @@ class HygieneRec(Structure):
     Mirrors `ngpc_hygiene_t`."""
 
     _fields_ = [("pc", c_uint32), ("addr", c_uint32)]
+
+
+# The two hardware-safety findings, as bits (`ngpc_set_hw_guard`, `Violation.kind`).
+HW_WATCHDOG = 0x1
+HW_SYSTEM_STACK = 0x2
+HW_KINDS = {HW_WATCHDOG: "watchdog-starved", HW_SYSTEM_STACK: "system-stack"}
+
+
+class Violation(Structure):
+    """One hardware-safety finding. Mirrors `ngpc_violation_t`.
+
+    `detail` is the XSP value for a stack crossing, and the watchdog period for a
+    starved watchdog. Counted, not fatal: see `set_hw_guard` for the gate.
+    """
+
+    _fields_ = [
+        ("pc", c_uint32),
+        ("detail", c_uint32),
+        ("cycle", c_uint64),
+        ("kind", c_uint32),
+        ("_pad", c_uint32),
+    ]
+
+    @property
+    def kind_name(self) -> str:
+        return HW_KINDS.get(self.kind, f"kind-{self.kind}")
 
 
 class EventRec(Structure):
@@ -372,6 +466,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_serial_state.restype = None
     lib.ngpc_get_apu_state.argtypes = [c_void_p, POINTER(ApuState)]
     lib.ngpc_get_apu_state.restype = None
+    lib.ngpc_get_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
+    lib.ngpc_get_aux_state.restype = None
+    lib.ngpc_set_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
+    lib.ngpc_set_aux_state.restype = c_int
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_apu_channel_mask.restype = None
     lib.ngpc_set_layer_mask.argtypes = [c_void_p, c_uint32]
@@ -446,6 +544,12 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_get_uninit_reads.restype = c_uint32
     lib.ngpc_get_lost_writes.argtypes = [c_void_p, POINTER(HygieneRec), c_uint32]
     lib.ngpc_get_lost_writes.restype = c_uint32
+    lib.ngpc_set_hw_guard.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_hw_guard.restype = None
+    lib.ngpc_hw_violations.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_hw_violations.restype = c_uint64
+    lib.ngpc_get_hw_violations.argtypes = [c_void_p, POINTER(Violation), c_uint32]
+    lib.ngpc_get_hw_violations.restype = c_uint32
     lib.ngpc_set_event_log.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_event_log.restype = None
     lib.ngpc_event_log_count.argtypes = [c_void_p]
@@ -754,6 +858,29 @@ class NativeMachine:
         got = self._lib.ngpc_get_lost_writes(self._h, buf, limit)
         return list(buf[:got])
 
+    HW_SAMPLES = 64
+
+    def set_hw_guard(self, stop_mask: int) -> None:
+        """Which hardware-safety findings should STOP a run: `HW_WATCHDOG`,
+        `HW_SYSTEM_STACK`, or both OR-ed together.
+
+        Zero -- the default -- is the diagnostic mode: findings are counted and
+        sampled while the ROM keeps running, because neither halts a real console
+        at the instruction that commits it. Arm this only for a gate that wants a
+        verdict ("this build must be clean"), and read `stop_status`.
+        """
+        self._lib.ngpc_set_hw_guard(self._h, stop_mask)
+
+    def hw_violations(self, kind: int = HW_WATCHDOG | HW_SYSTEM_STACK) -> int:
+        """How many findings of the given kind(s) since the last reset."""
+        return int(self._lib.ngpc_hw_violations(self._h, kind))
+
+    def hw_violation_samples(self, limit: int = HW_SAMPLES) -> list[Violation]:
+        """The earliest findings, oldest first, so a report can name the code."""
+        buf = (Violation * limit)()
+        got = self._lib.ngpc_get_hw_violations(self._h, buf, limit)
+        return list(buf[:got])
+
     EVENT_LOG_SIZE = 4096
     # The K2GE video registers: scroll, palette, window, raster control. The default
     # window for the event viewer, because this is where every raster trick lands.
@@ -961,6 +1088,25 @@ class NativeMachine:
 
     def set_cpu(self, st: CpuState) -> None:
         self._lib.ngpc_set_cpu(self._h, ctypes.byref(st))
+
+    def aux_state(self) -> AuxState:
+        """The rest of the machine: sound CPU, sound chip, timers, pending IRQs.
+
+        Everything a savestate needs that `read()` cannot see, because it is chip
+        state rather than memory. See AuxState.
+        """
+        st = AuxState()
+        self._lib.ngpc_get_aux_state(self._h, ctypes.byref(st))
+        return st
+
+    def set_aux_state(self, st: AuxState) -> bool:
+        """Put it back. False if the blob is from another build (never half-applied).
+
+        ⚠️ Apply this AFTER restoring the memory image, never before: writing the
+        image goes through the control registers, and 0x00BA is a door ("fire one
+        NMI at the sound CPU"), not storage. This call is what cancels that phantom.
+        """
+        return self._lib.ngpc_set_aux_state(self._h, ctypes.byref(st)) == 0
 
     def read(self, address: int, count: int) -> bytes:
         out = (c_uint8 * count)()

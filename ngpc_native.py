@@ -21,9 +21,12 @@ from pathlib import Path
 
 from core import native
 
-# The player's save state (ngpc_shell.py, F2): magic, the CpuState struct, then the
-# working image from 0x0000. Same contract as core.savestate.load_shell_savestate.
-SHELL_MAGIC = b"NGPCST01"
+# The player's save state (ngpc_shell.py, F2): magic, the CpuState struct, the
+# sound/timer block (v2 only), then the working image from 0x0000. Same contract as
+# core.savestate.load_shell_savestate.
+SHELL_MAGIC = b"NGPCST02"       # v2: carries the sound CPU, the T6W28 and the timers
+SHELL_MAGIC_V1 = b"NGPCST01"    # v1: CPU + memory only -- loads, but the sound will not
+SHELL_MAGICS = (SHELL_MAGIC, SHELL_MAGIC_V1)
 SHELL_MEM_LEN = 0x00C000
 
 # The controller, as the hardware reports it at 0x00B0.
@@ -50,17 +53,25 @@ def parse_buttons(spec: str | None) -> int:
 def load_state(machine: native.NativeMachine, path: Path) -> None:
     """Restore a player save state into a running machine."""
     blob = path.read_bytes()
-    if not blob.startswith(SHELL_MAGIC):
+    magic = blob[:len(SHELL_MAGIC)]
+    if magic not in SHELL_MAGICS:
         raise SystemExit(f"{path} is not a {SHELL_MAGIC.decode()} save state")
-    body = blob[len(SHELL_MAGIC):]
+    body = blob[len(magic):]
     cpu_t = type(machine.cpu())
     cpu_len = ctypes.sizeof(cpu_t)
-    if len(body) != cpu_len + SHELL_MEM_LEN:
+    aux_len = ctypes.sizeof(native.AuxState) if magic == SHELL_MAGIC else 0
+    if len(body) != cpu_len + aux_len + SHELL_MEM_LEN:
         raise SystemExit(
-            f"{path}: expected {cpu_len + SHELL_MEM_LEN} bytes after the magic, got {len(body)}"
+            f"{path}: expected {cpu_len + aux_len + SHELL_MEM_LEN} bytes after the "
+            f"magic, got {len(body)}"
         )
-    machine.write(0, body[cpu_len:])
+    machine.write(0, body[cpu_len + aux_len:])
     machine.set_cpu(cpu_t.from_buffer_copy(body[:cpu_len]))
+    # AFTER the image: writing it goes through the control registers, and 0x00BA is a
+    # door ("fire one NMI at the sound CPU"), not storage. This is what cancels that.
+    if aux_len:
+        machine.set_aux_state(
+            native.AuxState.from_buffer_copy(body[cpu_len:cpu_len + aux_len]))
 
 
 def write_png(machine: native.NativeMachine, path: Path) -> None:

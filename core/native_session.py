@@ -697,6 +697,15 @@ class NativeSession:
     _THEME_ADDR, _THEME_LEN = 0x006DD8, 0x80
 
     def _apply_bios_colour_theme(self) -> None:
+        # ⚡ NOT ON THE MONO NGP. The theme is a K2GE feature -- that silicon has no
+        # 12-bit palette to theme -- and 0x8380 is where `reset_memory` stamps the
+        # panel's grey ramp for a mono console instead. Writing an NGPC theme over it
+        # put the mono picture back into two tones, and only ONCE THE COIN CELL HAD
+        # BEEN CONFIGURED: a fresh install looked right, and every launch after the
+        # player had been through Boot BIOS once did not. Same rule as the machine-type
+        # bytes above: the console answers for itself.
+        if self.k1ge_console:
+            return
         try:
             cell = self.ram_path.read_bytes()
         except OSError:

@@ -435,6 +435,46 @@ constexpr uint32_t kInt0PowerButton      = 8;
  * (pass 247) -- so it is a second CHIP, with its own block map and its own identity. */
 constexpr uint32_t kCartChipSize         = 0x200000;
 
+/* --- HARDWARE SAFETY: WHAT THE CONSOLE MINDS AND THE CODE CANNOT SEE --------
+ *
+ * SysPro.txt gives user software 0x4000..0x6BFF. The 0x6C00..0x6FFF page is
+ * system-managed. XSP may EQUAL 0x6C00 because the stack descends before it
+ * writes; a cart that leaves it above that boundary puts a later push or call
+ * into system RAM, and that is what makes the BIOS restart or power off.
+ *
+ * The same manual requires the watchdog control at I/O 0x006F to receive the
+ * clear code 0x4E periodically -- ngpcspec.txt says at least every 100 ms.
+ *
+ * ⚡ REPORTED, NOT ENFORCED. Neither of these STOPS a real console at the
+ * instruction that commits them: the stack overwrite corrupts, and the watchdog
+ * raises INTWD (WDMOD bit1 picks reset or interrupt). An emulator that halts
+ * there is stricter than the silicon, and being stricter than the silicon is
+ * how you end up debugging the emulator instead of the ROM. So the core COUNTS
+ * them, keeps the first samples with their PC, and runs on -- the hygiene
+ * counters' contract, applied to hardware safety. A caller that wants a gate
+ * ("this build must be clean") arms ngpc_set_hw_guard and gets the batch
+ * stopped with the matching status instead.
+ *
+ * ⚠️ THE TIMEOUT IS AN ASSUMPTION, NOT A MEASUREMENT. The 100 ms of the SDK is
+ * the refresh rate asked of the PROGRAM, not the counter's period, and the
+ * WDMOD prescaler bits (WDTP, bits 6-5) are not modelled: the retail BIOS ends
+ * its boot with WDMOD=0xF0, so the console hands over with the watchdog ARMED
+ * on its longest setting. One CPU second at the measured 6.144 MHz is what ares
+ * uses and what we use, pending a hardware measurement. Being wrong here
+ * changes WHEN the counter reports, never whether the ROM runs. */
+constexpr uint32_t kUserStackTop          = 0x006C00;
+constexpr uint32_t kSystemRamEnd          = 0x006FFF;
+constexpr uint32_t kWatchdogModeIo        = 0x00006E;
+constexpr uint32_t kWatchdogIo            = 0x00006F;
+constexpr uint8_t  kWatchdogClearCode     = 0x4E;
+constexpr uint8_t  kWatchdogDisableCode   = 0xB1;
+constexpr uint32_t kWatchdogTimeoutCycles = 6144000;
+
+inline bool cart_pc(uint32_t pc) {
+    return (pc >= 0x200000 && pc <= 0x3FFFFF)
+        || (pc >= 0x800000 && pc <= 0x9FFFFF);
+}
+
 /* --- CHARACTER RAM AT HAND-OFF: THE BIOS'S BOOT SCREEN IS STILL IN IT --------
  *
  * The hand-off's job is to leave the cart the state a real boot would have left, and
@@ -609,6 +649,63 @@ struct Machine {
      * divide by zero). Those set `pending_status`; step() sees it, leaves PC where
      * it was, and reports the honest reason. */
     uint8_t pending_status = NGPC_OK;
+
+    /* --- THE WATCHDOG, WITH TIME ACTUALLY PASSING FOR IT ---------------------
+     *
+     * The core used to keep the last byte written at 0x006F and nothing else, so
+     * the counter never advanced: a ROM that resets a real console by starving
+     * the watchdog ran here forever, and the emulator agreed with it.
+     *
+     * On expiry the counter RE-ARMS and the run continues (ares does the same),
+     * because that is the shape of the hardware: the event fires, software gets
+     * to be wrong about it repeatedly, and a ROM that never refreshes reports
+     * once per period rather than once per session. */
+    uint32_t watchdog_cycles = 0;
+    bool     watchdog_enabled = true;
+    void watchdog_reset(bool enabled) {
+        watchdog_enabled = enabled;
+        watchdog_cycles = 0;
+    }
+    void watchdog_clear() { watchdog_cycles = 0; }
+    /* True on the tick that crosses the timeout. */
+    bool watchdog_tick(uint32_t cycles) {
+        if (!watchdog_enabled) return false;
+        watchdog_cycles += cycles;
+        if (watchdog_cycles < kWatchdogTimeoutCycles) return false;
+        watchdog_cycles -= kWatchdogTimeoutCycles;
+        return true;
+    }
+
+    /* --- THE TWO HARDWARE-SAFETY FINDINGS ------------------------------------
+     *
+     * Same contract as the hygiene counters below: a count, plus the first few
+     * samples so a report can name the code that did it. `hw_guard_stop` is the
+     * opt-in gate -- a bitmask of NGPC_HW_* kinds that END the batch with the
+     * matching status instead of merely being counted.
+     *
+     * The stack finding is EDGE-triggered: a cart that parks XSP in the system
+     * page would otherwise report once per instruction and drown the log. What
+     * matters is the crossing, and its PC is the code that moved the stack. */
+    struct ViolationRec { uint32_t pc; uint32_t detail; uint64_t cycle; uint32_t kind; uint32_t _pad; };
+    static constexpr uint32_t kHwSize = 64;
+
+    uint32_t hw_guard_stop = 0;
+    uint64_t hw_watchdog_count = 0;
+    uint64_t hw_stack_count = 0;
+    uint32_t hw_n = 0;
+    ViolationRec hw[kHwSize] = {};
+    bool stack_in_system = false;
+
+    inline void hw_reset() {
+        hw_watchdog_count = hw_stack_count = 0;
+        hw_n = 0;
+        stack_in_system = false;
+    }
+
+    inline void note_violation(uint32_t kind, uint32_t pc, uint32_t detail) {
+        if (kind == NGPC_HW_WATCHDOG) ++hw_watchdog_count; else ++hw_stack_count;
+        if (hw_n < kHwSize) hw[hw_n++] = {pc, detail, total_cycles, kind, 0};
+    }
 
     /* A/D converter state. Owned by the machine so a conversion survives across
      * run() batches, and ticked with the cycles each instruction consumed. */

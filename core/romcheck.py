@@ -161,6 +161,51 @@ def _sym(symbols, pc: int) -> str:
     return f"PC {pc:06X}"
 
 
+def _hardware_safety(machine, report: "Report", symbols) -> None:
+    """The two findings the CORE counts while the ROM runs: a cartridge stack that
+    crossed into the BIOS's page, and a watchdog left to starve.
+
+    Neither shows up as a crash here, and that is the point -- on a real console
+    neither faults where it happens. The stack quietly overwrites the BIOS's own
+    variables and the machine misbehaves later, somewhere else; the starved watchdog
+    resets the console outright. Both run perfectly on every emulator that does not
+    model them, which is exactly how a build ships broken.
+    """
+    stack = machine.hw_violations(native.HW_SYSTEM_STACK)
+    watchdog = machine.hw_violations(native.HW_WATCHDOG)
+    if not stack and not watchdog:
+        return
+    samples = machine.hw_violation_samples()
+
+    if stack:
+        first = next(s for s in samples if s.kind == native.HW_SYSTEM_STACK)
+        report.add(ERROR, "The stack was moved into the BIOS's own RAM",
+                   f"{_sym(symbols, first.pc)} left XSP at {first.detail:04X}. "
+                   "User RAM ends at 6BFF: a descending stack starts at 6C00, and "
+                   "6C00-6FFF belongs to the BIOS. Every push and every call from "
+                   "there overwrites the console's own variables — nothing faults, "
+                   "the console restarts or powers off later. "
+                   + (f"Crossed {stack} times during the run. "
+                      if stack > 1 else "")
+                   + "Fix it in the startup code: XSP = 0x6C00.",
+                   where=f"{first.pc:06X}")
+
+    if watchdog:
+        first = next(s for s in samples if s.kind == native.HW_WATCHDOG)
+        report.add(ERROR, "The watchdog was left to starve",
+                   f"{watchdog} full period(s) went by without the clear code 0x4E "
+                   f"reaching I/O 006F (first at cycle {first.cycle}, "
+                   f"{_sym(symbols, first.pc)}). The BIOS hands the console over with "
+                   "the watchdog ARMED, so refreshing it is the cartridge's job: a "
+                   "real console resets itself here. Write 0x4E to 006F once per "
+                   "frame, or switch the watchdog off the way the Toshiba startup "
+                   "does (WDMOD = 0, then WDCR = 0xB1). "
+                   "The period modelled is one CPU second — the emulator's estimate, "
+                   "not a measurement, so treat the COUNT as the finding, not its "
+                   "exact timing.",
+                   where=f"{first.pc:06X}")
+
+
 def _first_writes(machine, addrs: set[int], frames: int = 90) -> dict[int, tuple[int, int]]:
     """Re-run from a fresh power-on and record, for each address, the frame and PC of
     the FIRST write to it.
@@ -422,6 +467,9 @@ def analyse_dynamic(rom: Path, report: Report, bios: Path | None = None,
             report.add(ERROR, "The CPU is barely executing",
                        f"{total_instr} instructions over {ran_frames} frames. A running "
                        "game is tens of thousands per frame; this is a hang.")
+
+        # -- the two things the CONSOLE minds and the running code cannot see
+        _hardware_safety(machine, report, symbols)
 
         # -- reading RAM it never wrote
         uninit = machine.uninit_reads()
