@@ -175,3 +175,120 @@ def test_lobby_relays_serial_between_two_consoles(app):
     finally:
         link_a.disconnect()
         link_b.disconnect()
+
+
+# --- latency: what makes an online game run at full speed ---------------------
+# A link game sends a byte and BLOCKS until the answer comes back, so the emulated
+# game advances at one exchange per round trip. Latency we add ourselves is taken
+# straight off the game's speed -- and only the game's: the sound driver runs free,
+# which is why a slowed-down link game still sounds perfectly normal (issue #14.1).
+# These two tests pin the mechanisms, not a stopwatch, so they cannot go flaky.
+
+def test_queuing_a_frame_wakes_the_socket_thread():
+    """A byte handed over while the thread sits in select() must not wait for the
+    timeout. On Windows that timeout is quantised to the ~15.6 ms scheduler tick, so
+    a 20 ms select is really ~31 ms -- measured, on loopback, with no network at all.
+    """
+    import select as _select
+
+    c = LobbyClient("127.0.0.1", 1, "nobody")     # never started: no thread to race
+    assert not _select.select([c._wake_r], [], [], 0)[0], "nothing queued yet"
+
+    c.send_serial(b"\x42")
+    assert _select.select([c._wake_r], [], [], 0)[0], (
+        "send_serial must nudge the socket thread out of select()")
+
+    c._wake_r.recv(64)
+    c._send_control({"op": "list"})               # control frames travel the same way
+    assert _select.select([c._wake_r], [], [], 0)[0]
+    c.close()
+
+
+def test_a_full_kernel_buffer_neither_drops_bytes_nor_kills_the_link(app):
+    """`sendall()` on a NON-blocking socket raises BlockingIOError as soon as the
+    kernel buffer is full -- and BlockingIOError is an OSError, so the loop read a
+    momentary hiccup as "the link dropped" AND lost the frame it had already taken
+    off the queue. send() reports what it took and the rest waits for the next pass.
+    """
+    class Trickle:
+        """A socket that accepts one byte at a time, refusing every other call."""
+
+        def __init__(self, sock):
+            self._s = sock
+            self._refuse = True
+
+        def send(self, data):
+            self._refuse = not self._refuse
+            if self._refuse:
+                raise BlockingIOError(10035, "would block")
+            return self._s.send(data[:1])
+
+        def sendall(self, data):
+            """What the stdlib does on a non-blocking socket: loop over send() and
+            let the BlockingIOError out. Spelled out here so this test exercises the
+            OLD code path too -- delegating it to the real socket would have let the
+            bug through untouched."""
+            while data:
+                data = data[self.send(data):]
+
+        def __getattr__(self, name):
+            return getattr(self._s, name)
+
+    port = _start_server()
+    box = {"room": None, "host_joined": None, "guest_joined": None, "lost": None}
+
+    host = LobbyClient("127.0.0.1", port, "P1")
+    host.created.connect(lambda r: box.__setitem__("room", r))
+    host.joined.connect(lambda o: box.__setitem__("host_joined", o))
+    host.disconnected.connect(lambda why: box.__setitem__("lost", why))
+    host.start()
+    assert _wait(app, lambda: host._sock is not None)
+    host.create("room", "probe", public=True)
+    assert _wait(app, lambda: box["room"])
+
+    guest = LobbyClient("127.0.0.1", port, "P2")
+    guest.joined.connect(lambda o: box.__setitem__("guest_joined", o))
+    guest.start()
+    assert _wait(app, lambda: guest._sock is not None)
+    guest.join(box["room"])
+    assert _wait(app, lambda: box["host_joined"] and box["guest_joined"])
+
+    host._sock = Trickle(host._sock)              # from here on, sending is painful
+    payload = bytes(range(32))
+    host.send_serial(payload)
+
+    assert _wait(app, lambda: len(guest._rx_serial) >= len(payload), timeout=10), (
+        f"only {len(guest._rx_serial)}/{len(payload)} bytes crossed")
+    assert guest.read_serial() == payload, "bytes must arrive whole and in order"
+    assert box["lost"] is None, "a full send buffer is not a lost connection"
+
+    host.close(); guest.close()
+
+
+def test_the_relay_hop_has_nagle_off():
+    """Both clients set TCP_NODELAY, but a relayed byte crosses TWO connections and
+    the second one is the server's. Left on the default, Nagle holds each small write
+    until the previous is acknowledged and the peer's delayed ACK sits on that for
+    ~40 ms -- on traffic that is nothing but small writes."""
+    import socket as _socket
+
+    a, b = _socket.socketpair()
+
+    class Reader:
+        async def readexactly(self, n):           # the client hangs up at once
+            raise asyncio.IncompleteReadError(b"", n)
+
+    class Writer:
+        def get_extra_info(self, key):
+            return a if key == "socket" else ("127.0.0.1", 0)
+
+        def close(self):
+            pass
+
+    try:
+        assert a.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY) == 0
+        asyncio.run(lobby_server.client_task(lobby_server.Lobby(), Reader(), Writer()))
+        assert a.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY) != 0, (
+            "the server must disable Nagle on every accepted connection")
+    finally:
+        a.close(); b.close()

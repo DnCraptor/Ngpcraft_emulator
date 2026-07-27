@@ -548,6 +548,20 @@ player toolbar's **🔗** button:
 
 Both players must run a **compatible game** (same title), exactly like real hardware.
 
+### How fast an online game runs
+
+A link game sends a byte and **waits for the answer before it goes on**, so it advances one
+exchange per round trip: the delay on the wire is not a detail of the connection, it *is* the
+speed of the game. The tell is that the sound stays perfectly normal while the action crawls —
+the emulator is not slow, the game is waiting.
+
+So the transport adds as little as it can: the network thread is woken the moment a byte is
+handed to it rather than on a timer, and the relay server sends small packets immediately
+instead of grouping them. Measured on a local connection, a relayed byte crosses in **0.1 ms**
+where it used to take **31 ms**. What is left is your real ping, plus one frame at each end
+(the cable is pumped once per frame). On a LAN it is indistinguishable from a cable; across a
+continent it runs at the pace your ping allows.
+
 If a game refuses to see the other console, the debugger's [**Link** tab](#link--watch-the-cable-poke-it-break-it)
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the
 serial path with **one** console, so you can test without a partner.

@@ -53,6 +53,21 @@ class LobbyClient(QObject):
         self._rx_serial: deque[int] = deque()      # received serial bytes
         self._running = False
         self._thread: threading.Thread | None = None
+        # ⚡ THE WAKE-UP PIPE -- this is what keeps an online game at full speed.
+        # The socket thread waits in select(); without a second thing to wait ON, a
+        # byte queued from the Qt thread just after it went to sleep sat there for a
+        # whole select timeout. That is not a rounding error: Windows quantises a
+        # select timeout to the ~15.6 ms scheduler tick, so a 20 ms wait becomes ~31 ms,
+        # each way, on top of the real network. Measured on loopback (no network at
+        # all), one relayed byte took a median of 31 ms to cross -- 62 ms per exchange
+        # that the wire never charged us for. A link game exchanges a byte per frame
+        # and BLOCKS on the answer, so the game (and only the game -- the sound driver
+        # runs free, which is why the audio still sounds right) runs at a fraction of
+        # its speed. send_serial() now writes one byte here, select() returns at once,
+        # and the frame leaves in microseconds.
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_w.setblocking(False)            # never stall the Qt thread
+        self._wake_r.setblocking(False)
 
     # ---- lifecycle ---------------------------------------------------------
     def start(self) -> None:
@@ -61,15 +76,24 @@ class LobbyClient(QObject):
 
     def close(self) -> None:
         self._running = False
+        self._wake()                       # so the thread leaves select() now
         try:
             if self._sock is not None:
                 self._sock.close()
         except OSError:
             pass
 
+    def _wake(self) -> None:
+        """Nudge the socket thread out of select(). Called from the Qt thread."""
+        try:
+            self._wake_w.send(b"\x01")
+        except OSError:
+            pass                           # full (thread is behind) or closed: harmless
+
     # ---- control API (called from the Qt thread) ---------------------------
     def _send_control(self, obj: dict) -> None:
         self._out.put(_frame(FRAME_CONTROL, json.dumps(obj).encode("utf-8")))
+        self._wake()
 
     def create(self, name: str, game: str, public: bool, password: str = "") -> None:
         self._send_control({"op": "create", "pseudo": self._pseudo, "name": name,
@@ -89,6 +113,7 @@ class LobbyClient(QObject):
     def send_serial(self, data: bytes) -> None:
         if data:
             self._out.put(_frame(FRAME_RELAY, data))
+            self._wake()
 
     def read_serial(self) -> bytes:
         n = len(self._rx_serial)
@@ -110,22 +135,43 @@ class LobbyClient(QObject):
         self.connected.emit()
 
         buf = bytearray()
+        pending = bytearray()          # queued frames not yet accepted by the kernel
         reason = "closed"
         while self._running:
             # 1) send anything queued
             try:
                 while True:
-                    self._sock.sendall(self._out.get_nowait())
+                    pending += self._out.get_nowait()
             except queue.Empty:
                 pass
-            except OSError as e:
-                reason = str(e); break
-            # 2) read whatever is available
+            if pending:
+                try:
+                    # NOT sendall(): this socket is non-blocking, where sendall's
+                    # behaviour is undefined -- it raises BlockingIOError the moment
+                    # the kernel buffer is full, and BlockingIOError IS an OSError, so
+                    # a momentarily-full buffer used to be read as "the link dropped"
+                    # AND ate the bytes it had already taken off the queue. send()
+                    # reports what it took; the rest waits here for the next pass.
+                    sent = self._sock.send(pending)
+                    del pending[:sent]
+                except (BlockingIOError, InterruptedError):
+                    pass
+                except OSError as e:
+                    reason = str(e); break
+            # 2) wait for: something to read, room to write (only while we owe bytes),
+            # or the Qt thread waking us because it just queued a frame.
             try:
-                r, _, _ = select.select([self._sock], [], [], 0.02)
+                r, _, _ = select.select(
+                    [self._sock, self._wake_r], [self._sock] if pending else [],
+                    [], 0.02)
             except OSError:
                 break
-            if r:
+            if self._wake_r in r:
+                try:
+                    self._wake_r.recv(4096)        # drain the nudges; the queue is
+                except OSError:                    # what actually carries the data
+                    pass
+            if self._sock in r:
                 try:
                     chunk = self._sock.recv(8192)
                 except (BlockingIOError, InterruptedError):
@@ -137,6 +183,11 @@ class LobbyClient(QObject):
                 buf.extend(chunk)
                 self._drain_frames(buf)
         self._running = False
+        for s in (self._wake_r, self._wake_w):
+            try:
+                s.close()
+            except OSError:
+                pass
         self.disconnected.emit(reason)
 
     def _drain_frames(self, buf: bytearray) -> None:

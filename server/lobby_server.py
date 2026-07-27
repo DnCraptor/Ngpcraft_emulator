@@ -26,6 +26,7 @@ import argparse
 import asyncio
 import json
 import secrets
+import socket
 
 FRAME_CONTROL = 1
 FRAME_RELAY = 2
@@ -149,6 +150,20 @@ async def read_frame(reader):
 async def client_task(lobby: Lobby, reader, writer):
     s = Session(reader, writer)
     peer_addr = writer.get_extra_info("peername")
+    # ⚡ TURN NAGLE OFF ON THE RELAY HOP. Both clients set TCP_NODELAY on their end,
+    # but a relayed byte crosses TWO connections and the second one is this socket,
+    # which asyncio leaves on the default. Nagle holds a small write until the
+    # previous one is acknowledged, and the peer's delayed ACK holds that ACK back
+    # ~40 ms: exactly the pathological pair, on traffic that is nothing BUT small
+    # writes (one serial byte in a 6-byte frame). Latency here is not a comfort
+    # setting -- a link game blocks on the answer, so every millisecond added to the
+    # round trip is taken off the game's speed.
+    sock = writer.get_extra_info("socket")
+    if sock is not None:
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
     try:
         while True:
             ftype, payload = await read_frame(reader)
