@@ -272,7 +272,16 @@ def test_the_relay_hop_has_nagle_off():
     ~40 ms -- on traffic that is nothing but small writes."""
     import socket as _socket
 
-    a, b = _socket.socketpair()
+    # A REAL TCP pair, not socketpair(): on Linux and macOS that gives an AF_UNIX pair,
+    # where TCP_NODELAY does not exist and getsockopt raises "operation not supported".
+    # (On Windows it is emulated over AF_INET, which is why this passed there and only
+    # there.) The option under test is a TCP option, so the test needs a TCP socket.
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    b = _socket.create_connection(srv.getsockname())
+    a, _ = srv.accept()
+    srv.close()
 
     class Reader:
         async def readexactly(self, n):           # the client hangs up at once
