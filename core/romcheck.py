@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from core import native
+from core import native, rom_loader
 from core.rom import parse_rom_header_bytes
 
 # What the BIOS looks for at the top of the cartridge. A cart whose header does not
@@ -328,17 +328,20 @@ def analyse_static(data: bytes, path: Path, report: Report) -> None:
 
 
 # ----------------------------------------------------------------- dynamic
-def analyse_dynamic(rom: Path, report: Report, bios: Path | None = None,
+def analyse_dynamic(data: bytes, report: Report, bios: Path | None = None,
                     frames: int = 600, play: bool = True,
                     symbols=None) -> None:
     """Boot the ROM with the hygiene counters armed and watch what it does.
+
+    Takes the ROM IMAGE, not a path: the caller has already unpacked it (see
+    `analyse`), and re-reading the path here would boot the .zip container.
 
     `play=True` drives the joypad from ROBOT_SCRIPT so the analysis gets past the
     title screen into real code; coverage is reported either way so the difference
     is visible.
     """
     try:
-        machine = native.NativeMachine(rom.read_bytes(),
+        machine = native.NativeMachine(data,
                                        bios=bios.read_bytes() if bios else None)
     except Exception as exc:
         report.add(ERROR, "The core could not load this image", f"{type(exc).__name__}: {exc}")
@@ -591,11 +594,29 @@ def analyse(rom: str | Path, bios: str | Path | None = None,
     """
     path = Path(rom)
     report = Report(path=path)
+    # ⚡ AN ARCHIVE IS NOT A CARTRIDGE. Collections ship ROMs zipped, the library
+    # lists .zip/.7z, and every other consumer already reads through this one choke
+    # point (core/rom_loader) -- the analyser was the last place still calling
+    # `read_bytes()` on whatever the user picked. On a .zip that analysed the
+    # CONTAINER: the size was the compressed size, and the "header" was read out of
+    # the zip's local file header, so the title came back as a slice of the stored
+    # FILENAME ("ls' Fighters"), the game id as two bytes of "SNK", and the entry
+    # point as 4E530000 -- a 32-bit value the console's 24-bit vector cannot even
+    # hold. Every fact was wrong and none of them looked obviously wrong.
     try:
-        data = path.read_bytes()
+        loaded = rom_loader.load(path)
+    except rom_loader.RomArchiveError as exc:
+        report.add(ERROR, "Could not open this archive", str(exc))
+        return report
     except OSError as exc:
         report.add(ERROR, "Could not read the file", str(exc))
         return report
+    data = loaded.data
+    if loaded.from_archive:
+        # Name both, or the report claims to describe a file whose bytes it never
+        # looked at -- and the on-disk size is the one number the reader can check.
+        report.facts["archive"] = f"{path.name} ({path.stat().st_size} bytes on disk)"
+        report.facts["ROM inside"] = loaded.name
 
     analyse_static(data, path, report)
     if run:
@@ -605,5 +626,5 @@ def analyse(rom: str | Path, bios: str | Path | None = None,
         if symbols is None:
             symbols = _load_symbols_for(path)
         report.facts["symbols"] = f"{len(symbols)} loaded" if symbols else "none"
-        analyse_dynamic(path, report, bios_path, frames, play=play, symbols=symbols)
+        analyse_dynamic(data, report, bios_path, frames, play=play, symbols=symbols)
     return report

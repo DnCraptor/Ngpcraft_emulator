@@ -2331,6 +2331,8 @@ class PlayPage(QWidget):
     net_host_requested = pyqtSignal()     # 🔗 : host a direct network game
     net_join_requested = pyqtSignal()     # 🔗 : join a direct network game
     net_lobby_requested = pyqtSignal()    # 🔗 : open the online lobby (server)
+    net_link_lost = pyqtSignal(str)       # the online peer went away, with the reason
+    link_frame_requested = pyqtSignal()   # 🔗 : both consoles inside one window
 
     def __init__(self, settings, library: lib.Library) -> None:
         super().__init__()
@@ -2615,6 +2617,21 @@ class PlayPage(QWidget):
         # would be credited as playtime to whatever was played before it.
         self._rom_path = None
         self._raw = native.NativeMachine(_NO_CART, bios=bios.read_bytes())
+        # ⚡ WHICH CONSOLE THIS IS -- the one thing this path forgot to say.
+        #
+        # Booting a cartridge goes through NativeSession, which is handed
+        # `k1ge_console=self._mono_console()`. This path builds its machine by hand and
+        # never did, so a monochrome NGP dump was booted on K2GE silicon. The BIOS runs
+        # perfectly there (measured: same PC, same 900 frames) -- it simply never writes
+        # the colour palettes it has no reason to know about, so every pixel resolves
+        # through empty palette RAM and the whole screen is BLACK. That is the reported
+        # "select a monochrome bios and then boot bios -> black screen": not a boot
+        # failure at all, a console-type one. With the flag set the same dump comes up
+        # in its seven greys, on its own SELECT ONE / POCKET MENU screens.
+        #
+        # `_mono_console` is the same answer the cartridge path uses, and it is the BIOS
+        # IMAGE that decides -- you cannot run one console's BIOS on the other's silicon.
+        self._raw.set_k1ge_console(self._mono_console())
         if _SYSTEM_RAM.exists():
             self._raw.set_battery_ram(_SYSTEM_RAM.read_bytes())
         # The console's clock, kept alive by the same coin cell as those settings. This is
@@ -3784,6 +3801,7 @@ class PlayPage(QWidget):
         t = lambda k: cfg.tr(cfg.language(self._settings), k)
         m = QMenu(self)
         m.addAction(t("link_2p_local"), self.link_requested.emit)
+        m.addAction(t("link_2p_framed"), self.link_frame_requested.emit)
         m.addSeparator()
         m.addAction(t("link_online_lobby"), self.net_lobby_requested.emit)
         m.addSeparator()
@@ -3853,6 +3871,14 @@ class PlayPage(QWidget):
         if self._net_link is not None:           # online: relay over the socket
             self._net_link.pump()                # (the net link carries the monitor)
             self._link_tx_total = self._net_link.bytes_out
+            # A peer can vanish mid-game -- someone quits, a laptop sleeps, a NAT
+            # forgets the mapping. The link records that instead of raising it (see
+            # core.link.TcpLink.lost, and what raising it here used to do to the
+            # process), so this is where the game stops being told to talk to a
+            # console that is no longer there.
+            lost = getattr(self._net_link, "lost", None)
+            if lost:
+                self.net_link_lost.emit(str(lost))
             return
         peer = self._link_peer
         if peer is None or peer.machine is None or self.machine is None:
@@ -4183,21 +4209,134 @@ class _LinkInput(QObject):
         return False
 
 
+LINK_WINDOW_GAP = 8          # px between the two consoles, so the edge is visible
+LINK_WINDOW_CASCADE = 32     # offset when the screen cannot hold both side by side
+
+
+def side_by_side(primary, available, *, gap=LINK_WINDOW_GAP, min_w=0, min_h=0):
+    """Where two equal consoles go. Takes/returns (x, y, w, h) tuples.
+
+    ⛔ WHAT THIS REPLACES. Player 2's window opened at a hard-coded 3x (480x496) at
+    whatever position the window manager felt like -- which is on top of player 1.
+    Bigger main window, smaller second one, sitting over it: "elle est souvent ouverte
+    par defaut par dessus la premiere et plus petite".
+
+    ⚖️ THE TWO RULES ARE NOT EQUAL, and the order is the whole design:
+      1. THE CONSOLES ARE ALWAYS THE SAME SIZE. They are the same machine, and a
+         two-player game where one player has the bigger screen is not a fair one.
+      2. Neither hides the other -- side by side, WHEN THE SCREEN ALLOWS ("quand c'est
+         possible"). When it cannot, they cascade: still equal, deliberately offset so
+         the one underneath can be grabbed. Breaking rule 1 to satisfy rule 2 would
+         re-create the exact complaint.
+
+    `min_w`/`min_h` are the floor the WINDOWS impose, and they are not optional: a Qt
+    window silently refuses to shrink below its own minimum, so a width computed without
+    them is honoured by one window, ignored by the other, and the two end up different
+    sizes again. MEASURED offscreen, before this argument existed: player 1 obeyed at
+    400 px while player 2 stopped at its 730 px minimum. The caller passes the larger of
+    the two windows' minimums, so whatever comes back is a size both can actually take.
+
+    Pure geometry, no Qt: the screen is an argument, so the awkward cases (a narrow
+    laptop, a second monitor at a negative x) are testable without owning one.
+    """
+    ax, ay, aw, ah = available
+    px, py, w, h = primary
+
+    h = max(min_h, min(h, ah))
+    w = max(min_w, min(w, aw))
+    room = aw - gap
+    if 2 * w > room:                             # cannot stand side by side as-is
+        shrunk = max(min_w, room // 2)
+        if 2 * shrunk <= room:
+            w = shrunk                           # both shrink, equally
+        else:
+            # The screen is narrower than two windows at their own minimum. Keep them
+            # equal and cascade: overlapping is the honest outcome here, unequal is not.
+            x = max(ax, min(px, ax + aw - w))
+            y = max(ay, min(py, ay + ah - h))
+            ox = max(ax, min(x + LINK_WINDOW_CASCADE, ax + aw - w))
+            oy = max(ay, min(y + LINK_WINDOW_CASCADE, ay + ah - h))
+            return (x, y, w, h), (ox, oy, w, h)
+
+    total = 2 * w + gap
+    x = min(px, ax + aw - total)                 # slide left until the pair fits...
+    x = max(x, ax)                               # ...but never off the other edge
+    y = min(py, ay + ah - h)
+    y = max(y, ay)
+    return (x, y, w, h), (x + w + gap, y, w, h)
+
+
 class _Link2PWindow(QMainWindow):
     """Player 2's window: a second, full PlayPage (its own toolbar, save states,
     and -- crucially -- its own cartridge whose flash save loads normally)."""
 
     closed = pyqtSignal()
 
-    def __init__(self, settings, library, parent=None) -> None:
+    def __init__(self, play, settings, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(cfg.tr(cfg.language(settings), "window_player2"))
-        self.play = PlayPage(settings, library)
-        self.play._link_btn.hide()            # noqa: SLF001 -- P2 never re-links
+        # The page is built by the caller, so the separate-window and single-frame
+        # modes wire player 2 identically and only differ in where it is shown.
+        self.play = play
         self.setCentralWidget(self.play)
-        self.resize(SCREEN_W * 3, SCREEN_H * 3 + 40)
+        self.resize(SCREEN_W * 3, SCREEN_H * 3 + 40)   # replaced by side_by_side()
 
     def closeEvent(self, e) -> None:          # noqa: N802
+        self.play.stop()
+        self.closed.emit()
+        super().closeEvent(e)
+
+
+class _Link2PFrame(QMainWindow):
+    """Both consoles in ONE window, side by side and always the same size.
+
+    Asked for as "un grand cadre qui gere la taille des deux en meme temps et les
+    maintient a taille egale". Equal stretch factors in one row are exactly that: the
+    layout owns both widths, so there is no size to keep in sync by hand and no way for
+    them to drift apart -- resize the frame and both consoles follow, together.
+
+    Player 1's page is BORROWED from the shell's stack for the session and handed back
+    when the frame closes (see Shell._end_link_2p), so its cartridge, its save states
+    and its audio keep running throughout -- nothing restarts.
+    """
+
+    closed = pyqtSignal()
+
+    def __init__(self, p1, p2, settings, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(cfg.tr(cfg.language(settings), "window_link_frame"))
+        self.p1, self.play = p1, p2
+        central = QWidget(); central.setObjectName("page")
+        row = QHBoxLayout(central)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(LINK_WINDOW_GAP)
+        row.addWidget(p1, 1)                  # 1 : 1 -- equal, whatever the frame does
+        row.addWidget(p2, 1)
+        self.setCentralWidget(central)
+        # ⚠️ TAKING A PAGE OUT OF A QStackedWidget LEAVES IT HIDDEN, and a hidden widget
+        # gets no room from a layout however its stretch factor reads. MEASURED on a
+        # rendered frame: player 1 sat at its stale 640x480 while player 2 took the whole
+        # 1200. The stretch factors were already right and the picture was still wrong --
+        # which is why the test for this asserts the resulting WIDTHS, not the settings.
+        p1.show()
+        p2.show()
+        # ⚖️ AND EQUAL STRETCH ONLY SHARES THE SURPLUS. Each page starts from its own
+        # minimum, and the two are not the same -- player 2 hides the 🔗 button, so its
+        # toolbar is narrower. MEASURED, again on the rendered frame: 767 against 726.
+        # A common floor is what actually makes "maintient a taille egale" true; it is
+        # put back when the frame closes so the shell does not keep an inflated minimum
+        # for the rest of the session.
+        self._p1_min_w = p1.minimumWidth()
+        floor = max(p1.minimumSizeHint().width(), p2.minimumSizeHint().width())
+        p1.setMinimumWidth(floor)
+        p2.setMinimumWidth(floor)
+
+    def closeEvent(self, e) -> None:          # noqa: N802
+        # Only player 2 is ours to stop. Player 1 belongs to the shell and is about to
+        # be put back in it -- stopping it here would end the session the player is
+        # still in the middle of. Its minimum width is ours to give back, though: it was
+        # widened to match player 2 and the shell would be stuck with it otherwise.
+        self.p1.setMinimumWidth(self._p1_min_w)
         self.play.stop()
         self.closed.emit()
         super().closeEvent(e)
@@ -4276,9 +4415,11 @@ class Shell(QMainWindow):
         self.play.options_requested.connect(self._play_options)
         self.play.debug_requested.connect(self._open_debug)
         self.play.link_requested.connect(self._launch_link_2p)
+        self.play.link_frame_requested.connect(self._launch_link_2p_framed)
         self.play.net_host_requested.connect(self._host_online)
         self.play.net_join_requested.connect(self._join_online)
         self.play.net_lobby_requested.connect(self._open_lobby)
+        self.play.net_link_lost.connect(self._on_net_link_lost)
         self._link2p = None                # the P2 window, when 2-player is active
         self._link_input = None            # the global key router, when active
         self._link_status = None           # P2 title-bar link diagnostic timer
@@ -4477,9 +4618,21 @@ class Shell(QMainWindow):
         self._update_rail(1)
 
     def _launch_link_2p(self) -> None:
-        """Open player 2's window and wire the link cable. P2 chooses its OWN
-        cartridge (its flash save loads normally); the two consoles then exchange
-        serial bytes each frame. Input is split per player via a global router."""
+        self._start_link_2p(framed=False)
+
+    def _launch_link_2p_framed(self) -> None:
+        self._start_link_2p(framed=True)
+
+    def _start_link_2p(self, *, framed: bool) -> None:
+        """Open player 2 and wire the link cable. P2 chooses its OWN cartridge (its
+        flash save loads normally); the two consoles then exchange serial bytes each
+        frame. Input is split per player via a global router.
+
+        `framed` picks WHERE the two consoles live: two separate windows laid out side
+        by side, or one window holding both. Everything else -- the cable, the input
+        router, the diagnostics -- is identical, which is the point of building player
+        2's page here rather than inside either window class.
+        """
         if self._link2p is not None:              # already linked -> just surface it
             self._link2p.raise_(); self._link2p.activateWindow(); return
         if self.play.machine is None:
@@ -4491,8 +4644,8 @@ class Shell(QMainWindow):
             start_dir, "NGPC ROMs (*.ngc *.ngp *.npc);;All (*)")
         if not rom2:
             return
-        win = _Link2PWindow(self._settings, self._library_db, self)
-        p2 = win.play
+        p2 = PlayPage(self._settings, self._library_db)
+        p2._link_btn.hide()                        # noqa: SLF001 -- P2 never re-links
         p2.set_player(2)                           # P2 bindings + gamepad
         p2._lean = True                            # silent + wall-clock paced (see _lean)
         p2.start(Path(rom2))                       # its own flash save loads here
@@ -4500,6 +4653,19 @@ class Shell(QMainWindow):
         p2.attach_link(self.play)
         self._link_input = _LinkInput(self.play, p2)
         QApplication.instance().installEventFilter(self._link_input)
+
+        self._link_framed = framed
+        if framed:
+            # Borrow player 1's page out of the shell for the session; _end_link_2p
+            # puts it back. Nothing about the running console is disturbed.
+            self._stack.removeWidget(self.play)
+            win = _Link2PFrame(self.play, p2, self._settings, self)
+            win.resize(self.size().width(), self.size().height())
+            win.move(self.pos())
+            self.hide()
+        else:
+            win = _Link2PWindow(p2, self._settings, self)
+            self._lay_out_side_by_side(win)
         win.closed.connect(self._end_link_2p)
         self._link2p = win
         # Live link diagnostic in P2's title bar: if both counts climb once both
@@ -4511,6 +4677,32 @@ class Shell(QMainWindow):
         self._link_status.start(500)
         self._refresh_link_title()
         win.show(); win.raise_()
+
+    def _lay_out_side_by_side(self, win) -> None:
+        """Same size as player 1's window, next to it -- not on top of it."""
+        screen = self.screen() or QApplication.primaryScreen()
+        avail = screen.availableGeometry()
+        mine = self.frameGeometry()
+        # ⚡ ASK, THEN READ BACK. A window silently refuses to shrink below its own
+        # minimum, and that minimum is not something to predict -- `minimumSizeHint()`
+        # is inflated by every page in the stack and by the toolbar's translated
+        # labels, so trusting it made both windows far too wide. Instead: ask both for
+        # the same size, see what each ACTUALLY took, and settle on the larger. Neither
+        # can refuse that, so they finish equal by construction rather than by guess.
+        self.resize(mine.width(), mine.height())
+        win.resize(mine.width(), mine.height())
+        w = max(self.width(), win.width())
+        h = max(self.height(), win.height())
+        self.resize(w, h); win.resize(w, h)
+        grew = self.frameGeometry()
+        one, two = side_by_side(
+            (mine.x(), mine.y(), grew.width(), grew.height()),
+            (avail.x(), avail.y(), avail.width(), avail.height()),
+            min_w=grew.width(), min_h=grew.height())
+        # Player 1 only moves/resizes when the pair could not fit as it stood; when it
+        # already fits, `one` is exactly where it already is and this is a no-op.
+        self.resize(one[2], one[3]); self.move(one[0], one[1])
+        win.resize(two[2], two[3]); win.move(two[0], two[1])
 
     def _refresh_link_title(self) -> None:
         if self._link2p is None:
@@ -4527,6 +4719,14 @@ class Shell(QMainWindow):
             self._link_status.stop(); self._link_status = None
         QApplication.instance().removeEventFilter(self._link_input)
         self.play.detach_link()
+        if getattr(self, "_link_framed", False):
+            # Hand player 1's page back to the shell, exactly where it lives, and come
+            # out from behind the frame. Called BEFORE `_to_library` switches pages
+            # (see its first lines), so the stack is whole again by the time it does.
+            self._stack.insertWidget(2, self.play)
+            self._stack.setCurrentWidget(self.play)
+            self.show(); self.raise_(); self.activateWindow()
+        self._link_framed = False
         self._link_input = None
         self._link2p = None
 
@@ -4609,12 +4809,32 @@ class Shell(QMainWindow):
             client.close(); return
         net = LobbyLink(self.play.machine, client)
         self.play.attach_net_link(net)
+        # The lobby has its OWN way of losing a peer, and it does not go through
+        # TcpLink at all: this link only ever touches thread-safe queues, so it cannot
+        # crash the way the direct one did -- it went QUIET instead, and the player was
+        # left waiting on a console that had already left the room. The client knows;
+        # nothing was listening.
+        client.peer_left.connect(
+            lambda: self._on_net_link_lost(
+                cfg.tr(cfg.language(self._settings), "link_peer_left")))
+        client.disconnected.connect(self._on_net_link_lost)
         self.play.overlay.setText(cfg.tr(cfg.language(self._settings), "link_ready"))
         self._net_status = QTimer(self)
         self._net_status.timeout.connect(
             lambda: self.setWindowTitle(
                 f"NgpCraft — online ⇄  out {net.bytes_out} B   in {net.bytes_in} B"))
         self._net_status.start(500)
+
+    def _on_net_link_lost(self, why: str) -> None:
+        """The online peer went away. Say so, and put the console back on its own.
+
+        The game keeps running -- a dropped cable is not a dropped game, and on real
+        hardware unplugging the lead does not switch the console off. What must not
+        happen is the emulator carrying on pumping a dead socket, which is where the
+        crash came from.
+        """
+        self._end_net_link()
+        self.play._flash(cfg.tr(cfg.language(self._settings), "link_lost").format(why=why))
 
     def _end_net_link(self) -> None:
         if self._net_status is not None:
@@ -4705,16 +4925,59 @@ class Shell(QMainWindow):
         super().closeEvent(e)
 
 
+TASKBAR_APP_ID = "NgpCraft.Emulator"
+
+
+def claim_taskbar_identity(frozen: bool, platform: str) -> str | None:
+    """The AppUserModelID to claim, or None to leave Windows' own identity alone.
+
+    ⛔ THE BUG THIS DECIDES. "When i start the emu the icon in taskbar is a generic
+    one. If i click pin to taskbar then it displays the right icon" -- user report
+    2026-07-28. Everything the icon could have depended on was measured healthy: the
+    .ico carries all nine sizes 16..256, the shell call returns S_OK and reads back,
+    the window answers WM_GETICON with a live handle for both sizes from source AND
+    from the packaged .exe, the .exe carries an extractable icon resource, and moving
+    the call before QApplication changes nothing (the window is stamped with no
+    per-window PKEY_AppUserModel_ID either way).
+
+    What is left is the identity itself. An EXPLICIT AppUserModelID takes the taskbar
+    button off the executable and onto an id that resolves to nothing -- no installer
+    here ever registered a shortcut carrying it -- so the button has no app to take an
+    icon from. "Pin to taskbar" is the act of CREATING that shortcut, which is exactly
+    why pinning fixes it, and fixes it for good.
+
+    ⚖️ SO THE ANSWER IS NOT THE SAME IN BOTH BUILDS, and that is the whole point:
+
+      * frozen (.exe)  -- the executable already IS a proper identity with its own
+        embedded icon (spec: icon=assets/icone_ngpcraft.ico). Claim nothing and
+        Windows uses it. This is the path an end user is on.
+      * from source    -- the executable is python.exe, whose identity and icon are
+        not ours and would pool this app with every other Python GUI. There the
+        explicit id is still the lesser evil, so keep it.
+
+    Non-Windows platforms have no such concept; the caller no-ops there.
+    """
+    if platform != "win32":
+        return None
+    return None if frozen else TASKBAR_APP_ID
+
+
+def _claim_windows_taskbar_identity() -> None:
+    app_id = claim_taskbar_identity(bool(getattr(sys, "frozen", False)), sys.platform)
+    if app_id is None:
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])
     if APP_ICON.is_file():
         app.setWindowIcon(QIcon(str(APP_ICON)))
-        # Make Windows show our icon in the taskbar (not the generic python.exe one).
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NgpCraft.Emulator")
-        except Exception:
-            pass
+    _claim_windows_taskbar_identity()
     rom = sys.argv[1] if len(sys.argv) > 1 else None
     shell = Shell(rom)
     shell.show()

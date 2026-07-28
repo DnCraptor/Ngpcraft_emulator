@@ -138,6 +138,25 @@ class TcpLink:
         self._rx = bytearray()
         self.bytes_out = 0
         self.bytes_in = 0
+        # ⚡ WHY THE PEER WENT AWAY, once it has -- and None while the cable is good.
+        #
+        # ⛔ THE CRASH THIS ENDS. "Sometimes, some games lost the connection between
+        # users playing in online mode and then, the emulator crashes." pump() caught
+        # only BlockingIOError/InterruptedError, which are the "try again" cases. A peer
+        # that GOES is a different family -- ConnectionResetError, BrokenPipeError,
+        # ConnectionAbortedError -- and those escaped. MEASURED, both ways a peer can
+        # vanish (a clean FIN and an RST from a kill/NAT drop): ConnectionResetError out
+        # of the FIRST pump after the peer left, every time.
+        #
+        # That pump runs inside PlayPage._tick, which is a QTimer slot, and PyQt answers
+        # an unhandled Python exception in a slot with qFatal(). MEASURED: the process
+        # dies with 0xC0000409 and prints no traceback -- which is exactly why this reads
+        # as "the emulator crashes" rather than as an error. (Same mechanism the root
+        # conftest documents for the test runner.)
+        #
+        # So the link records the loss instead of raising it, and stops touching a dead
+        # socket. The owner polls this and can say so; the emulation is never disturbed.
+        self.lost: str | None = None
 
     # --- connection helpers -------------------------------------------------
     @classmethod
@@ -157,8 +176,19 @@ class TcpLink:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         return cls(machine, conn)
 
+    def _lose(self, why: str) -> None:
+        """The peer is gone. Record it once and let go of the socket."""
+        if self.lost is None:
+            self.lost = why or "peer closed"
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
     # --- per-frame pump -----------------------------------------------------
     def pump(self) -> None:
+        if self.lost is not None:
+            return                      # a dead cable carries nothing; do not touch it
         # 1) local TX -> socket. Drained into one buffer so the monitor sees one
         # handover per pump (and can release bytes it is holding back for latency
         # even on a pump where the game sent nothing).
@@ -176,18 +206,28 @@ class TcpLink:
             except (BlockingIOError, InterruptedError):
                 # kernel buffer full; the bytes are lost for this simple relay.
                 # A production link would queue them -- fine for frame-rate,
-                # low-volume link traffic.
+                # low-volume link traffic. NOT a lost peer: this is "try again".
                 pass
+            except OSError as e:
+                # ...whereas this family IS the peer going away. Note it and stop.
+                self._lose(str(e))
+                return
 
         # 2) socket -> local buffer
         try:
             while True:
                 chunk = self.sock.recv(4096)
                 if not chunk:
-                    break               # peer closed
+                    # A clean FIN. This used to just leave the loop, so a peer that
+                    # quit tidily was indistinguishable from one with nothing to say
+                    # and the game sat there waiting for a console that had gone.
+                    self._lose("peer closed the connection")
+                    break
                 self._rx.extend(chunk)
         except (BlockingIOError, InterruptedError):
             pass
+        except OSError as e:
+            self._lose(str(e))
 
         # 3) buffer -> local RX FIFO. Push unconditionally: the core's serial_tick
         # is the flow-control gate (it only PRESENTS a byte to the CPU once our RTS

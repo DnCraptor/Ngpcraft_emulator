@@ -506,7 +506,36 @@ void Machine::timer_tick(uint32_t cycles) {
         timer_count[i] = total % limit;
         if (matches) {
             if (even) cascade[i] = matches;
-            irq_pending |= 1u << (kIrqVectorIndexIntT0 + i);
+            /* ⚡ ONE MATCH, ONE MICRO-DMA TRANSFER -- AND `irq_pending` IS A BITMASK.
+             *
+             * A per-HBlank scroll table is a channel armed on INTT0 walking one entry
+             * per scanline: the Nth entry MUST land on the Nth line, or every line
+             * below the loss is drawn with its neighbour's offset. The request used to
+             * be recorded by OR-ing one bit and answered later, in deliver_irq, which
+             * runs BETWEEN INSTRUCTIONS -- so two matches falling inside a single long
+             * instruction collapsed into one transfer and the table ran a line behind
+             * for the whole rest of the frame.
+             *
+             * MEASURED, SNK Gals' Fighters (the player's own save state, 120 frames):
+             * a healthy frame delivers 152 entries, and the entry that hands the bottom
+             * HUD its S2SO.V = 8 arrives on line 135, in time for line 136's snapshot.
+             * On the frames that lost one -- always at line 0 or 1, where the VBlank
+             * handler's block copy straddles the first HBlanks of the picture -- only
+             * 151 arrived, the split reached line 136 too late to be latched, and line
+             * 136 came out as a row of playfield above the special bar. That is the
+             * reported flickering line, and it is the SAME seam Samurai Shodown! 2 was
+             * fixed at, by a different mechanism (see render.cpp: the window is live).
+             *
+             * The DMA controller is not the CPU and does not wait for an instruction
+             * boundary: it steals a bus cycle when the request happens. So answer each
+             * match here, as it happens. A channel that runs its count out clears its
+             * own start vector, so the loop stops on its own; whatever is left over --
+             * no channel armed, or the channel just disarmed -- falls through to the
+             * CPU exactly as before. */
+            uint32_t unserviced = matches;
+            while (unserviced && micro_dma_service(kIrqVectorIndexIntT0 + i))
+                --unserviced;
+            if (unserviced) irq_pending |= 1u << (kIrqVectorIndexIntT0 + i);
             /* "T03 is used as an interrupt to the Z80 CPU" -- SNK, 8Bit.txt. Timer 3
              * is the sound driver's heartbeat. It is not an option: without it the
              * driver boots, idles forever, and the game waits on a handshake that
@@ -1038,7 +1067,18 @@ bool Machine::micro_dma_service(unsigned vector_index) {
                 value |= uint32_t(read8(src + i)) << (8 * i);
             for (uint8_t i = 0; i < size; ++i) {
                 const uint32_t a = (dst + i) & kAddrMask;
-                if (region_writable(region_of(a))) mem[a] = uint8_t(value >> (8 * i));
+                if (!region_writable(region_of(a))) continue;
+                mem[a] = uint8_t(value >> (8 * i));
+                /* ⚡ A DMA WRITE IS STILL A WRITE, AND IT IS THE ONE RASTER WORK IS MADE OF.
+                 * The event log exists to answer "when in the frame did this register
+                 * change", and the answer for a scroll split is almost never a CPU store:
+                 * the split is driven by micro-DMA precisely so no instruction has to run.
+                 * Logging only `write8` left the log showing a game's vblank set-up and
+                 * NOTHING on the lines where the split actually happens -- a silence that
+                 * reads as "this game does no raster effect". It does; the CPU just is not
+                 * the one doing it. Same window, same fields, `pc` = the DMA'd source. */
+                if (a >= elog_lo && a <= elog_hi)
+                    note_event(kEventWrite, a, mem[a], src + i);
             }
             switch (kind) {
                 case 0: dst += size; break;         /* (DMAD+) <- (DMAS)  */
