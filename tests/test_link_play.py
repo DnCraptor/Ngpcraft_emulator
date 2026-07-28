@@ -21,6 +21,14 @@ REPO = Path(__file__).resolve().parent.parent
 BIOS = REPO / "bios.bin"
 ROM = REPO / "tests" / "roms" / "link_probe.ngc"
 
+# probe-ROM globals, from its .map (see tests/test_link_cable.py)
+G_TX_COUNT = 0x400E
+
+
+def rd16(machine, addr):
+    d = machine.read(addr, 2)
+    return d[0] | (d[1] << 8)
+
 pytestmark = pytest.mark.skipif(
     not (BIOS.exists() and ROM.exists()),
     reason="needs the retail bios.bin (gitignored) and the probe ROM",
@@ -138,6 +146,58 @@ def test_shell_link_2p_monitor_taps_the_relay(app, monkeypatch):
             p2._tick()
         assert p2.machine.serial_state().rx_queued_count == before_p2
         assert sh.play.machine.serial_state().rx_queued_count > before_p1
+    finally:
+        if sh._link2p is not None:
+            sh._link2p.close()
+        sh.play.stop()
+
+
+def test_attaching_the_cable_power_cycles_a_running_console(app, monkeypatch):
+    """⚡ A cable handed to a console that is already running is a cable no game
+    will ever see.
+
+    Samurai Shodown! 2 sends its first link packet at frame FIVE of its own boot
+    and latches the answer: no peer then means no peer for the rest of the
+    session, and VS PLAY stops responding entirely. Arming the link at frame 0
+    works and arming it at frame 30 does not -- but the shell's flow is to boot a
+    game and press the link button afterwards, which is always the late case.
+
+    So attaching the cable power-cycles the console: on hardware you plug the
+    cable in and *then* switch both consoles on. Player 1 has been running for a
+    while when 🔗 is pressed; it must restart with the link already armed, so the
+    game's boot-time probe finds its peer.
+    """
+    import ngpc_shell
+    from PyQt6.QtWidgets import QFileDialog
+
+    sh = ngpc_shell.Shell()
+    try:
+        sh._settings.setValue("paths/bios", str(BIOS))
+        sh.play._frames_due = lambda: 1
+        sh.play.start(ROM)
+        for _ in range(120):               # P1 is well past its own boot probe
+            sh.play._tick()
+        assert rd16(sh.play.machine, G_TX_COUNT) > 50   # it has been running a while
+
+        monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                            staticmethod(lambda *a, **k: (str(ROM), "")))
+        sh._launch_link_2p()
+        p2 = sh._link2p.play
+
+        # P1 went back to power-on WITH the cable armed -- not left mid-session.
+        # Its own loop counter, in work RAM, is the witness: a reboot zeroes it.
+        assert rd16(sh.play.machine, G_TX_COUNT) == 0, "the console did not power-cycle"
+        assert sh.play.machine.serial_state().enabled == 1
+        assert p2.machine.serial_state().enabled == 1
+
+        # and the cable works from P1's very first frame after that
+        p2._frames_due = lambda: 1
+        sh.play.held, p2.held = 0x08, 0x01
+        for _ in range(300):
+            sh.play._tick()
+            p2._tick()
+        assert sh.play.machine.read(0x400A, 1)[0] == 0x01
+        assert p2.machine.read(0x400A, 1)[0] == 0x08
     finally:
         if sh._link2p is not None:
             sh._link2p.close()

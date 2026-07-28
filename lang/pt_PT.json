@@ -217,6 +217,8 @@
  "tb_step": "Avançar um fotograma",
  "toolbar_autohide": "Ocultar automaticamente a barra de ferramentas quando inativa",
  "cart_lang": "Idioma do cartucho",
+ "cart_lang_en": "Inglês",
+ "cart_lang_ja": "Japonês",
  "cart_lang_hint": "Define o idioma em que um cartucho BILINGUE é executado (byte do sistema 0x6F87). ⚠️ Esta opção aplica-se apenas à emulação de alto nível (HLE) da BIOS integrada, que não possui ecrã de configuração, ou a uma consola que ainda nunca tenha sido configurada. Com uma BIOS real, a escolha pertence ao ecrã de configuração da própria consola: a definição aí efetuada é guardada na memória de acesso aleatório (RAM) alimentada pela pilha e tem prioridade em ambos os modos de arranque. Utilize «Repor a consola» para recomeçar. A alteração terá efeito na próxima vez que iniciar o emulador.",
  "close": "Fechar",
  "player": "Jogador",
@@ -272,5 +274,17 @@
  "lobby_password_ask": "Palavra-passe:",
  "covers_regen": "↻ Regenerar capas",
  "covers_regen_tip": "Volta a gerar as capas de todos os jogos. Os jogos novos recebem uma capa automaticamente; esta opção serve para recriar as existentes.",
- "covers_regen_ask": "Pretende voltar a gerar as capas dos {n} jogo(s)?\n\nCada jogo será iniciado para capturar uma imagem, pelo que este processo pode demorar algum tempo em bibliotecas grandes. As capas que escolheu manualmente serão preservadas."
+ "covers_regen_ask": "Pretende voltar a gerar as capas dos {n} jogo(s)?\n\nCada jogo será iniciado para capturar uma imagem, pelo que este processo pode demorar algum tempo em bibliotecas grandes. As capas que escolheu manualmente serão preservadas.",
+ "cover_set": "Escolher imagem de capa",
+ "cover_bad": "Esse ficheiro não pôde ser lido como uma imagem.",
+ "cover_failed": "Não foi possível guardar a capa.",
+ "menu_cover_set": "🖼  Escolher imagem de capa…",
+ "menu_cover_reset": "↺  Voltar à capa automática",
+ "menu_analyze": "🔍  Analisar ROM…",
+ "link_2p_framed": "Dois jogadores — uma janela",
+ "window_link_frame": "NGPC — dois jogadores",
+ "link_lost": "🔌 ligação perdida: {why} — o jogo continua a correr",
+ "link_peer_left": "o outro jogador saiu da sala",
+ "unit_hm": "{h} {hour} {m}",
+ "unit_ago": "{t}"
 }

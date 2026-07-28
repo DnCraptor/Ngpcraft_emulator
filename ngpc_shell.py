@@ -3821,6 +3821,34 @@ class PlayPage(QWidget):
         self._link_peer = peer
         if self.machine is not None:
             self.machine.serial_set_enabled(True)
+            self._power_cycle_for_link()
+
+    # ⚡ PLUGGING A CABLE IN MEANS SWITCHING BOTH CONSOLES ON AFTERWARDS.
+    #
+    # ⛔ THE BUG THIS ENDS: "Samurai Shodown! 2 — does not detect the second player
+    # and the VS Mode is impossible to be selected." MEASURED, two consoles + the
+    # real BIOS: the game sends its first link packet (FC 01 00 30, through the BIOS
+    # COM send at 0xFF2C36) at FRAME 5 of its own boot, and latches the answer. With
+    # a peer it keeps talking (151 packets by frame 300) and VS PLAY opens; with no
+    # answer it goes quiet for the rest of the session -- pressing A on VS PLAY then
+    # does nothing at all, which is exactly what the tester saw.
+    #
+    # Arming the cable at frame 0 works; arming it at frame 30 or at frame 240 is
+    # already too late, and no amount of waiting brings it back (measured across a
+    # sweep: 298 bytes at arm-frame 0, ZERO at every later one). And the shell's own
+    # flow is the late one -- you boot a game, THEN press the link button.
+    #
+    # 🔑 So the cable cannot be handed to a console that is already running. On real
+    # hardware you plug the cable in and then turn the consoles on; do that. The
+    # console power-cycles with the link already armed, and the game's frame-5 probe
+    # finds its peer. PROVEN end to end: after this, player 1 reaches SELECT PLAYER
+    # as PLAYER 1 and player 2 as PLAYER 2, 516 bytes crossing each way.
+    def _power_cycle_for_link(self) -> None:
+        if self.machine is None or self._frame == 0:
+            return          # never ran a frame: the cable is there from its first one
+        self.machine.serial_set_enabled(False)   # drop whatever the FIFOs held...
+        self._do_reset()
+        self.machine.serial_set_enabled(True)    # ...and plug in for the fresh boot
 
     def detach_link(self) -> None:
         if self.machine is not None:
@@ -3834,6 +3862,10 @@ class PlayPage(QWidget):
         self._net_link = net
         if self.machine is not None:
             self.machine.serial_set_enabled(True)
+            # Same reason as the local cable: a game that probed the link during its
+            # own boot will never look again. See _power_cycle_for_link. Both ends do
+            # this when the connection comes up, so both boot with the cable in.
+            self._power_cycle_for_link()
 
     def detach_net_link(self) -> None:
         if self._net_link is not None:
