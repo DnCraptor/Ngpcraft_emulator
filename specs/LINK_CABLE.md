@@ -73,6 +73,40 @@ All three present the same interface (`pump()` / `disconnect()` /
 The shell's local 2-player relay is inline in `PlayPage._pump_link` rather than
 using `InProcessLink`; it carries the same tap.
 
+**A linked frame is relayed every `PlayPage.LINK_SLICE` = 400 instructions, and that
+number is a correctness figure, not a comfort setting.** Each page pumps after ITS OWN
+frame and the two tick one after the other, so player 1's bytes reach player 2 before
+player 2 runs — but player 2's answer waits for the next frame. The Last Blade's
+handshake times out on exactly that one frame: measured on the game's own "message
+received" byte `0x4B9D`, the console that speaks first waits from +0 to +6 for the
+reply and gives up at +6, after which both consoles show **LINK ERROR**.
+
+| slice | message received | consumed | link driver at +900 |
+|---|---|---|---|
+| whole frame | player 2 only, +6 | **never** | dead (`0xFF`) → LINK ERROR |
+| 2000 instructions | player 2 only, +8 | **never** | dead (`0xFF`) |
+| **400 instructions** | **both, +4** | **+6** | **alive (`0x14`)** |
+| 100 instructions | both, +4 | +6 | alive (`0x14`) |
+
+An earlier attempt used 2000 and judged on the final screen alone; it failed, and the
+conclusion drawn from it — "sub-frame relaying does not help" — was wrong. Do not raise
+the slice without re-running that table. Slicing is not free (a few percent of host
+time, plus the speed table above `_flash_overlay`), so a console with **no peer** keeps
+the plain one-call-per-frame path. See also [NETPLAY_MIRROR.md §0](NETPLAY_MIRROR.md).
+
+⚠️ `TcpLink` writes with `send()` plus a pending buffer, **never `sendall()`**: on a
+non-blocking socket `sendall` raises `BlockingIOError` the moment the kernel buffer
+fills and does not say how much it already handed over, so the old code dropped a whole
+write mid-exchange and the peer waited for a packet that was never sent.
+`core/lobby.py` had the same fault and was fixed there first.
+
+**There is a second online mode.** Relaying the cable means the game waits for the
+network and slows down with it (0.56x speed at a 67 ms round trip, measured). Mirror
+netplay runs BOTH consoles on each PC and sends only the controller bytes, so the
+cable is local and the latency is spent on input delay instead —
+see [NETPLAY_MIRROR.md](NETPLAY_MIRROR.md). Both modes ship; they are mutually
+exclusive at runtime (`Shell._one_link_at_a_time`).
+
 Delivery into the receive FIFO is **unconditional**. The core's `serial_tick` is
 the authoritative flow-control gate (it only PRESENTS a byte once our RTS is
 low), so holding bytes back in the host can strand a handshake byte and read as

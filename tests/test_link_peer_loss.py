@@ -174,11 +174,15 @@ class _ScriptedSocket:
     says while the FIN is still in flight -- the state the CI hit and Windows skips.
     """
 
-    def __init__(self, recv_script, send_script=()):
+    def __init__(self, recv_script, send_script=(), *, accepts=None):
         self.recv_script = list(recv_script)
         self.send_script = list(send_script)
         self.closed = False
         self.sent = bytearray()
+        # How many bytes one send() takes, like a kernel buffer with room for that
+        # much. None = it takes everything, which is the easy case and the one that
+        # hides a partial-write bug.
+        self.accepts = accepts
 
     def setblocking(self, _flag): pass
     def close(self): self.closed = True
@@ -192,9 +196,22 @@ class _ScriptedSocket:
     def recv(self, _n):
         return self._step(self.recv_script)
 
-    def sendall(self, data):
+    def send(self, data):
+        """Returns how much it took -- the whole point of send over sendall."""
         self._step(self.send_script)
-        self.sent += data
+        take = len(data) if self.accepts is None else min(self.accepts, len(data))
+        self.sent += bytes(data[:take])
+        return take
+
+    def sendall(self, data):
+        """Kept only so the partial-write test still condemns if the product goes back
+        to it: a real non-blocking sendall takes what fits and THEN raises, telling the
+        caller nothing about how much went."""
+        take = len(data) if self.accepts is None else min(self.accepts, len(data))
+        self._step(self.send_script)
+        self.sent += bytes(data[:take])
+        if take < len(data):
+            raise BlockingIOError()
 
 
 def test_a_posix_style_departure_is_noticed_and_never_raises():
@@ -224,3 +241,32 @@ def test_a_send_that_fails_late_is_noticed_and_never_raises():
         m.queue_tx(b"\x02")
         lk.pump()
     assert lk.lost, "a broken pipe went unnoticed"
+
+
+def test_a_full_kernel_buffer_delays_bytes_it_does_not_eat_them():
+    """⛔ A LINK CABLE THAT LOSES BYTES IS A GAME THAT HANGS.
+
+    The direct host/join socket is non-blocking, and `sendall` on a non-blocking
+    socket raises BlockingIOError the moment the kernel buffer fills WITHOUT saying
+    how much it already handed over. The old code answered that by dropping the whole
+    write -- mid-stream, silently. The peer then waits forever for a packet that was
+    never sent, which is "the link froze" and looks nothing like a bug in the sender.
+    (core/lobby.py had the same fault on the lobby socket and it was fixed there; this
+    socket kept it.)
+
+    Scripted so the faulty line is genuinely executed: a socket that accepts exactly
+    one byte per send. Every queued byte must still arrive, in order.
+    """
+    sock = _ScriptedSocket(recv_script=[BlockingIOError] * 50,
+                           send_script=[None] * 50, accepts=1)
+    m = FakeMachine()
+    lk = link.TcpLink(m, sock)
+
+    m.queue_tx(b"HANDSHAKE")            # nine bytes, one accepted per pump
+    for _ in range(20):
+        lk.pump()
+
+    assert bytes(sock.sent) == b"HANDSHAKE", (
+        f"the cable dropped bytes the game had sent: {bytes(sock.sent)!r}")
+    assert lk.bytes_out == 9, "bytes_out must count what the socket actually took"
+    assert lk.lost is None, "a full buffer is back-pressure, not a lost peer"

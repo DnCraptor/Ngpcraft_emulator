@@ -184,10 +184,19 @@ class Library:
 
 
 def _stat(rom: Path, field: str) -> float:
-    try:
-        return float(getattr(rom.stat(), field))
-    except OSError:
-        return 0.0
+    """A file date, for the date sorts.
+
+    ⚡ A game inside a collection archive has a VIRTUAL path (`Pack.zip/Game A.ngc`),
+    which no filesystem knows: `stat()` raises and every one of those games would sort
+    as "the oldest thing in the library". The archive holding it has a real date, and
+    it is the right one -- that IS when the game arrived.
+    """
+    for candidate in (rom, *rom.parents):
+        try:
+            return float(getattr(candidate.stat(), field))
+        except OSError:
+            continue
+    return 0.0
 
 
 # Abbreviations for the two card subtitles below. They are the only words this

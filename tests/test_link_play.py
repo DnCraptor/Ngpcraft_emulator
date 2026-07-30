@@ -202,3 +202,68 @@ def test_attaching_the_cable_power_cycles_a_running_console(app, monkeypatch):
         if sh._link2p is not None:
             sh._link2p.close()
         sh.play.stop()
+
+
+def test_a_linked_frame_relays_the_cable_many_times_over(app, monkeypatch):
+    """⚡ Relaying the cable once per frame costs a frame of latency ONE WAY, and
+    that is enough to break a real handshake.
+
+    Player 1 runs, we relay, player 2 runs -- so player 2 consumes player 1's bytes
+    in the same frame, while player 1 only sees the answer on the next one. The Last
+    Blade's link script times out on exactly that asymmetry: measured on the game's
+    own "message received" byte (0x4B9D), the console that speaks first waits from
+    frame +0 to +6 for the reply and gives up at +6, one frame short, then tears the
+    session down and both consoles end up showing "LINK ERROR".
+
+    Slicing the frame fixes it, but only if the slice is small enough: 2000
+    instructions still fails, 400 works (both consoles receive at +4 and consume at
+    +6, and the link driver is still alive 900 frames later). So what this test
+    guards is not "we slice" but "we slice a lot" -- a single relay per frame, or a
+    slice so coarse it amounts to one, must fail here.
+    """
+    import ngpc_shell
+    from PyQt6.QtWidgets import QFileDialog
+
+    sh = ngpc_shell.Shell()
+    try:
+        sh._settings.setValue("paths/bios", str(BIOS))
+        sh.play._frames_due = lambda: 1
+        sh.play.start(ROM)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                            staticmethod(lambda *a, **k: (str(ROM), "")))
+        sh._launch_link_2p()
+        p2 = sh._link2p.play
+        p2._frames_due = lambda: 1
+
+        seen = {"n": 0}
+        real = ngpc_shell.PlayPage._pump_link
+
+        def counting(self):
+            if self is sh.play:
+                seen["n"] += 1
+            return real(self)
+
+        monkeypatch.setattr(ngpc_shell.PlayPage, "_pump_link", counting)
+
+        FRAMES = 10
+        for _ in range(FRAMES):
+            sh.play._tick()
+            p2._tick()
+        linked = seen["n"]
+
+        # CONTROL: the same page with no peer takes the plain path, one relay a
+        # frame. Without it, "many relays" could just mean "_tick ran many times".
+        sh.play._link_peer = None
+        seen["n"] = 0
+        for _ in range(FRAMES):
+            sh.play._tick()
+        alone = seen["n"]
+
+        assert alone == FRAMES, f"unlinked page should relay once a frame, got {alone}"
+        assert linked > FRAMES * 5, (
+            f"a linked frame relayed the cable {linked / FRAMES:.1f} times on average; "
+            "one relay a frame breaks The Last Blade's handshake")
+    finally:
+        if sh._link2p is not None:
+            sh._link2p.close()
+        sh.play.stop()

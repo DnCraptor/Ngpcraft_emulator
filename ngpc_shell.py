@@ -341,6 +341,31 @@ def _file_id(path: Path) -> object:
         return str(path)
 
 
+def choose_game_in_archive(parent, path: str | Path, lang: str) -> str | None:
+    """`path` as opened by the user, resolved to ONE game.
+
+    A collection archive opened by hand is ambiguous, and the old answer -- load the
+    largest member -- silently picked a game nobody asked for. So ask; a bare ROM or a
+    single-game archive is returned untouched and nothing is asked. None = cancelled.
+    """
+    p = Path(path)
+    if p.suffix.lower() not in rom_loader.ARCHIVE_EXTS:
+        return str(p)
+    try:
+        members = rom_loader.list_roms(p)
+    except Exception:
+        return str(p)
+    if len(members) < 2:
+        return str(p)
+    labels = [Path(m).stem for m in members]
+    choice, ok = QInputDialog.getItem(
+        parent, cfg.tr(lang, "archive_pick_title"),
+        cfg.tr(lang, "archive_pick_label").format(archive=p.name), labels, 0, False)
+    if not ok:
+        return None
+    return str(p / members[labels.index(choice)])
+
+
 def scan_roms(root: Path, max_depth: int = SCAN_MAX_DEPTH) -> list[Path]:
     """Every ROM and archive under `root` -- each PHYSICAL file exactly ONCE.
 
@@ -389,9 +414,37 @@ def scan_roms(root: Path, max_depth: int = SCAN_MAX_DEPTH) -> list[Path]:
             if ident in seen:
                 continue
             seen.add(ident)
-            out.append(path)
+            out.extend(_games_in(path))
     out.sort()
     return out
+
+
+def _games_in(path: Path) -> list[Path]:
+    """One entry per GAME for a physical file: usually itself, several for a
+    collection archive.
+
+    ⚡ AN ARCHIVE HOLDING SEVERAL GAMES BECOMES SEVERAL CARDS, each addressed by a
+    virtual `Pack.zip/Game A.ngc` path. Everything a game owns is derived from its
+    `Path` -- the flash save (`saves/<stem>.flash`), the savestates, the watches, the
+    cover, the library entry -- so this hands each game inside the archive its own,
+    and `Pack.zip` alone would have given forty games ONE shared save file. (It would
+    also have booted whichever member happened to be the largest, silently.)
+
+    ⛔ AN ARCHIVE WITH ONE GAME KEEPS ITS OWN PATH, and that is not tidiness: today
+    `Sonic.zip` saves to `saves/Sonic.flash`, and expanding it to `Sonic.zip/Sonic
+    Pocket Adventure.ngc` would rename the save, the states and the cover of every
+    single-game archive in every existing library. The new shape is only used where
+    the old one cannot work.
+    """
+    if path.suffix.lower() not in rom_loader.ARCHIVE_EXTS:
+        return [path]
+    try:
+        members = rom_loader.list_roms(path)
+    except Exception:
+        return [path]          # unreadable archive: one card, and the loader will say why
+    if len(members) < 2:
+        return [path]
+    return [path / m for m in members]
 
 
 # ---------------------------------------------------------------- thumbnails
@@ -1293,9 +1346,12 @@ class LibraryPage(QWidget):
 
     def _open_rom(self) -> None:
         cur = cfg.rom_folder(self._settings) or str(DEFAULT_ROM_DIR)
+        lang = cfg.language(self._settings)
         path, _ = QFileDialog.getOpenFileName(
-            self, cfg.tr(cfg.language(self._settings), "open_rom_pick"), cur,
-            cfg.tr(cfg.language(self._settings), "filter_rom_files"))
+            self, cfg.tr(lang, "open_rom_pick"), cur,
+            cfg.tr(lang, "filter_rom_files"))
+        if path:
+            path = choose_game_in_archive(self, path, lang)   # a collection -> which one?
         if path:
             self.play_requested.emit(path)
 
@@ -2332,6 +2388,9 @@ class PlayPage(QWidget):
     net_join_requested = pyqtSignal()     # 🔗 : join a direct network game
     net_lobby_requested = pyqtSignal()    # 🔗 : open the online lobby (server)
     net_link_lost = pyqtSignal(str)       # the online peer went away, with the reason
+    mirror_ended = pyqtSignal(str)        # a mirror session refused or desynced
+    net_mirror_host_requested = pyqtSignal()   # 🔗 : host a MIRROR game
+    net_mirror_join_requested = pyqtSignal()   # 🔗 : join a MIRROR game
     link_frame_requested = pyqtSignal()   # 🔗 : both consoles inside one window
 
     def __init__(self, settings, library: lib.Library) -> None:
@@ -2345,6 +2404,12 @@ class PlayPage(QWidget):
         self._player = 1
         self._link_peer = None               # the other PlayPage, when linked (local 2P)
         self._net_link = None                # a core.link.TcpLink, when linked online
+        # Mirror netplay (core/netplay.py): both consoles run HERE and only the
+        # controller bytes cross the network. None = not in that mode.
+        self._mirror = None
+        self._mirror_peer_session = None
+        self._mirror_waits = 0               # consecutive frames spent waiting on the peer
+        self._mirror_desynced = False
         # A linked guest (player 2) runs LEAN: no audio sink of its own. Two audio
         # sinks fighting for the device both crackle AND make the 1x audio-clock
         # pacer stall (a starved sink returns 0 frames due, freezing that console
@@ -2668,6 +2733,10 @@ class PlayPage(QWidget):
     def stop(self) -> None:
         self.timer.stop()
         self._autohide_timer.stop(); self._idle_hidden = False   # no game -> no idle hide
+        # ⚡ The mirror owns a SECOND console and a socket. Left attached, they outlive
+        # the game that opened them, and the next `start()` would step a session whose
+        # local machine has been closed.
+        self.detach_mirror()
         self._commit_playtime()
         if self._rom_path is not None:    # keep this ROM's watches + breakpoints
             try:
@@ -3081,6 +3150,8 @@ class PlayPage(QWidget):
         return ran
 
     def _do_reset(self) -> None:
+        if self._mirror_blocks():
+            return
         if self.session is not None:
             self.session.reboot()
         elif self._raw is not None:
@@ -3325,11 +3396,44 @@ class PlayPage(QWidget):
         STATE_DIR.mkdir(exist_ok=True)
         return STATE_DIR / f"{self._rom_path.stem}.s{slot}"
 
-    def _flash(self, msg: str) -> None:
-        """Briefly show a status line over the game."""
+    def _mirror_blocks(self) -> bool:
+        """True (and says so) when an action would rewind THIS console only.
+
+        ⛔ In mirror play the other PC is simulating both consoles too, from the shared
+        input stream alone. A savestate, a rewind or a reset applied here and nowhere
+        else puts the two copies in different states -- the checksum would catch it a
+        second later and end the match, which is a rotten way to answer a keypress. So
+        the keypress is refused instead, and the player is told why.
+        """
+        if self._mirror is None:
+            return False
+        self._flash(cfg.tr(cfg.language(self._settings), "mirror_local_only"))
+        return True
+
+    def _flash(self, msg: str, ms: int = 1100) -> None:
+        """Briefly show a status line over the game.
+
+        ⛔ NOT `QTimer.singleShot(ms, lambda: ...)`. That timer belongs to nobody: it
+        outlives the page, and when it fires into a widget that has been torn down the
+        process dies with qFatal or an access violation, no traceback, at whatever the
+        test suite happens to be doing a couple of modules later. MEASURED TWICE this
+        session -- once from the link-cable message, once from here, and the second time
+        it looked exactly like a bug in somebody else's tests. A QTimer PARENTED to the
+        page is destroyed with the page, so the call cannot outlive its target; the
+        callback still guards, because a page can be deleted while the timer is queued.
+        """
         self.overlay.setText(msg)
-        QTimer.singleShot(1100, lambda: self.overlay.setText(
-            cfg.tr(cfg.language(self._settings), "paused") if self.paused else ""))
+        self._overlay_timer = QTimer(self)
+        self._overlay_timer.setSingleShot(True)
+        self._overlay_timer.timeout.connect(self._clear_overlay)
+        self._overlay_timer.start(ms)
+
+    def _clear_overlay(self) -> None:
+        try:
+            self.overlay.setText(
+                cfg.tr(cfg.language(self._settings), "paused") if self.paused else "")
+        except RuntimeError:
+            pass            # the page went away first; nothing to clear
 
     def set_slot(self, slot: int) -> None:
         self._slot = max(0, min(STATE_SLOTS - 1, slot))
@@ -3363,6 +3467,8 @@ class PlayPage(QWidget):
     def save_state(self, slot: int | None = None) -> None:
         if self.machine is None:
             return
+        if self._mirror_blocks():
+            return
         slot = self._slot if slot is None else slot
         path = self._state_path(slot)
         if path is None:
@@ -3372,6 +3478,8 @@ class PlayPage(QWidget):
 
     def load_state(self, slot: int | None = None) -> None:
         if self.machine is None:
+            return
+        if self._mirror_blocks():
             return
         slot = self._slot if slot is None else slot
         path = self._state_path(slot)
@@ -3405,7 +3513,7 @@ class PlayPage(QWidget):
     def start_rewind(self) -> None:
         """Begin holding rewind: the game runs BACKWARD through the history for as long
         as the key/button is held. Release -> resume forward (stop_rewind)."""
-        if self.machine is None:
+        if self.machine is None or self._mirror_blocks():
             return
         self.paused = False
         self._rewinding = True
@@ -3807,6 +3915,12 @@ class PlayPage(QWidget):
         m.addSeparator()
         m.addAction(t("link_host_direct"), self.net_host_requested.emit)
         m.addAction(t("link_join_direct"), self.net_join_requested.emit)
+        m.addSeparator()
+        # The second online mode, kept ALONGSIDE the cable one rather than replacing
+        # it: mirror play is far faster on a slow link but demands the same cartridge,
+        # save, BIOS and build on both sides. See core/netplay.py.
+        m.addAction(t("link_mirror_host"), self.net_mirror_host_requested.emit)
+        m.addAction(t("link_mirror_join"), self.net_mirror_join_requested.emit)
         m.exec(self._link_btn.mapToGlobal(self._link_btn.rect().bottomLeft()))
 
     def set_player(self, n: int) -> None:
@@ -3849,6 +3963,11 @@ class PlayPage(QWidget):
         self.machine.serial_set_enabled(False)   # drop whatever the FIFOs held...
         self._do_reset()
         self.machine.serial_set_enabled(True)    # ...and plug in for the fresh boot
+        # SAY SO. From the player's seat a game that jumps back to the SNK logo the
+        # instant the second console appears is indistinguishable from a crash -- and
+        # it has been reported as one. It is deliberate: the cable has to be in before
+        # the game boots or the game never sees it.
+        self._flash_overlay("link_rebooted")
 
     def detach_link(self) -> None:
         if self.machine is not None:
@@ -3874,6 +3993,86 @@ class PlayPage(QWidget):
         if self.machine is not None and self._link_peer is None:
             self.machine.serial_set_enabled(False)
 
+    # ---- mirror netplay: the OTHER online mode (core/netplay.py) --------------
+    # The cable mode above sends the cable's own bytes, so the game waits for the
+    # network and slows down with it (measured: 0.57x speed at a 67 ms round trip).
+    # Mirror mode instead runs BOTH consoles here and sends only the controller
+    # bytes, so the cable is local and the latency is spent on input delay rather
+    # than on speed. Both modes stay: this one is faster, the other one is the one
+    # that works with a peer who has a different save, a different BIOS or a
+    # different build.
+    def attach_mirror(self, session, peer_session) -> None:
+        """`session` is a core.netplay.MirrorSession already wired to the transport;
+        `peer_session` is the second console's NativeSession, kept so it can be
+        closed with the link."""
+        self._mirror = session
+        self._mirror_peer_session = peer_session
+        # A new session starts with a clean slate: leaving the previous one's verdict
+        # set would end this one on its first frame, for a desync that is not its own.
+        self._mirror_desynced = False
+        self._mirror_waits = 0
+        self._flash_overlay("mirror_ready")
+
+    def _step_mirror(self):
+        """One frame of mirror netplay, or None when the peer's input is not here.
+
+        The session runs BOTH consoles and relays the local cable between them, so
+        this returns the summary of OUR console's frame for the rest of _tick to use.
+        Waiting is not a stall to hide: it is the network, and the player is told
+        about it rather than left wondering why the picture stopped.
+        """
+        t = lambda k: cfg.tr(cfg.language(self._settings), k)
+        # ⛔ A PEER THAT VANISHES MUST NOT LOOK LIKE A SLOW ONE. Without this the
+        # session waits for an input that will never come, for ever, showing "waiting
+        # for the other player" -- the same failure the cable mode had to fix (see
+        # core.link.TcpLink.lost) and just as unreadable from the player's seat.
+        lost = getattr(self._mirror.pipe, "lost", None)
+        if lost:
+            self.overlay.setText(t("link_lost").format(why=lost))
+            self.mirror_ended.emit(str(lost))
+            return None
+        result = self._mirror.step(self._joypad_byte())
+        if result == "rejected":
+            self.overlay.setText(t("mirror_refused").format(why=self._mirror.rejected))
+            self.mirror_ended.emit(str(self._mirror.rejected))
+            return None
+        if result == "waiting":
+            self._mirror_waits += 1
+            if self._mirror_waits > 30:          # half a second: say something
+                self.overlay.setText(t("mirror_waiting"))
+            return None
+        if self._mirror_waits:
+            self._mirror_waits = 0
+            self.overlay.setText("")
+        if self._mirror.desync_at is not None and not self._mirror_desynced:
+            # Detected, never repaired: the two PCs now hold different consoles, and
+            # pretending otherwise would let the match carry on as a fiction. The frame
+            # itself DID run, so it is still counted -- only the session ends.
+            self._mirror_desynced = True
+            self.overlay.setText(t("mirror_desync"))
+            self.mirror_ended.emit("desync")
+        # The session already ran our console's frame; hand back a summary for the
+        # crash/breakpoint checks the rest of _tick does.
+        return self.machine.run(0, record=False)[0]
+
+    def detach_mirror(self) -> None:
+        if self._mirror is not None:
+            sock = getattr(self._mirror.pipe, "sock", None)
+            if sock is not None:
+                try:
+                    sock.close()          # the pipe owns it; nobody else will
+                except OSError:
+                    pass
+        self._mirror = None
+        self._mirror_desynced = False
+        self._mirror_waits = 0
+        if self._mirror_peer_session is not None:
+            try:
+                self._mirror_peer_session.close()
+            except Exception:
+                pass
+        self._mirror_peer_session = None
+
     def set_link_monitor(self, monitor) -> None:
         """Tap (or untap) this console's cable for the debugger's Link tab.
 
@@ -3885,6 +4084,12 @@ class PlayPage(QWidget):
         self.link_monitor = monitor
         if self._net_link is not None:
             self._net_link.monitor = monitor
+        # ...and in mirror play the cable is the IN-PROCESS one between the two local
+        # consoles, pumped by the session rather than by _pump_link. Without this the
+        # Link tab would read zero bytes on a cable that is busy -- and a debug tool
+        # that reads zero on a working link is worse than no tool.
+        if self._mirror is not None:
+            self._mirror.link.monitor_a = monitor
 
     def link_mode(self) -> str:
         """Which cable, if any, this console is on -- for the debugger to show."""
@@ -3892,9 +4097,95 @@ class PlayPage(QWidget):
             return {"TcpLink": "lan", "LobbyLink": "lobby",
                     "LoopbackLink": "loopback"}.get(
                         type(self._net_link).__name__, "net")
+        if self._mirror is not None:
+            return "mirror"
         if self._link_peer is not None:
             return "local2p"
         return "none"
+
+    # ⚠️ WHAT SLICING COSTS -- the other half of the LINK_SLICE story (see _run_frame_relaying
+    # for why we slice at all: The Last Blade's handshake does not survive one relay a frame).
+    #
+    # Measured before that was understood (Fatal Fury link match, two consoles, the game's own
+    # logic counter 0x4B3C per emulated frame, through this shell):
+    #
+    #     cable delay      relay once per frame     relay every ~2000 instructions
+    #     none                    1.000                        0.957
+    #     1 frame                 0.800                        0.733
+    #     2 frames                0.573                        0.553
+    #
+    # So slicing is not free, and this table was once read as "slicing never helps". That
+    # reading was wrong -- it only measured SPEED, and the thing slicing buys is CORRECTNESS
+    # (a handshake that completes at all). Keep both facts: slice, but do not slice finer
+    # than the handshake needs, and never slice a console with no peer.
+    #
+    # Half of the intuition here IS right and still applies: each page pumps after ITS OWN
+    # frame and the two tick one after the other, so player 1's bytes reach player 2 before
+    # player 2 runs. The asymmetry is the OTHER direction -- player 2's answer waits for the
+    # next frame -- and that is the frame The Last Blade times out on.
+    #
+    # (A bench that steps both consoles and THEN pumps once invents a frame of latency that
+    # the shell does not have. Measure through this path, not through such a bench.)
+    #
+    # What the table does say is that latency is taken out of the GAME's speed and
+    # nothing else -- 0.57 at two frames of it. That is the "combat in slow motion,
+    # audio perfect" report: audio comes from the APU, which waits for nobody. Online,
+    # that latency is the network's, and no relay schedule of ours can remove it.
+    def _flash_overlay(self, key: str, ms: int = 2500) -> None:
+        """A translated `_flash` -- same owned-timer safety, see _flash."""
+        self._flash(cfg.tr(cfg.language(self._settings), key), ms)
+
+
+    # How many instructions a linked console runs between two relays of the cable.
+    # ⚠️ THIS NUMBER IS A CORRECTNESS FIGURE, NOT A TUNING KNOB. A whole frame between
+    # relays costs one frame of latency in ONE direction only (player 1 runs, we relay,
+    # player 2 runs and can consume those bytes the same frame -- player 1 only sees the
+    # answer next frame). The Last Blade's link handshake times out on exactly that:
+    # measured on the game's own "message received" byte 0x4B9D, the console that speaks
+    # first waits +0 -> +6 for the reply and gives up at +6, one frame short.
+    #    slice     | message received | consumed | link driver at +900
+    #    whole frame|  P2 only, +6     | NEVER    | dead (0xFF) -> "LINK ERROR"
+    #    2000 instr |  P2 only, +8     | NEVER    | dead (0xFF)
+    #    400 instr  |  BOTH at +4      | +6       | alive (0x14), both in Player Select
+    #    100 instr  |  BOTH at +4      | +6       | alive (0x14)
+    # 2000 was tried first and judged on the final screen alone -- it fails, which is why
+    # an earlier attempt at this concluded "sub-frame relaying does not help". It does;
+    # the slice was simply too coarse. Do not raise it without re-running that table.
+    LINK_SLICE = 400
+
+    def _run_frame_relaying(self):
+        """Run one frame, relaying the cable every `LINK_SLICE` instructions.
+
+        Unlinked consoles keep the plain one-call-per-frame path: slicing costs a few
+        percent of speed and buys nothing when there is no peer to hear the bytes.
+        """
+        if self._net_link is None and self._link_peer is None:
+            summ = self.machine.run_frames(1)
+            self._pump_link()
+            return summ
+        # Probe the core's own counter rather than trusting `_core_frames`: a rewind or a
+        # savestate can move the core without the page's copy following.
+        start = self.machine.run(0, record=False)[0].frame_count
+        total = 0
+        for _ in range(256):
+            summ, _ = self.machine.run(self.LINK_SLICE, record=False)
+            total += summ.executed
+            self._pump_link()
+            if summ.stop_status in _CRASH_STATUSES:
+                break
+            if summ.stop_status == native.STATUS_BREAKPOINT:
+                break
+            if summ.executed == 0:               # core refused to advance
+                break
+            if summ.frame_count != start:        # the frame is done
+                break
+        else:
+            # Never leave a frame half-run: whatever happened, finish it the plain way.
+            summ = self.machine.run_frames(1)
+            total += summ.executed
+            self._pump_link()
+        summ.executed = total
+        return summ
 
     def _pump_link(self) -> None:
         mon = self.link_monitor
@@ -3999,7 +4290,11 @@ class PlayPage(QWidget):
             # That is invisible for a held button but fatal to autofire: the press
             # train would come out at the tick rate (and at whatever the batch size
             # happened to be) instead of the rate that was asked for.
-            self.machine.write(0x00B0, bytes([self._joypad_byte()]))
+            # In mirror mode the session owns the controller byte: it plays the one
+            # captured `delay` frames ago, so both PCs feed the two consoles the same
+            # streams. Writing the live pad here would fight it.
+            if self._mirror is None:
+                self.machine.write(0x00B0, bytes([self._joypad_byte()]))
             self._frame += 1
             if wrange is not None:               # fresh per-frame write capture
                 self.machine.set_write_log(wrange[0], wrange[1])
@@ -4008,8 +4303,13 @@ class PlayPage(QWidget):
             if probing:                          # fresh window per frame for the viewer
                 self.machine.set_write_log(*self.access_probe)
                 self.machine.set_read_log(*self.access_probe)
-            summ = self.machine.run_frames(1)
-            self._pump_link()                    # relay this frame's serial bytes
+            if self._mirror is not None:
+                summ = self._step_mirror()
+                if summ is None:
+                    self._frame -= 1             # nothing ran; do not count this frame
+                    break                        # the peer's buttons have not arrived
+            else:
+                summ = self._run_frame_relaying()
             # Console-side load. `executed` is the game's own work for this frame, and a
             # changed sprite table means the game completed a logic update -- a game that
             # has fallen behind updates on fewer frames than the LCD draws. Read straight
@@ -4452,6 +4752,13 @@ class Shell(QMainWindow):
         self.play.net_join_requested.connect(self._join_online)
         self.play.net_lobby_requested.connect(self._open_lobby)
         self.play.net_link_lost.connect(self._on_net_link_lost)
+        self.play.net_mirror_host_requested.connect(self._host_mirror)
+        self.play.net_mirror_join_requested.connect(self._join_mirror)
+        self.play.mirror_ended.connect(self._on_mirror_ended)
+        self._mirror_pending = None        # "host"/"join" while a mirror link connects
+        self._mirror_boot = None           # the cartridge trade, while it runs
+        self._mirror_boot_host = False
+        self._mirror_timer = None
         self._link2p = None                # the P2 window, when 2-player is active
         self._link_input = None            # the global key router, when active
         self._link_status = None           # P2 title-bar link diagnostic timer
@@ -4667,13 +4974,15 @@ class Shell(QMainWindow):
         """
         if self._link2p is not None:              # already linked -> just surface it
             self._link2p.raise_(); self._link2p.activateWindow(); return
-        if self.play.machine is None:
+        if self.play.machine is None or self._one_link_at_a_time(False):
             return                                 # nothing running to link to
         start_dir = (str(self.play._rom_path.parent) if self.play._rom_path
                      else str(DEFAULT_ROM_DIR))
         rom2, _ = QFileDialog.getOpenFileName(
             self, "Player 2 — choose a cartridge (may be the same as player 1)",
-            start_dir, "NGPC ROMs (*.ngc *.ngp *.npc);;All (*)")
+            start_dir, "NGPC ROMs (*.ngc *.ngp *.npc *.zip *.7z);;All (*)")
+        if rom2:
+            rom2 = choose_game_in_archive(self, rom2, cfg.language(self._settings))
         if not rom2:
             return
         p2 = PlayPage(self._settings, self._library_db)
@@ -4709,6 +5018,7 @@ class Shell(QMainWindow):
         self._link_status.start(500)
         self._refresh_link_title()
         win.show(); win.raise_()
+        stamp_taskbar_icon(win)               # player 2 / the 2P frame is a button too
 
     def _lay_out_side_by_side(self, win) -> None:
         """Same size as player 1's window, next to it -- not on top of it."""
@@ -4764,7 +5074,7 @@ class Shell(QMainWindow):
 
     # ---- online link (LAN / internet) -------------------------------------
     def _host_online(self) -> None:
-        if self.play.machine is None:
+        if self.play.machine is None or self._one_link_at_a_time(False):
             return
         port, ok = QInputDialog.getInt(
             self, "Host a network game", "Listen on port:", 7788, 1, 65535)
@@ -4781,7 +5091,7 @@ class Shell(QMainWindow):
         self._host_info.show()
 
     def _join_online(self) -> None:
-        if self.play.machine is None:
+        if self.play.machine is None or self._one_link_at_a_time(False):
             return
         text, ok = QInputDialog.getText(
             self, "Join a network game",
@@ -4809,6 +5119,10 @@ class Shell(QMainWindow):
 
     def _on_net_connected(self, sock) -> None:
         from core.link import TcpLink
+        if self._mirror_pending is not None:        # the other online mode
+            mode, self._mirror_pending = self._mirror_pending, None
+            self._begin_mirror(sock, host=(mode == "host"))
+            return
         if self.play.machine is None:
             try: sock.close()
             except OSError: pass
@@ -4822,12 +5136,238 @@ class Shell(QMainWindow):
                 f"NgpCraft — online ⇄  out {net.bytes_out} B   in {net.bytes_in} B"))
         self._net_status.start(500)
 
+    # ---- mirror netplay: the second online mode -------------------------------
+    def _host_mirror(self) -> None:
+        if self.play.machine is None or self._one_link_at_a_time(True):
+            return
+        port, ok = QInputDialog.getInt(
+            self, "Host a mirror game", "Listen on port:", 7789, 1, 65535)
+        if not ok or not self._ask_mirror_delay():
+            return
+        self._mirror_pending = "host"
+        self._start_net("host", "", int(port),
+                        cfg.tr(cfg.language(self._settings), "link_waiting")
+                        .format(port=port))
+
+    def _join_mirror(self) -> None:
+        if self.play.machine is None or self._one_link_at_a_time(True):
+            return
+        text, ok = QInputDialog.getText(
+            self, "Join a mirror game",
+            "Host address (IP or Tailscale name), e.g. 192.168.1.42:7789")
+        if not ok or not text.strip():
+            return
+        host, _, pt = text.strip().partition(":")
+        port = int(pt) if pt.strip().isdigit() else 7789
+        if not self._ask_mirror_delay():
+            return
+        self._mirror_pending = "join"
+        self._start_net("join", host.strip(), port,
+                        cfg.tr(cfg.language(self._settings), "link_connecting")
+                        .format(addr=f"{host}:{port}"))
+
+    # ⚡ IN MIRROR MODE THE TWO CONSOLES ARE BUILT THE SAME WAY ON BOTH PCs, and that
+    # is not a detail -- it is the whole mode.
+    #
+    # ⛔ THE DESYNC THIS ENDS, caught by the shell test on its first run: the local
+    # console comes from PlayPage.start with the player's own settings (flash size,
+    # save mode, HLE or retail BIOS) and its clock set from THIS PC's wall clock, while
+    # the mirror was built with defaults. So player 1's console here and player 1's
+    # mirror over there were two different machines, and the checksum caught it at
+    # frame ZERO. Two rules fix it, both of them boring and both of them required:
+    #   * the mirror boots from the LOCAL console's cartridge image, byte for byte
+    #     (which carries the save with it), with the same console settings;
+    #   * both consoles are reset onto ONE agreed session clock, because "now" is a
+    #     different number on the two PCs and the BIOS copies it into RAM at boot.
+    # A game that shows the date will show the session clock. That is the price, it is
+    # visible, and it is smaller than a match that silently drifts apart.
+    MIRROR_CLOCK = (0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x04)   # 2000-01-01 00:00:00
+
+    def _one_link_at_a_time(self, want_mirror: bool) -> bool:
+        """True (and says so) when another kind of link is already attached.
+
+        ⛔ The two modes drive the SAME console two different ways: the cable relays its
+        serial FIFO to a peer, the mirror runs a second console here and owns the pad
+        byte. Both at once means two relays fighting over one FIFO and two writers of
+        one controller port -- so the second one asked for is refused, plainly, instead
+        of half-attaching.
+        """
+        p = self.play
+        mirrored = p._mirror is not None
+        cabled = p._link_peer is not None or p._net_link is not None
+        if (want_mirror and cabled) or (not want_mirror and mirrored):
+            p._flash(cfg.tr(cfg.language(self._settings), "link_busy"))
+            return True
+        return False
+
+    def _ask_mirror_delay(self) -> bool:
+        """How many frames of input delay to cover the round trip.
+
+        BOTH PLAYERS MUST TYPE THE SAME NUMBER -- the delay decides which frame an
+        input is played on, so two different values are two different matches and the
+        handshake refuses them. Roughly: ping in ms / 17, plus one.
+        """
+        d, ok = QInputDialog.getInt(
+            self, "Mirror play",
+            "Input delay in frames (BOTH players must use the same number).\n"
+            "About ping-in-ms / 17, plus one:", cfg.mirror_delay(self._settings),
+            0, 30)
+        if ok:
+            self._settings.setValue("online/mirror_delay", int(d))
+        return bool(ok)
+
+    def _mirror_handshake(self, host: bool):
+        """The fingerprint both PCs must agree on, and our own cartridge's.
+
+        The cartridge is ANNOUNCED, not compared: the images are traded (see
+        core.netplay.CartExchange), because requiring the same one meant requiring the
+        same SAVE, and two players almost never have that. What still has to match is
+        what decides how the code RUNS.
+        """
+        import hashlib
+        from core.netplay import Handshake
+
+        page = self.play
+        bios = page._bios_path()
+        bios_hash = (hashlib.sha1(Path(bios).read_bytes()).hexdigest()[:16]
+                     if bios else "hle")
+        # The wait-state switch is a per-PC SETTING that changes how fast the code
+        # runs, so it belongs in the fingerprint: two players on different sides of
+        # that toggle would drift, and drift is what the handshake exists to refuse.
+        return Handshake(
+            rom_hash=hashlib.sha1(page.session._rom).hexdigest()[:16],
+            bios_hash=bios_hash,
+            core_version=(native.core_fingerprint()
+                          + ("+waits" if cfg.cart_wait_states(self._settings) else "")),
+            delay=cfg.mirror_delay(self._settings), host=host)
+
+    def _begin_mirror(self, sock, host: bool) -> None:
+        """Trade cartridges with the peer, then start the mirror session.
+
+        ⚡ TWO PHASES, AND THE FIRST ONE IS WHY THE MODE IS USABLE AT ALL. Building the
+        mirror from the LOCAL cartridge forced both players to hold the same image --
+        and a save lives inside the image, so it forced the same SAVE. It also barred
+        SNK-versus-Capcom in Card Fighters' Clash, which is the reason that game has a
+        link. So each side sends its own image and builds the peer's console from the
+        one it receives. A few MiB, once, with progress on screen.
+        """
+        from core.netplay import CartExchange, SocketPipe
+
+        page = self.play
+        if page.machine is None or page.session is None or page._rom_path is None:
+            try: sock.close()
+            except OSError: pass
+            return
+        pipe = SocketPipe(sock)
+        self._mirror_boot = CartExchange(pipe, page.session._rom,
+                                         self._mirror_handshake(host))
+        self._mirror_boot_host = host
+        page._flash(cfg.tr(cfg.language(self._settings), "mirror_trading"), 60_000)
+        self._mirror_timer = QTimer(self)
+        self._mirror_timer.timeout.connect(self._pump_mirror_bringup)
+        self._mirror_timer.start(16)
+
+    def _pump_mirror_bringup(self) -> None:
+        """Drive the cartridge trade, then hand over to the session."""
+        x = self._mirror_boot
+        if x is None:
+            return
+        for _ in range(8):          # a few chunks per tick: a 4 MiB cart is ~128 of them
+            x.pump()
+            if x.done or x.failed:
+                break
+        lang = cfg.language(self._settings)
+        if x.failed:
+            self._end_mirror_bringup()
+            self.play._flash(cfg.tr(lang, "mirror_refused").format(why=x.failed))
+            return
+        if not x.done:
+            up, down = x.progress
+            self.play.overlay.setText(
+                cfg.tr(lang, "mirror_trading_pct").format(pct=int(min(up, down) * 100)))
+            return
+        peer_image, prime = x.peer_image, x.leftover
+        pipe, hs = x.pipe, x.hs
+        self._end_mirror_bringup()
+        self._start_mirror(pipe, hs, peer_image, prime)
+
+    def _end_mirror_bringup(self) -> None:
+        if self._mirror_timer is not None:
+            self._mirror_timer.stop(); self._mirror_timer = None
+        self._mirror_boot = None
+
+    def _start_mirror(self, pipe, hs, peer_image: bytes, prime: bytes) -> None:
+        from core.link import InProcessLink
+        from core.netplay import MirrorSession
+
+        page = self.play
+        if page.machine is None or page.session is None or page._rom_path is None:
+            return
+        # The mirror is a session like any other, minus the two things a copy of
+        # somebody else's console must not have: it never writes a save, and it has no
+        # window -- nobody watches it, it exists so the cable has something to talk to.
+        # ⚡ Its cartridge is the one the PEER sent, save and all.
+        peer = NativeSession(
+            page._rom_path, rom_bytes=peer_image, autosave=False,
+            bios_path=page._bios_path(), real_bios=page._real_bios,
+            save_to_rom=False, sidecar=False,
+            # ⛔ Sized from the IMAGE, not from this PC's flash setting. The setting is
+            # per-player; sizing the peer's console by it would build a different
+            # machine on each side of the same match.
+            flash_size=cfg.flash_capacity_bytes(self._settings, len(peer_image)),
+            k1ge_console=page._mono_console(),
+            language=cfg.cart_language(self._settings),
+            hle_bios=resolve_selected_bios(self._settings)[1] == cfg.BIOS_USE_HLE)
+        # ⚡ AND THE SAME TIMING. PlayPage.start tunes its machine AFTER building it
+        # (silicon-calibrated cart wait-states); a mirror built without them executes
+        # the same code at a different speed, which is a desync inside one frame --
+        # measured, the two copies parted company on the very first one.
+        if cfg.cart_wait_states(self._settings):
+            peer.machine.set_cart_wait(cfg.CART_FETCH_WAIT)
+            peer.machine.set_cart_data_wait(cfg.CART_DATA_WAIT)
+            peer.machine.set_ldir_cost(cfg.CART_LDIR_COST)
+        clock = native.RtcState(1, *self.MIRROR_CLOCK)
+        for m in (page.machine, peer.machine):
+            m.set_rtc(clock)
+            m.serial_set_enabled(True)      # the cable is in before either boots
+            m.reset(real_bios=page._real_bios, bios_handoff=not page._real_bios)
+        # A console that has just been power-cycled needs the page's own boot
+        # bookkeeping cleared with it -- the same things _do_reset clears. Skipping it
+        # left the BIOS hand-off assist thinking it had already run, on the console-boot
+        # path; and a reset clears the core's breakpoints, so they are re-armed.
+        page._frame = 0
+        page._did_handoff = False
+        page._bios_frames = 0
+        page._menu_ticks = 0
+        page._crashed = False
+        page._power_pressed = False
+        page.watches.rearm()
+        page.apply_debug()
+        link = InProcessLink(page.machine, peer.machine)
+        session = MirrorSession(page.machine, peer.machine, link, pipe, hs, prime)
+        page.attach_mirror(session, peer)
+        self._net_status = QTimer(self)
+        self._net_status.timeout.connect(
+            lambda: self.setWindowTitle(
+                f"NgpCraft — mirror ⇄  {session.frames_run} frames, "
+                f"{session.stalls} waits"))
+        self._net_status.start(500)
+
+    def _on_mirror_ended(self, why: str) -> None:
+        self._end_mirror_bringup()      # a trade still running belongs to this session
+        self.play.detach_mirror()
+        if self._net_status is not None:
+            self._net_status.stop(); self._net_status = None
+
     def _on_net_failed(self, msg: str) -> None:
+        # ⛔ CLEAR THE MODE FLAG. Left set by a mirror attempt that timed out, the next
+        # ordinary Host/Join would silently start a MIRROR session instead of a cable.
+        self._mirror_pending = None
         self.play.overlay.setText(
             cfg.tr(cfg.language(self._settings), "link_failed").format(why=msg))
 
     def _open_lobby(self) -> None:
-        if self.play.machine is None:
+        if self.play.machine is None or self._one_link_at_a_time(False):
             return
         from ngpc_lobby import LobbyDialog
         game = self.play._rom_path.stem if self.play._rom_path else "?"
@@ -4883,6 +5423,7 @@ class Shell(QMainWindow):
         self._debug_win.attach(self.play)     # may be None -> "no game running"
         self._debug_win.show(); self._debug_win.raise_()
         self._debug_win.activateWindow()
+        stamp_taskbar_icon(self._debug_win)   # its own button, so its own icon
 
     def _to_library(self) -> None:
         if self._link2p is not None:              # tear down 2-player first
@@ -4987,6 +5528,9 @@ def claim_taskbar_identity(frozen: bool, platform: str) -> str | None:
         not ours and would pool this app with every other Python GUI. There the
         explicit id is still the lesser evil, so keep it.
 
+    📌 AND THAT WAS STILL NOT THE WHOLE BUG: the button also needs an icon it can reach
+    without a shortcut existing. That is the other half, see taskbar_window_props below.
+
     Non-Windows platforms have no such concept; the caller no-ops there.
     """
     if platform != "win32":
@@ -5005,6 +5549,203 @@ def _claim_windows_taskbar_identity() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# The taskbar BUTTON's own icon (Windows 11)
+#
+# ⛔ THE BUG THIS FIXES, AND WHY THE 2026-07-28 ROUND WAS NOT ENOUGH. "l'icone ne
+# s'affiche pas bien chez certains utilisateurs sous Windows 11 dans la barre du bas
+# [...] l'icone devient correcte s'il la pin a la barre d'application" -- 2026-07-30,
+# on ANOTHER user's machine, where the .exe's icon in Explorer is CORRECT. So icon
+# extraction from the binary works there: the file has the picture, the button does
+# not. Measured healthy again from here: the .ico carries all nine sizes 16..256, and
+# the shipped .exe carries RT_GROUP_ICON #1 plus all nine RT_ICONs, every one readable.
+#
+# ⚖️ "Pinning fixes it" is the whole diagnosis. A taskbar button gets its picture from
+# the SHELL ITEM its identity resolves to -- a shortcut. A portable .exe that no
+# installer ever registered has no shortcut anywhere, so on a machine that happens to
+# have one (a pin, a desktop shortcut -- the developer's machine always does) the button
+# looks right, and on a clean machine it falls back to the generic icon. Pinning is the
+# act of creating the missing shortcut, which is why it fixes it, and fixes it for good.
+# Claiming no AppUserModelID (2026-07-28) removed a WRONG identity but could not conjure
+# the shortcut the right one still needs.
+#
+# 🎯 So stop depending on a shortcut existing. Windows lets a window carry its own
+# relaunch info, and RelaunchIconResource is exactly "the icon this button must use":
+# the shell reads it off the window's property store instead of hunting for a shell
+# item, and it is also what the shortcut gets baked with if the user does pin later.
+# Three properties, because the shell documents them as one set (icon alone is ignored).
+#
+# This is strictly ADDITIVE: it hands the button an icon source where it had none, and
+# leaves claim_taskbar_identity's decision -- and the .exe's own identity, which is the
+# fallback if any of this fails -- exactly as they are.
+# ---------------------------------------------------------------------------
+TASKBAR_RELAUNCH_NAME = "NgpCraft Emulator"
+
+# {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, the shell's AppUserModel property set.
+_PK_RELAUNCH_COMMAND = 2
+_PK_RELAUNCH_ICON = 3
+_PK_RELAUNCH_NAME = 4
+
+
+def taskbar_window_props(exe: str, script: str, icon: str | None,
+                         frozen: bool, platform: str) -> dict[str, str] | None:
+    """The relaunch properties to stamp on our top-level windows, or None to stamp none.
+
+    Pure on purpose -- the values are the whole correctness of this fix, and they must be
+    checkable without a Windows message loop. An icon reference is "<file>,<index>"; the
+    two builds do NOT point it at the same file:
+
+      * frozen (.exe) -- the executable itself, whose embedded resource IS our icon
+        (spec: icon=assets/icone_ngpcraft.ico). One file, no way for it to go missing.
+      * from source    -- the executable is python.exe and its icon is not ours, so the
+        reference must be the .ico we ship. Without a bundled icon there is nothing
+        honest to point at, so stamp nothing rather than a path that resolves to junk.
+    """
+    if platform != "win32":
+        return None
+    if frozen:
+        icon_ref = f"{exe},0"
+        command = f'"{exe}"'
+    else:
+        if not icon:
+            return None
+        icon_ref = f"{icon},0"
+        command = f'"{exe}" "{script}"'
+    return {"RelaunchIconResource": icon_ref,
+            "RelaunchCommand": command,
+            "RelaunchDisplayNameResource": TASKBAR_RELAUNCH_NAME}
+
+
+def _current_taskbar_window_props() -> dict[str, str] | None:
+    return taskbar_window_props(
+        exe=sys.executable,
+        script=str(Path(__file__).resolve()),
+        icon=str(APP_ICON) if APP_ICON.is_file() else None,
+        frozen=bool(getattr(sys, "frozen", False)),
+        platform=sys.platform,
+    )
+
+
+class _PROPERTYKEY(ctypes.Structure):
+    class _GUID(ctypes.Structure):
+        _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort),
+                    ("d3", ctypes.c_ushort), ("d4", ctypes.c_ubyte * 8)]
+    _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_ulong)]
+
+
+class _PROPVARIANT(ctypes.Structure):
+    # 24 bytes on x64: the union starts at offset 8, and we only ever use VT_LPWSTR.
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ubyte), ("r2", ctypes.c_ubyte),
+                ("r3", ctypes.c_ulong), ("pwsz", ctypes.c_wchar_p),
+                ("tail", ctypes.c_ulonglong)]
+
+
+_VT_LPWSTR = 31
+_APP_USER_MODEL_FMTID = (0x9F4C2855, 0x9F79, 0x4B39,
+                         (0xA8, 0xD0, 0xE1, 0xD4, 0x2D, 0xE1, 0xD5, 0xF3))
+_IID_IPROPERTYSTORE = (0x886D8EEB, 0x8CF2, 0x4446,
+                       (0x8D, 0x02, 0xCD, 0xBA, 0x1D, 0xBD, 0xCF, 0x99))
+_PROP_PIDS = {"RelaunchCommand": _PK_RELAUNCH_COMMAND,
+              "RelaunchIconResource": _PK_RELAUNCH_ICON,
+              "RelaunchDisplayNameResource": _PK_RELAUNCH_NAME}
+
+
+def _guid(spec) -> "_PROPERTYKEY._GUID":
+    d1, d2, d3, d4 = spec
+    return _PROPERTYKEY._GUID(d1, d2, d3, (ctypes.c_ubyte * 8)(*d4))
+
+
+def _window_property_store(hwnd: int):
+    """(store pointer, vtable) for a live top-level window, or (None, None)."""
+    iid = _guid(_IID_IPROPERTYSTORE)
+    store = ctypes.c_void_p()
+    shell32 = ctypes.windll.shell32
+    shell32.SHGetPropertyStoreForWindow.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(_PROPERTYKEY._GUID), ctypes.POINTER(ctypes.c_void_p)]
+    shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+    if shell32.SHGetPropertyStoreForWindow(
+            ctypes.c_void_p(hwnd), ctypes.byref(iid), ctypes.byref(store)) < 0:
+        return None, None
+    vtbl = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+    return store, vtbl
+
+
+def _com_call(vtbl, slot: int, *argtypes):
+    proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)
+    return proto(vtbl[slot])
+
+
+def stamp_window_taskbar_props(hwnd: int, props: dict[str, str] | None = None) -> bool:
+    """Give this window's taskbar button its own icon. True if the shell took every value.
+
+    Best-effort by contract: every failure path leaves the button exactly where it was
+    (on the .exe's identity), so this can never make the icon worse than before.
+    """
+    if sys.platform != "win32" or not hwnd:
+        return False
+    if props is None:
+        props = _current_taskbar_window_props()
+    if not props:
+        return False
+    store = None
+    try:
+        store, vtbl = _window_property_store(hwnd)
+        if store is None:
+            return False
+        # IPropertyStore: 3 GetCount, 4 GetAt, 5 GetValue, 6 SetValue, 7 Commit.
+        set_value = _com_call(vtbl, 6, ctypes.POINTER(_PROPERTYKEY),
+                             ctypes.POINTER(_PROPVARIANT))
+        commit = _com_call(vtbl, 7)
+        ok = True
+        for name, value in props.items():
+            key = _PROPERTYKEY(_guid(_APP_USER_MODEL_FMTID), _PROP_PIDS[name])
+            var = _PROPVARIANT(_VT_LPWSTR, 0, 0, 0, value, 0)
+            ok = set_value(store, ctypes.byref(key), ctypes.byref(var)) >= 0 and ok
+        return commit(store) >= 0 and ok
+    except Exception:
+        return False
+    finally:
+        if store:
+            try:
+                _com_call(ctypes.cast(store, ctypes.POINTER(
+                    ctypes.POINTER(ctypes.c_void_p)))[0], 2)(store)
+            except Exception:
+                pass
+
+
+def read_window_taskbar_props(hwnd: int) -> dict[str, str]:
+    """What the shell now holds for this window -- the read-back the runtime gate needs."""
+    if sys.platform != "win32" or not hwnd:
+        return {}
+    store, vtbl = _window_property_store(hwnd)
+    if store is None:
+        return {}
+    try:
+        get_value = _com_call(vtbl, 5, ctypes.POINTER(_PROPERTYKEY),
+                             ctypes.POINTER(_PROPVARIANT))
+        out: dict[str, str] = {}
+        for name, pid in _PROP_PIDS.items():
+            key = _PROPERTYKEY(_guid(_APP_USER_MODEL_FMTID), pid)
+            var = _PROPVARIANT()
+            if get_value(store, ctypes.byref(key), ctypes.byref(var)) >= 0 \
+                    and var.vt == _VT_LPWSTR and var.pwsz:
+                out[name] = var.pwsz
+        return out
+    finally:
+        try:
+            _com_call(vtbl, 2)(store)
+        except Exception:
+            pass
+
+
+def stamp_taskbar_icon(win) -> bool:
+    """Stamp a Qt top-level window. Call it AFTER show(): winId must be a real HWND."""
+    try:
+        return stamp_window_taskbar_props(int(win.winId()))
+    except Exception:
+        return False
+
+
 def main() -> int:
     app = QApplication(sys.argv[:1])
     if APP_ICON.is_file():
@@ -5013,6 +5754,9 @@ def main() -> int:
     rom = sys.argv[1] if len(sys.argv) > 1 else None
     shell = Shell(rom)
     shell.show()
+    # AFTER show(): the property store needs a real HWND, which winId only has once the
+    # window exists. This is what puts our picture on the taskbar button (see above).
+    stamp_taskbar_icon(shell)
     return app.exec()
 
 

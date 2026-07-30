@@ -337,6 +337,17 @@ def cart_language(s: QSettings) -> int:
     return CART_LANG_JA if int(v) == CART_LANG_JA else CART_LANG_EN
 
 
+def mirror_delay(s: QSettings) -> int:
+    """Frames of input delay for mirror netplay (core/netplay.py).
+
+    It has to cover the round trip: an input that has not arrived stalls both sides for
+    that frame, so too small is stutter and too large is sluggish controls. Three frames
+    (~50 ms) suits a decent connection; a player on a slower link raises it rather than
+    putting up with the stutter.
+    """
+    return max(0, min(30, s.value("online/mirror_delay", 3, type=int)))
+
+
 REWIND_CHOICES = (0, 10, 20, 30)          # seconds of history the UI offers
 
 

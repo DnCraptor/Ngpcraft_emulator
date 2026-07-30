@@ -301,6 +301,14 @@ class ShellSaveLoadPathTests(unittest.TestCase):
             save_state = P.save_state
             load_state = P.load_state
 
+            # ⚡ This double borrows the REAL save_state/load_state, so it has to carry
+            # every attribute they read. `_mirror` is one of them now: mirror netplay
+            # refuses a savestate, because restoring THIS console alone would put the
+            # two PCs in different states (see PlayPage._mirror_blocks). None = not in a
+            # mirror session, which is what this test is.
+            _mirror = None
+            _mirror_blocks = P._mirror_blocks
+
             def __init__(self):
                 self._rewind = []
                 self._rw_pos = None

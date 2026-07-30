@@ -619,6 +619,20 @@ class NativeSession:
         else:
             self.machine.reset(bios_handoff=True)
             self.machine.set_rtc(clock)               # after: the warm-up would wipe it
+            # ⛔ AND THE CONSOLE'S OWN SETTINGS PAGE, exactly as __init__ does after the
+            # same reset. Without it a power cycle quietly forgets the language, and a
+            # dual-language SNK cartridge comes back up in JAPANESE.
+            #
+            # It stayed unnoticed while the only way here was the reset button. Then the
+            # link button started power-cycling player 1 (so a game that probes the cable
+            # at boot can find its peer) -- and two-player play began showing one window
+            # in the chosen language and the other in Japanese, because player 2 was a
+            # FRESH session, which does restore the page, and player 1 was a rebooted one,
+            # which did not. Reported by a player, diffed byte by byte: 25 bytes of the
+            # BIOS page differed between the two consoles, 0x6DC8.. still at 0xFF on the
+            # rebooted side.
+            self._restore_bios_settings_page()
+            self._apply_bios_colour_theme()
 
         for base, data in cartridge:
             self.machine.flash_restore(base, data)

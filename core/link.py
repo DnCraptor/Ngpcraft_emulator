@@ -136,6 +136,7 @@ class TcpLink:
         self.monitor = monitor
         self.machine.serial_set_enabled(True)
         self._rx = bytearray()
+        self._out = bytearray()     # written but not yet accepted by the kernel
         self.bytes_out = 0
         self.bytes_in = 0
         # ⚡ WHY THE PEER WENT AWAY, once it has -- and None while the cable is good.
@@ -199,15 +200,24 @@ class TcpLink:
                 break
             buf += data
         outgoing = self.monitor.on_tx(bytes(buf)) if self.monitor is not None else bytes(buf)
-        if outgoing:
+        self._out += outgoing
+        if self._out:
+            # ⛔ NOT `sendall` ON A NON-BLOCKING SOCKET. It raises BlockingIOError the
+            # moment the kernel buffer fills and does NOT say how much of the buffer it
+            # already handed over -- so the old code dropped the whole write, mid-stream,
+            # and a link cable that loses bytes is a game that desyncs or hangs waiting
+            # for a packet that was never sent. (core/lobby.py fixed exactly this on the
+            # lobby socket; the direct host/join socket still had it.)
+            #
+            # `send` reports what it took. Keep the rest and offer it again next pump --
+            # the frame is relayed several times now (PlayPage._run_one_frame), so a full
+            # buffer costs a fraction of a frame, not a byte.
             try:
-                self.sock.sendall(outgoing)
-                self.bytes_out += len(outgoing)
+                sent = self.sock.send(self._out)
+                self.bytes_out += sent
+                del self._out[:sent]
             except (BlockingIOError, InterruptedError):
-                # kernel buffer full; the bytes are lost for this simple relay.
-                # A production link would queue them -- fine for frame-rate,
-                # low-volume link traffic. NOT a lost peer: this is "try again".
-                pass
+                pass                # buffer full: nothing taken, nothing lost, try again
             except OSError as e:
                 # ...whereas this family IS the peer going away. Note it and stop.
                 self._lose(str(e))

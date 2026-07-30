@@ -58,8 +58,9 @@ is a feature you can run yourself — see [ROM analysis](#rom-analysis).
   yet — see [Known issues](#known-issues).*
 - **Two players & link cable** — the NGPC link cable is emulated end to end: play two
   consoles **on one PC** (a second window), over your **LAN**, or **online** (a built-in
-  lobby, or share a direct address). Each player has their own controls. See
-  [Two players & link](#two-players--link-cable).
+  lobby, or share a direct address). Each player has their own controls. And when the ping
+  is what hurts, **🪞 mirror mode** keeps the match at full speed by sending only the
+  controller bytes. See [Two players & link](#two-players--link-cable).
 - **Fully remappable** — console buttons *and* every in-game hotkey, with a warning when
   a binding would collide. The console buttons are bound **on a picture of the console**:
   each field sits next to the button it drives, so you pick the D-pad's *left* rather than
@@ -286,6 +287,14 @@ throw them away — re-rendering a real collection means booting every game in i
 work for a picture that differs by a shade. When you do want them redone, the Library's
 **↻ Covers** button does the whole library, and asks first. A game that never reaches a
 real screen is left uncovered and retried next launch, so a blank frame is never cached.
+
+**Zipped collections show every game they hold.** ROMs are usually shipped zipped, and an
+archive often holds more than one cartridge. Each game inside gets its own card, its own
+save, its own savestates and its own cover — before, a collection quietly booted whichever
+member happened to be the largest, and all of them would have shared one save file. `.zip`
+works everywhere; `.7z` needs either the `py7zr` package or 7-Zip installed. Opening a
+collection by hand asks which game you want. (An archive holding a *single* game is
+untouched, so nothing in an existing library is renamed.)
 
 **Two cards that look like the same game are two files.** Card titles drop the usual dump
 tags — `Faselei! (Europe)` reads *Faselei!* — so two dumps of one game used to print the same
@@ -545,6 +554,17 @@ player toolbar's **🔗** button:
   be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
   The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
   the risks of opening a port** honestly.
+- **🪞 Mirror play — host / join** — the *other* online mode, for when your ping is the
+  problem. Instead of sending the cable's bytes, each PC runs **both** consoles and only
+  the **controller bytes** cross the network, so the cable is local and the delay is spent
+  on slightly late controls rather than on the speed of the game. Both players type the
+  **same input delay** (roughly ping-in-ms / 17, plus one). The two consoles swap their
+  cartridges when the session opens — a few MiB, once, with progress on screen — so you
+  may hold **different games and different saves**, exactly like two people with two
+  cartridges. What must match is the **BIOS and the emulator build**, because those
+  decide how the code runs; it refuses to start otherwise, since a mismatch does not
+  fail loudly, it drifts. Savestates, rewind and reset are refused during a mirror match
+  for the same reason.
 
 Both players must run a **compatible game** (same title), exactly like real hardware.
 
@@ -558,9 +578,26 @@ the emulator is not slow, the game is waiting.
 So the transport adds as little as it can: the network thread is woken the moment a byte is
 handed to it rather than on a timer, and the relay server sends small packets immediately
 instead of grouping them. Measured on a local connection, a relayed byte crosses in **0.1 ms**
-where it used to take **31 ms**. What is left is your real ping, plus one frame at each end
-(the cable is pumped once per frame). On a LAN it is indistinguishable from a cable; across a
-continent it runs at the pace your ping allows.
+where it used to take **31 ms**. What is left is your real ping. On a LAN it is
+indistinguishable from a cable; across a continent it runs at the pace your ping allows.
+
+That last part is not a bug we can fix in the transport — it is what a blocking byte pipe
+costs — so there is a **second mode that changes the deal**. Measured on the same Fatal Fury
+link match, counting the game's own logic updates per frame:
+
+| your round trip | cable relayed | 🪞 mirror |
+|---|---|---|
+| 0 ms | 0.97 | 0.97 |
+| 33 ms | 0.78 | **0.97** |
+| 67 ms | 0.56 | **0.97** |
+| 134 ms | 0.35 | **0.97** |
+| 267 ms | 0.21 | **0.97** |
+
+In mirror play the speed stops depending on your ping; what you feel instead is your
+controls arriving a few frames late, and an input that has not arrived yet briefly pausing
+both sides. Pick the cable mode when your connection is good or your saves differ, and
+mirror play when the ping is what is hurting. Details in
+[`specs/NETPLAY_MIRROR.md`](specs/NETPLAY_MIRROR.md).
 
 If a game refuses to see the other console, the debugger's [**Link** tab](#link--watch-the-cable-poke-it-break-it)
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the

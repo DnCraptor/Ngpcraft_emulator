@@ -610,6 +610,25 @@ def available() -> bool:
         return False
 
 
+def core_fingerprint(path: Path | None = None) -> str:
+    """Identify THIS BUILD of the core, for anything that compares two of them.
+
+    Mirror netplay (core/netplay.py) simulates the same two consoles on two PCs and
+    relies on them agreeing bit for bit, so a core built with different timing at the
+    other end is a desync waiting to happen -- and one that shows up mid-match as
+    drift, not as an error. The ABI number does not move for a timing fix, so the
+    file's own bytes are what answers "is that the same core as mine".
+    """
+    import hashlib
+
+    dll = path or _DEFAULT_DLL
+    try:
+        digest = hashlib.sha1(Path(dll).read_bytes()).hexdigest()[:16]
+    except OSError:
+        digest = "unknown"
+    return f"{ABI_VERSION}:{digest}"
+
+
 def _buf(data: bytes) -> "ctypes.Array[c_uint8]":
     return (c_uint8 * len(data)).from_buffer_copy(data)
 
