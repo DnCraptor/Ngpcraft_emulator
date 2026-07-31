@@ -48,6 +48,24 @@ in-process `InProcessLink` with no latency, and the network carries only each pl
 is spent on input lag instead of on speed. This is how every other emulator does
 netplay.
 
+**The local cable is stepped like a cable, not a frame at a time.** `MirrorSession.step`
+used to run `first.run_frames(1); pump; second.run_frames(1); pump`, which freezes one
+console for the whole of the other's frame — a frame of latency on every answer, in one
+direction, which is exactly what this mode exists to avoid. It now calls
+`core.link.run_two_consoles_interleaved` (shared with the shell's local 2-player cable).
+Deterministic by construction: a fixed slice, a fixed order, the same code on both PCs —
+and **which console runs first still matters** for the reason in §4.
+
+Measured through a mirror of a Card Fighters' Clash VS match, everything else equal:
+
+| mirror cable schedule | bytes | screen |
+|---|---|---|
+| a whole frame each | 118/102 | its **LINK ERROR** |
+| interleaved | **610/617** | **a card match in progress, both PCs identical** |
+
+That game is the reason this matters: its VS handshake gives up on latency the cable
+mode cannot avoid, so mirror play is the only way to play it online.
+
 ## 2. Why it is sound — measured before it was written
 
 - **Determinism.** A full link match (menus plus 300 frames of fighting with varied
@@ -152,18 +170,46 @@ controller port.
 The debugger's Link tab tap is handed to the mirror's in-process cable
 (`set_link_monitor`), or it would read zero bytes on a busy cable.
 
+## 7b. Reaching it: direct address **or the lobby**
+
+Two ways in, and they end in the same session:
+
+- **Direct** — host on a port / join `host:port`. `Shell._host_mirror` / `_join_mirror`.
+- **Lobby** — the same rooms, pairing and NAT traversal the cable mode uses. The relay
+  carries opaque bytes, so it carries either protocol; what the two clients must agree
+  on is what those bytes MEAN, and only the host chose. So a room advertises **`mode`**
+  (`cable` / `mirror`; absent means cable, which is what an older client's room says)
+  and, for a mirror, the **`delay`** — the input delay must be identical on both PCs, so
+  **the joiner adopts the host's** rather than its own setting. The listing shows 🔗 or
+  🪞 per room.
+
+`core.lobby.LobbyPipe` presents the relay as a `Pipe`. It carries `lost` because the
+lobby loses a peer through a **Qt signal**, not a socket error, and a session never told
+would sit at "waiting for the other player" for ever. `Shell._begin_mirror` therefore
+takes a **pipe**, not a socket, and `_close_pipe()` releases whatever that pipe owns —
+a socket, or a room to leave plus a client thread to stop. An abandoned or failed
+cartridge trade closes it too (`_end_mirror_bringup(close=True)`); the one caller that
+hands the pipe straight to the session passes `close=False`.
+
 ## 8. Limits, stated plainly
 
 Same BIOS and same build on both sides (the cartridges may differ, and each player's
 save rides along inside their image) · the session starts
 from power-on, nobody joins a match in progress · an input that has not arrived stalls
 BOTH sides for that frame (this is what a rollback layer would remove) · the local
-2-player mode gains nothing, it is already at full speed.
+2-player mode gains nothing, it is already at full speed · the **console schedule is in
+the handshake fingerprint** (`+ilv<slice>`), because `core_fingerprint()` hashes the DLL
+and would not move for a change to how Python steps the pair · the lobby's `mode` field
+needs the **server redeployed**; without it every room reads as a cable room.
 
 ## 9. Validation
 
-`tests/test_netplay_mirror.py` — 18 test functions, 20 cases with parametrisation: the session logic against a list-based
-pipe (no ROM needed), **four real consoles** (two PCs' worth of session, the probe ROM,
-a delayed wire) proving both PCs stay byte-identical while every frame still runs, and
-the **real `Shell`** in mirror mode over a real socket. Every behavioural fix in this
+`tests/test_netplay_mirror.py` — 22 test functions, 24 cases with parametrisation: the
+session logic against a list-based pipe (no ROM needed), **four real consoles** (two
+PCs' worth of session, the probe ROM, a delayed wire) proving both PCs stay
+byte-identical while every frame still runs, the **real `Shell`** in mirror mode over a
+real socket, the cable being stepped a slice at a time rather than a frame (with the
+test doubles as the control group), and a lobby room starting the link it advertised
+(with a room that advertises none as the control). The room protocol itself is proved
+against the **real server** in `tests/test_lobby.py`. Every behavioural fix in this
 spec was checked by removing it and watching its test fail.

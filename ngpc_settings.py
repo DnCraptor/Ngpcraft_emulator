@@ -135,6 +135,107 @@ def set_portable(enabled: bool) -> None:
             src.sync()
 
 
+# --- keeping settings, whatever happens to the store ----------------------
+# Settings live in the Windows registry by default, which has no undo, no history
+# and nothing beside it saying what used to be there. One stray `clear()` -- a
+# script run outside the test suite's redirect, a botched uninstall, a registry
+# cleaner -- takes the BIOS path, the ROM folder, every key binding and every
+# preference with it, silently, and the app comes up looking like a fresh install.
+#
+# So the app keeps its OWN copy beside itself and puts it back when the store
+# comes up empty. Two rules are what make a backup trustworthy rather than a
+# second way to lose the data:
+#
+#   * an EMPTY store is never saved over a good copy -- backing up the damage is
+#     the classic way a backup destroys what it was meant to protect;
+#   * the previous generation is kept, so even one bad cycle leaves a way back.
+BACKUP_FILENAME = "settings_backup.ini"
+BACKUP_PREVIOUS = "settings_backup.prev.ini"
+
+# Window geometry and rail state are rewritten on every launch, including the
+# first one after a wipe. They are not evidence that settings exist, so they do
+# not count when deciding whether a store is worth saving or needs restoring.
+_COSMETIC_PREFIXES = ("win/",)
+
+
+def backup_path(previous: bool = False) -> Path:
+    name = BACKUP_PREVIOUS if previous else BACKUP_FILENAME
+    override = os.environ.get(SETTINGS_FILE_ENV)
+    if override:                    # tests (and portable mode) keep it together
+        return Path(override).with_name(name)
+    return _app_dir() / name
+
+
+def _real_keys(s: QSettings) -> list[str]:
+    return [k for k in s.allKeys()
+            if not any(k.startswith(p) for p in _COSMETIC_PREFIXES)]
+
+
+def backup_settings(s: QSettings) -> bool:
+    """Keep a copy of the current settings. True if one was written.
+
+    Refuses to save a store with nothing meaningful in it, so a wipe followed by a
+    launch cannot overwrite the copy that would have undone it. One real key is
+    enough to be worth keeping -- a user who has set only their BIOS path has
+    still set something, and the rotation below covers the rest.
+    """
+    if not _real_keys(s):
+        return False
+    path = backup_path()
+    try:
+        if path.exists():
+            prev = backup_path(previous=True)
+            prev.unlink(missing_ok=True)
+            path.replace(prev)
+        dst = QSettings(str(path), QSettings.Format.IniFormat)
+        for key in s.allKeys():
+            dst.setValue(key, s.value(key))
+        dst.sync()
+    except OSError:
+        return False
+    return True
+
+
+def restore_settings(s: QSettings) -> int:
+    """Put a backup back. Returns how many keys were restored (0 = nothing to do).
+
+    Only ever used on a store that has come up EMPTY: this recovers what was lost,
+    it never merges over settings someone is using.
+
+    ⚠️ Takes the RICHEST generation, not the newest. Launch once after a wipe and
+    the newest copy is of the damage -- a handful of keys the fresh start wrote --
+    while the one before it still holds everything. Restoring "the latest" would
+    hand back the emptier of the two.
+    """
+    best, best_keys = None, 0
+    for candidate in (backup_path(), backup_path(previous=True)):
+        if not candidate.is_file():
+            continue
+        src = QSettings(str(candidate), QSettings.Format.IniFormat)
+        count = len(_real_keys(src))
+        if count > best_keys:
+            best, best_keys = src, count
+    if best is None:
+        return 0
+    for key in best.allKeys():
+        s.setValue(key, best.value(key))
+    s.sync()
+    return best_keys
+
+
+def protect_settings(s: QSettings) -> int:
+    """Once at startup: restore if the store is empty, then back it up.
+
+    Returns the number of keys recovered so the caller can SAY so -- putting a
+    user's settings back without a word is nearly as confusing as losing them.
+    """
+    recovered = 0
+    if not _real_keys(s):
+        recovered = restore_settings(s)
+    backup_settings(s)
+    return recovered
+
+
 # --- typed accessors ------------------------------------------------------
 def rom_folder(s: QSettings) -> str:
     return s.value("paths/rom_folder", "", type=str)

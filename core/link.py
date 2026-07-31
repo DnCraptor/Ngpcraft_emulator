@@ -49,6 +49,57 @@ class _SerialMachine(Protocol):
 # never left stranded in the FIFO for a frame.
 _DRAIN_CHUNK = 256
 
+# ⚡ HOW OFTEN TWO CONSOLES IN ONE PROCESS MUST BE INTERLEAVED, in instructions.
+#
+# Running one console's whole frame while the other stands still puts a frame of
+# latency on the answer, in one direction, always -- and that is enough to lose Card
+# Fighters' Clash's VS handshake (its packet reader gives up when the next byte is not
+# already in the BIOS ring). Both places that own two consoles use this: the shell's
+# local 2-player cable (PlayPage.LINK_SLICE) and mirror netplay
+# (core.netplay.run_two_consoles_interleaved).
+#
+# ⚠️ THIS NUMBER IS A CORRECTNESS FIGURE, NOT A TUNING KNOB -- The Last Blade needs it
+# no coarser than 400 (2000 already fails it). See PlayPage.LINK_SLICE for that table.
+CABLE_SLICE = 400
+
+# A frame is a few thousand instructions, so this is a runaway backstop with a wide
+# margin, not a target: whatever happens, the caller finishes the frame the plain way.
+_MAX_SLICES = 256
+
+
+def run_two_consoles_interleaved(first, second, link) -> None:
+    """Advance both consoles by one frame, a slice at a time, relaying between slices.
+
+    `first` runs first within each slice round -- callers that must agree bit for bit
+    across two PCs (mirror netplay) have to pass the SAME console first on both.
+
+    Machines without the sliced `run` interface (test doubles) fall back to a whole
+    frame each, which is what this code did everywhere before.
+    """
+    if not hasattr(first, "run") or not hasattr(second, "run"):
+        first.run_frames(1)
+        link.pump()
+        second.run_frames(1)
+        link.pump()
+        return
+    pair = (first, second)
+    starts = [m.run(0, record=False)[0].frame_count for m in pair]
+    done = [False, False]
+    for _ in range(_MAX_SLICES):
+        for i, m in enumerate(pair):
+            if done[i]:
+                continue
+            summ, _ = m.run(CABLE_SLICE, record=False)
+            if summ.executed == 0 or summ.frame_count != starts[i]:
+                done[i] = True          # this console's frame is finished
+        link.pump()
+        if all(done):
+            return
+    for i, m in enumerate(pair):        # never leave a frame half-run
+        if not done[i]:
+            m.run_frames(1)
+    link.pump()
+
 
 class InProcessLink:
     """Cable between two machines living in the same process.

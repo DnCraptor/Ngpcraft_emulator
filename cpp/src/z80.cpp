@@ -886,6 +886,7 @@ void io_action_write(Machine& m, uint32_t address, uint8_t value) {
          * still holds it, harmlessly -- the RX read path returns serial_rx_byte.) */
         m.serial_tx_byte = value;
         m.serial_tx_busy = true;
+        m.serial_tx_shifting = false;   /* not on the wire yet: CTS may hold the START */
         m.serial_tx_cycles = kSerialByteCycles;
         ++m.serial_tx_count;      /* debugger: the game IS talking, even if held */
     }

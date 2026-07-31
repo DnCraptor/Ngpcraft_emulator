@@ -389,15 +389,37 @@ void Machine::serial_tick(uint32_t cycles) {
      * receive. Games that just blast bytes leave CTSE off / the peer's RTS low, so
      * nothing changes for them; Card Fighters' Clash relies on this gate to keep the
      * two consoles' handshake in step. Without it we completed every send instantly,
-     * one-sided, and CFC's mutual rendezvous never converged. */
+     * one-sided, and CFC's mutual rendezvous never converged.
+     *
+     * ⚡ CTS GATES THE START OF A BYTE, NEVER A BYTE ALREADY GOING OUT. The datasheet
+     * says it twice -- "when the CTS0 pin goes high, AFTER COMPLETION OF THE CURRENT
+     * DATA SEND, data send is halted", and Note 1 of fig 3.11(16): "if the CTS signal
+     * rises during transmission, the NEXT data is not sent after the completion of the
+     * current transmission". A shift register that has begun cannot be paused.
+     *
+     * ⛔ THE BUG THIS ENDS: this used to re-test CTS every tick and freeze the
+     * in-flight byte's countdown, so a peer that pulsed its RTS high for a fraction of
+     * a frame stalled a byte that hardware would have finished. MEASURED, Card
+     * Fighters' Clash at the HP exchange that starts a VS match: the peer raises RTS
+     * just as we start a packet, the sender is held 6001 ticks, a 26-byte packet drags
+     * over three frames instead of two, and the game gives up -- "LINK ERROR. CHECK
+     * CONNECTIONS AND SETTINGS." on one console while the other waits at "CHOOSING HP."
+     * for ever. That is the reported "both press A and nothing happens".
+     *
+     * It only became visible when the cable started being relayed every LINK_SLICE
+     * instructions (for The Last Blade): at one relay per frame the peer's RTS pulse
+     * fell between two samples and was never seen. So the finer relay did not break
+     * CFC -- it exposed a transmitter that was always wrong. */
     if (serial_tx_busy) {
         const bool ctse       = (mem[0x000052] & 0x40) != 0;  /* SC0MOD<CTSE> */
         const bool cts_blocks = ctse && serial_cts_high;      /* peer not ready */
-        if (!cts_blocks) {
+        if (serial_tx_shifting || !cts_blocks) {
+            serial_tx_shifting = true;     /* committed: this byte now always finishes */
             serial_tx_cycles -= int32_t(cycles);
             if (serial_tx_cycles <= 0) {
                 serial_tx.push_back(serial_tx_byte);
                 serial_tx_busy = false;
+                serial_tx_shifting = false;
                 irq_pending |= 1u << kIrqVectorSerialTransmit;
                 ++serial_wire_count;
                 ++serial_irq_tx_count;

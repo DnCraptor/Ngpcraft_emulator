@@ -27,6 +27,7 @@ WHAT IS ASSERTED, and each one fails without cpp/src/core.cpp's aux state:
 
 from __future__ import annotations
 
+import collections
 import ctypes
 import tempfile
 import unittest
@@ -290,6 +291,11 @@ class ShellSaveLoadPathTests(unittest.TestCase):
 
         P = ngpc_shell.PlayPage
 
+        class _StubBar:
+            visible = True
+
+            def setVisible(self, on): self.visible = bool(on)
+
         class _Page:      # the slice of PlayPage these methods touch -- the methods
             machine = m   # themselves are the SHELL'S OWN, borrowed, not re-written
             _rom_path = rom
@@ -310,9 +316,18 @@ class ShellSaveLoadPathTests(unittest.TestCase):
             _mirror_blocks = P._mirror_blocks
 
             def __init__(self):
+                # ...and `_prerun` likewise: loading a state drops the frames a link
+                # peer had run ahead for this console, because they describe the
+                # timeline being overwritten (see PlayPage._run_frame_interleaved).
+                self._prerun = collections.deque()
                 self._rewind = []
                 self._rw_pos = None
                 self.messages = []
+                # ...and the rewind strip: loading a state starts a new timeline,
+                # so the strip drawing the old one is put away. A stub, because
+                # this test is about the SAVESTATE -- but it has to be here, or
+                # the borrowed method reads an attribute that is not there.
+                self.rewind_bar = _StubBar()
 
             def _flash(self, msg): self.messages.append(msg)
             def _blit(self): pass

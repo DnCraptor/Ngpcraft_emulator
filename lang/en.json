@@ -299,5 +299,9 @@
   "lobby_password_ask": "Password:",
   "covers_regen": "↻ Covers",
   "covers_regen_tip": "Render every cover again. New games get a cover on their own — this is for redoing the ones you already have.",
-  "covers_regen_ask": "Render the covers of all {n} game(s) again?\n\nEach one is booted to capture a frame, so this takes a while on a large library. Covers you chose yourself are kept."
+  "covers_regen_ask": "Render the covers of all {n} game(s) again?\n\nEach one is booted to capture a frame, so this takes a while on a large library. Covers you chose yourself are kept.",
+  "lobby_mode_title": "Which link?",
+  "lobby_mode_ask": "🪞 Mirror play?\n\nYes — mirror: both consoles run on both PCs and only the buttons cross. Full speed whatever the ping, and the only mode Card Fighters' Clash's VS match survives. Needs the same BIOS and the same build on both sides.\n\nNo — cable: the console's own link cable, relayed. Works with any build, but the game waits for the network.",
+  "settings_restored_title": "Settings restored",
+  "settings_restored": "Your settings were missing from the system store and have been restored from the emulator's own backup ({n} restored).\n\nThe backup is kept beside the emulator as settings_backup.ini."
 }

@@ -219,6 +219,25 @@ found the same way under `ngp_bios.bin` / `ngp_bios.ngp` / `bios_ngp.bin`.
 > *you* supply. The only BIOS in the repository is `hle_bios/bios_hle.bin`, which is our own
 > clean-room image.
 
+### Your settings are backed up
+
+On Windows the emulator's own preferences live in the registry, which has no undo, no history
+and nothing beside it saying what used to be there. A single stray wipe — a botched uninstall,
+a "registry cleaner", a script run against the real store — takes the BIOS path, the ROM
+folder, every key binding and every preference, silently, and the app comes up looking like a
+fresh install.
+
+So it keeps **its own copy beside itself** (`settings_backup.ini`, plus the previous
+generation) and **puts it back automatically when the store comes up empty**, saying so once
+rather than restoring your preferences behind your back. Two rules make that a safety net
+instead of a second way to lose them: an **empty store is never saved over a good copy** —
+backing up the damage is the classic way a backup destroys what it was meant to protect — and a
+restore takes the **richest** generation, not the newest, because after a wipe the newest copy
+is of the damage.
+
+*(Prefer everything in one folder? **Portable mode** keeps settings in a `config.ini` next to
+the emulator instead, and the backup follows it there.)*
+
 ### Settings the CONSOLE owns
 
 Three things the console tells the cartridge, which the BIOS setup screens decide on real
@@ -547,15 +566,17 @@ player toolbar's **🔗** button:
   routed by player regardless of which window has focus.
 - **Online lobby…** — connect to a lobby server, set a nickname, and **create** or **join**
   a game (public, or private with a password). The list shows each game's title, server
-  name and creator. Needs a server — run the tiny one in [`server/`](server/README.md)
-  (pure stdlib, deploy free) or your own.
+  name and creator. When you create one you also pick **which link it is for** — the
+  cable, or 🪞 mirror play — and the list marks each room 🔗 or 🪞 so whoever joins starts
+  the same mode without being asked. Needs a server — run the tiny one in
+  [`server/`](server/README.md) (pure stdlib, deploy free) or your own.
 - **Host / Join (direct address)** — the simplest path: one player hosts on a port, the
   other dials `ip:port`. Works on a LAN directly; over the internet it needs the host to
   be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
   The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
   the risks of opening a port** honestly.
 - **🪞 Mirror play — host / join** — the *other* online mode, for when your ping is the
-  problem. Instead of sending the cable's bytes, each PC runs **both** consoles and only
+  problem (also reachable from the lobby above, as a 🪞 room). Instead of sending the cable's bytes, each PC runs **both** consoles and only
   the **controller bytes** cross the network, so the cable is local and the delay is spent
   on slightly late controls rather than on the speed of the game. Both players type the
   **same input delay** (roughly ping-in-ms / 17, plus one). The two consoles swap their
@@ -599,6 +620,12 @@ both sides. Pick the cable mode when your connection is good or your saves diffe
 mirror play when the ping is what is hurting. Details in
 [`specs/NETPLAY_MIRROR.md`](specs/NETPLAY_MIRROR.md).
 
+**Some games ask for more than speed.** *SNK vs. Capcom — Card Fighters' Clash* checks
+for the next byte of a packet the moment it wants it and gives up if it is not there
+yet, so its VS match wants a round trip well under ~120 ms on the cable mode and simply
+refuses a slow one ("LINK ERROR. CHECK CONNECTIONS AND SETTINGS."). Play it on a 🪞
+mirror room and the question does not arise: that cable is local.
+
 If a game refuses to see the other console, the debugger's [**Link** tab](#link--watch-the-cable-poke-it-break-it)
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the
 serial path with **one** console, so you can test without a partner.
@@ -606,7 +633,25 @@ serial path with **one** console, so you can test without a partner.
 ## Debugging (F1)
 
 Built for people writing NGPC games by hand. Everything below is saved **per ROM**, so
-your map of a game survives across sessions.
+your map of a game survives across sessions. The contracts behind these panels — and the
+claims they are deliberately *not* allowed to make — are in
+[`specs/DEBUG_TOOLS.md`](specs/DEBUG_TOOLS.md).
+
+The 27 panels sit on **two rows** — a category on top (CPU · Memory · Video · Audio ·
+Analysis · ROM · Link), its panels underneath. One row stopped working somewhere around
+twenty: Qt then either shrinks every label past reading or hides half of them behind scroll
+arrows, and a tool whose tabs you cannot see is a tool you stop opening. The grouping is by
+*what you are looking at* — chasing a graphics fault puts the palette, the tiles, the map and
+the raster timeline side by side — and nothing outside the tab bar knows about it, so
+`Ctrl+G` still jumps straight to the disassembly from anywhere and a double-clicked coverage
+gap still opens it.
+
+**A debug panel can never kill the emulator.** Refreshing runs from a timer and from tab
+changes — both Qt slots — and an exception reaching PyQt calls `qFatal()`: the process dies
+with no message, no traceback, and it looks like the *core* crashed. So a panel that throws is
+caught, named in the status line (`⚠ Movie: AttributeError: …`), and the rest of the window
+keeps working. It is reported rather than swallowed: the failure is also recorded, so a test
+asserting "every panel refreshed" cannot pass on a window full of broken ones.
 
 ### Symbols
 
@@ -636,12 +681,194 @@ open (about 1 % of emulation speed, nothing while you are just playing): a call 
 recognised by the return address landing on the stack and a return by the stack unwinding
 past it, so a plain `push` is never mistaken for a call.
 
+### Console — a Python prompt with the machine in scope
+
+Look at what this project does when it needs an answer the debugger does not have:
+`analyze_glitch_state.py`, `detect_hdiscontinuity.py`, `ripoam.py`, `triage_vs_oracle.py` —
+one-off scripts written outside the tool, run against a dump, then kept forever or lost.
+Several of them answered their question in four lines.
+
+This is those four lines, with the machine already loaded. Nothing it exposes is a new
+capability — but a debugger you can only use through the buttons someone thought of in
+advance stops exactly where your question starts.
+
+```python
+>>> [hex(a) for a in find(b"\x21\x00\x70")]      # where is this byte pattern?
+>>> hexdump(0x6F80, 32)                          # the BIOS's work RAM
+>>> hwregs.format_report(read)                   # every register, decoded
+>>> seen = []
+>>> cancel = on_frame(lambda: seen.append(u16(0x8032)))   # sample EVERY frame
+>>> max(seen) - min(seen)                        # how far did scroll move?
+```
+
+`m`, `play`, `read/write/poke`, `u8/u16/u32`, `find`, `hexdump`, `dis`, `z80dis`, `regs`,
+`step`, `screen`, `on_frame` — plus `hwregs`, `tilemap_view`, `coverage_map`, `profile`,
+`movie`, `z80dasm` and `numpy` already imported. `help()` lists all of it, and a test checks
+that everything `help()` names actually exists. **Run a file…** executes a `.py` in the same
+session, so the next one-off script never has to leave the debugger.
+
+`on_frame` is the one that replaces those scripts: it runs per **emulated frame**, which is
+the granularity they always needed — sampling at a window's refresh rate takes eight readings
+out of six hundred thousand instructions and calls it a measurement.
+
+Two safety properties, both tested. Every exception is **captured, never propagated**: this
+code runs inside a Qt slot, and an exception reaching PyQt calls `qFatal()` — the process dies
+with no message at all, so a REPL that let one through would be a crash generator with a
+prompt on it. And the refresh timer **never executes anything**: only Enter runs code. `exit()`
+means "close the console", not "tear down a running game".
+
+### Movie — record what you press, replay it exactly
+
+Every playtest report on this project has been a **sentence**: *"the text windows get stuck
+halfway", "the HUD flickers"*. Sentences cannot be re-run — the person who saw it has to see
+it again, on demand, while someone else watches.
+
+The console takes **one byte of input per frame**, so a session is a snapshot plus a list of
+bytes: sixty bytes a second, a few kilobytes a minute. Record, play, save a `.ngpcmov`, and
+the bug becomes a file anyone can re-run. The note field travels with it (*"the dialogue box
+stops halfway at 0:12"*), along with the cartridge's identity and when it was taken.
+
+The whole feature hangs off **one call site** — the byte written to `0x00B0` once per emulated
+frame. Nothing else in the frame loop knows it exists, so there is no second clock for a
+replay to drift against. The starting snapshot is taken **when you press Record**, not at the
+first frame: a recording that begins one frame late replays one frame out of step forever, and
+a one-frame drift reads as an emulation bug rather than as a broken tool.
+
+Three refusals, on purpose:
+
+- a movie recorded against **a different cartridge is refused outright**, not warned about —
+  it would produce garbage that looks exactly like an emulation bug, and this feature exists
+  to make bugs *believable*. A file merely renamed is only a note.
+- a starting state whose size does not match this build is refused: it would be applied
+  field-by-field onto a struct of another shape.
+- recording and replaying cannot both be on, and **neither runs during a mirror match** — the
+  other PC is simulating both consoles from the shared input stream, and feeding this one a
+  recorded byte desynchronises the match.
+
+When a replay reaches its end the controller comes straight back to you; it never holds the
+last frame's buttons, which would walk the game into a wall and call it a reproduction.
+
+> ⚠️ A movie does **not** carry the cartridge's flash save — a savestate deliberately excludes
+> it, because it is a save and not a snapshot. A game that reads its save file mid-session can
+> diverge from the recording. That is said out loud rather than papered over: a replay that
+> silently drifts is worse than no replay at all.
+
+### Profiler — where the frame goes
+
+**Not a sampler.** The core can retire instructions while recording every one of them —
+PC, memory accesses, and what each one *cost* — so this is an exact accounting of a captured
+window rather than a statistical guess about it. A sampler running at a debug window's
+refresh rate would take eight samples a second out of six hundred thousand instructions and
+call the result a profile.
+
+The unit is **cycles, not instruction counts**. On this machine the cartridge bus is slow and
+instruction cost varies by a factor of ten, so ranking by instructions puts a tight `djnz`
+loop above the routine that is actually eating the frame. Each row gives cycles, share,
+**cycles per frame** (the absolute figure — a bucket's *share* of one frame is arithmetically
+the same number as its share of the capture, so printing both would be printing one number
+twice), instruction count, cycles per instruction, and the read/write counts the slow bus
+charges for. Double-click a row to open it in the disassembly.
+
+Rows are named from the toolchain's `.map` when one is loaded beside the ROM, and by address
+block when there is none — refusing to answer without symbols would make the tool useless on
+every commercial cartridge, which is most of the corpus. Above the table, **where the cycles
+went by region**: *"cartridge 61 %, BIOS 39 %"* is something no function list can tell you,
+and on this console it is often the answer.
+
+Capturing **advances the machine** — like *Trace to file*, it is a deliberate one-shot on a
+button and never something a refresh does behind your back. The pause state you had is the
+one you get back.
+
+### Coverage — what the cartridge actually executed
+
+The core has recorded this all along — one bit per byte of the cart window, set when an
+instruction *starts* there — and nothing in the emulator ever looked at it. It settles two
+questions nothing else can:
+
+- **a routine that never runs.** A breakpoint that does not fire proves nothing on its own:
+  it looks exactly like a breakpoint on the wrong address. A cold region says the CPU has
+  not been there.
+- **whether an input reached new code.** Reset the count, press the button, watch it move.
+  "Driving the buttons exercised more of the ROM" becomes a number instead of a hope.
+
+The cartridge is drawn as a map — green ran, grey never did, black is past the end of this
+file — with hover giving the address range under the pixel, how many instruction starts fired
+in it, and the symbol name if a `.map` is loaded. Beside it, the **never-executed runs**,
+largest first; double-click one to open it in the disassembly.
+
+Two honesties are built in. A bit means *an instruction started here*, so the bytes inside a
+multi-byte instruction are cold — short gaps are the encoding, not dead code, and are not
+reported at all. And the window is `0x200000..0x3FFFFF`: a **4 MiB cartridge has a second
+chip at `0x800000` that coverage does not watch**, so the percentage is taken against what is
+actually recorded and the tab says why, instead of showing a game that runs perfectly as 40 %
+dead. Recording is off until you arm it, and an unarmed bitmap reads as *not recording* — never
+as 0 % executed, which would be a measurement the tool never took.
+
 ### Events — the raster timeline
 
 Every video-register write and every interrupt, plotted at the **scanline and cycle** it
 happened on. This is the view for raster work: a mid-frame scroll split, an HBlank HUD or
 a palette swap on a given line is correct or broken purely as a function of timing, and no
 write log can show that.
+
+### HW Regs — every register, decoded and checked
+
+The memory viewer can tell you that `0x8118` holds `0x87`. It cannot tell you that this
+means *"backdrop enabled, palette 7"* — nor that `0x07`, one bit away, means *"backdrop
+off, and the picture goes black"*. Every register on this machine packs unrelated switches
+into one byte, so reading them as hex is reading them in a language nobody thinks in.
+
+This tab is the dictionary: every hardware register laid out field by field, with each
+field's meaning spelled out (`T0CLK = 0 → external TI0`; `INT4 = 0 → **DISABLED**`;
+`DMA0V = 0x10 → INTT0, so that interrupt is serviced by DMA and never reaches the CPU`).
+Alongside it:
+
+- **live change tint** — a value cell lights up the refresh after the game writes it and
+  fades over about a second, so you can watch *which* registers a scene actually touches;
+- **Hide untouched** — drop every register still at its documented reset value; what is
+  left is what this game programmed on purpose;
+- **filter** by name, by **address** (`8118` — how you arrive here from the memory viewer,
+  holding a number and no name), or by what it does (`watchdog`, `timer`);
+- **checks** — states the manufacturer documents call illegal, each quoting the sentence
+  that makes it a defect rather than an opinion: a window whose origin plus size passes the
+  hardware limit (*"display and Vint/Hint generations are disrupted"*), a stopped prescaler
+  (*"prohibited"*), Character Over, or a VBlank left at **level 0** — which is not "lowest
+  priority", it is off, and a game waiting on it hangs in a way that looks like a CPU fault.
+
+Provenance is part of the table, not a footnote. A register with no manufacturer document
+behind it is labelled **REVERSE** (`0x8000`, `0x8400`, the sound-CPU control bytes) — because
+presenting a guess next to a sourced fact in the same typography is how a guess becomes a
+fact. The decoding itself lives in `core/hwregs.py` — pure Python, no Qt — so a script or a
+test can ask the same questions the window does, and `format_report()` dumps the whole map
+as text.
+
+### Tilemap — the plane, and where the screen is on it
+
+The **Tiles** tab shows character RAM: 512 tiles in storage order, which is a picture of
+nothing. This tab shows the other half — the **32×32 map each scroll plane actually
+draws**, as one 256×256 image, in the game's own colours (K2GE palettes, K1GE compat LUT,
+or the mono grey ramp on an NGP, whichever the machine is really using).
+
+Over it: **the part the screen is reading**, left bright while everything else is dimmed —
+never tinted, because a tint would change the colours you came here to judge. And it is
+drawn **one scanline at a time**, which is the point. The plane is cyclical 256×256 and the
+scroll registers are re-read *by every line*, so the camera is not a rectangle: games drive
+parallax by rewriting scroll from an H-blank handler. A straight edge means one scroll value
+for the frame; a **wavy edge means line-scroll**; a torn one means the game meant to and got
+the timing wrong. The note line names it outright — `line-scroll 11 px` or `no line-scroll
+this frame` — measured **around the circle**, so a scroll wobbling between 254 and 2 reads as
+four pixels rather than 252.
+
+If the core cannot supply the per-line registers, the tab falls back to the single
+end-of-frame scroll **and says so** — that fallback is the exact mistake this view exists to
+expose, so it is never silent.
+
+Hover any cell for its map entry: the **entry's own VRAM address**, the 9-bit character
+number, where those 16 bytes live in character RAM, the palette code and the flips — click to
+copy. Plus an 8-pixel grid, a **mark-transparent** toggle (pixel value 0 is transparent *per
+pixel*; there is no "tile 0 is blank" rule on this hardware), a distinct-tile count and PNG
+export. Decoding lives in `core/tilemap_view.py` — pure numpy, no Qt — deliberately in step
+with `cpp/src/render.cpp`; if the two ever disagree, this viewer is the one that is wrong.
 
 ### Watch, breakpoints, memory
 
@@ -676,12 +903,52 @@ write log can show that.
   frames, then ask for the addresses that changed exactly six times. **Undo** takes back a
   bad pass, and **unaligned** finds a 16/32-bit value that does not sit on a multiple of
   its size. Double-click a hit to name and watch it.
+- **Cheats** — named groups of addresses held at a value. The Watch tab already locks *one*
+  address (that is how "what if HP never drops" gets answered); a cheat is usually two or
+  three that only mean something together — health *and* the death flag, lives *and* the
+  continue counter — and typing those back one at a time every session is how a map gets
+  lost. Saved per ROM, in the **same plain format you paste into a message**, so what you
+  edit and what you share are the same text and there is no second representation to keep in
+  step:
+
+  ```
+  # Infinite health
+  4812:1 = 63
+  481A:2 = 03E7
+  ```
+
+  Enabled cheats are written **at the same point in the frame as a locked watch** — not a
+  second freezing mechanism, because two things that both "hold a value" would eventually
+  disagree about which one won, and the answer would depend on where in the frame each ran.
+  A line that will not parse is reported **with its number**, never skipped: a pasted code
+  that quietly loads three of its four addresses is a cheat that half-works, which is the
+  state that wastes the most time. And an address in the cartridge window is flagged —
+  the cart is **flash**, so a write there does not change memory, it goes to the chip's
+  command latch. Flagged, never refused: a debugger that rejects an address for looking
+  wrong is useless the day the address is right.
 - **Trace to file** — every instruction with, optionally, the registers it wrote and every
   memory address it read or wrote.
 - **Audio** — live per-channel monitor (3 square + noise): period → frequency → **note**,
   L/R volume, plus an oscilloscope of the output and the sound Z80's state. **Mute / solo**
   any channel to isolate it, watch the raw chip-write log, and **record the music** — save it
   as a **`.vgm`** (Furnace / VGM players) or as a **`.ngps` song** for the NGPC sound creator.
+- **Sound CPU** — the Z80 as a first-class processor rather than one line of status text.
+  A **full Z80 disassembly** that follows its PC (the whole instruction set: CB, ED, DD/FD
+  and the `DD CB d op` form, including the undocumented `sll` and the indexed write-back the
+  drivers actually use), **both register banks** — `exx` swaps them in one instruction, so
+  showing only one is showing half the CPU — the interrupt state, the signed cycle credit,
+  and the stack. It runs in its **own address space**, which the tab makes explicit: `0x0000`
+  here is the shared RAM the main CPU sees at `0x7000`, `0x4000` is the write-only sound
+  chip, `0x8000` the mailbox, `0xC000` the register that raises INT5 on the main CPU.
+
+  Above all it separates **halted** from **trapped**. A halt is the driver sleeping between
+  timer ticks — normal, and where it spends most of its life. A trap is *our core refusing
+  an opcode*, and the tab names the instruction: `TRAPPED at 0x0100 on opcode ED B0 — that
+  instruction is ldir, our core does not implement it. This is a hole in the emulator, not
+  in the game.` Only that one gets the alarm colour, or the alarm stops meaning anything.
+
+  Read-only on purpose: the core has no Z80 breakpoints yet, and a Pause button here would
+  stop the *main* CPU while claiming to stop this one.
 - **Layers** — the same idea, applied to the picture: **show or hide** each of the five
   video layers (scroll plane 1, scroll plane 2, and sprites split by priority) **while the
   game runs**, with a *solo* button per layer. On this machine text and artwork are always
@@ -824,7 +1091,43 @@ verdicts.**
 ## Rewind — how it works and its limits
 
 Rewind keeps a ring of recent frame snapshots so you can step **back** (`,`) and **forward**
-(`.`) through what just happened. Buffer length is set in **Settings ▸ General ▸ Rewind
+(`.`) through what just happened.
+
+There are **two ways to use it**, and they are for different things.
+
+**Hold the key** for a quick correction — and it **speeds up the longer you hold**. It used to
+run backwards in real time, so reaching the far end of a 30-second buffer meant holding a key
+for thirty seconds, which is not rewinding, it is waiting. The first half-second stays at 1×
+so a tap still lands on the frame you meant; after that it doubles every half-second up to 8×.
+Measured: **a 10 s buffer is crossed in 2.3 s, 20 s in 3.6 s, 30 s in 4.8 s** — and a quarter-
+second tap still moves exactly 15 frames. The strip shows `×4` while it ramps, because a
+picture that suddenly runs eight times faster with nothing on screen to say so reads as a
+glitch.
+
+**Or drag the strip** to go straight to a moment instead of feeling your way there. It floats
+**over** the bottom of the picture — never in the layout, because there it took space and the
+image shrank the moment you touched rewind and grew back when you let go — and it shows where
+you are, how much history is left, and a tick per second so you can *see* it rather than read
+a number.
+
+Crucially it **stays up for a few seconds after you let go of the key**, and while the game is
+paused. The first version vanished the instant the key came up, so the only moment it existed
+was the moment your hand was busy holding a key: a scrubber you can never grab is a
+decoration. Grabbing it stops the countdown.
+
+The mouse then mirrors the key exactly: **hold to move through time, let go to carry on.**
+Dragging *has* to pause — otherwise the game runs out from under the position you are
+choosing — but it does not leave you there, because there is no play button on this toolbar to
+get out with: `⏭` steps one frame (and pauses again) and `⏩` does nothing at all while paused,
+since the loop returns before it. A game that was already paused before the drag stays paused,
+because then pausing is what you asked for. The strip puts itself away when you are done: a
+permanent bar under the game is a permanent tax on the game.
+
+(It replaced a `⏪ 137` printed over the middle of the screen: a count of frames is a unit
+nobody thinks in, it sat on the thing you were trying to look at, and it never answered the
+question you actually have while the key is down — how close you are to the end of the
+buffer.)
+ Buffer length is set in **Settings ▸ General ▸ Rewind
 buffer**: **Off**, or 10 / 20 / 30 seconds. Each snapshot is ~48 KB, so the cost is roughly
 **10 s ≈ 29 MB, 20 s ≈ 58 MB, 30 s ≈ 86 MB** of RAM held while a game runs (Off = no cost).
 The default is 10 s.

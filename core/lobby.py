@@ -27,6 +27,14 @@ FRAME_RELAY = 2
 _HDR = 5
 
 
+class _Closed(Exception):
+    """The socket loop is done, and why. Raised rather than returned so that every
+    exit -- a dead socket, a closed one, a server hang-up -- lands on the SAME
+    teardown. The old code broke out of the loop and fell through to the cleanup,
+    which worked for every path it had thought of and skipped it for the one it
+    had not."""
+
+
 def _frame(ftype: int, payload: bytes) -> bytes:
     return bytes([ftype]) + len(payload).to_bytes(4, "big") + payload
 
@@ -95,9 +103,17 @@ class LobbyClient(QObject):
         self._out.put(_frame(FRAME_CONTROL, json.dumps(obj).encode("utf-8")))
         self._wake()
 
-    def create(self, name: str, game: str, public: bool, password: str = "") -> None:
+    def create(self, name: str, game: str, public: bool, password: str = "",
+               mode: str = "cable", delay: int = 0) -> None:
+        """Open a room. `mode` is which link it is for -- "cable" (the console's own
+        serial bytes) or "mirror" (core/netplay session records). The relay carries
+        both the same way, but the two clients must agree on what the bytes mean, so
+        the room advertises it and the joiner follows. `delay` is the mirror's input
+        delay: it has to be identical on both PCs, so the host's is the one that counts.
+        """
         self._send_control({"op": "create", "pseudo": self._pseudo, "name": name,
-                            "game": game, "public": public, "password": password})
+                            "game": game, "public": public, "password": password,
+                            "mode": mode, "delay": int(delay)})
 
     def refresh(self) -> None:
         self._send_control({"op": "list"})
@@ -137,6 +153,24 @@ class LobbyClient(QObject):
         buf = bytearray()
         pending = bytearray()          # queued frames not yet accepted by the kernel
         reason = "closed"
+        # ⚡ THE TEARDOWN BELOW MUST RUN NO MATTER HOW THIS LOOP ENDS. It closes the
+        # wake socketpair and emits `disconnected`, and the UI is waiting for that
+        # signal -- a thread that dies on the way out leaks two descriptors and
+        # leaves the session looking alive forever.
+        try:
+            self._pump(buf, pending)
+        except _Closed as e:
+            reason = str(e)
+        finally:
+            self._running = False
+            for s in (self._wake_r, self._wake_w):
+                try:
+                    s.close()
+                except OSError:
+                    pass
+        self.disconnected.emit(reason)
+
+    def _pump(self, buf: bytearray, pending: bytearray) -> None:
         while self._running:
             # 1) send anything queued
             try:
@@ -157,15 +191,22 @@ class LobbyClient(QObject):
                 except (BlockingIOError, InterruptedError):
                     pass
                 except OSError as e:
-                    reason = str(e); break
+                    raise _Closed(str(e)) from e
             # 2) wait for: something to read, room to write (only while we owe bytes),
             # or the Qt thread waking us because it just queued a frame.
             try:
                 r, _, _ = select.select(
                     [self._sock, self._wake_r], [self._sock] if pending else [],
                     [], 0.02)
-            except OSError:
-                break
+            except (OSError, ValueError) as e:
+                # ⚠️ ValueError, NOT only OSError. `close()` runs on the Qt thread and
+                # can shut the socket between the `while self._running` test above and
+                # this call. A closed socket's fileno() is -1, and select REJECTS a
+                # negative descriptor as a bad ARGUMENT -- a ValueError, which this
+                # only caught as OSError. The thread then died on the way out, so the
+                # wake socketpair leaked and `disconnected` was never emitted: the UI
+                # sat waiting for a signal that could no longer come.
+                raise _Closed("closed") from e
             if self._wake_r in r:
                 try:
                     self._wake_r.recv(4096)        # drain the nudges; the queue is
@@ -177,18 +218,11 @@ class LobbyClient(QObject):
                 except (BlockingIOError, InterruptedError):
                     continue
                 except OSError as e:
-                    reason = str(e); break
+                    raise _Closed(str(e)) from e
                 if not chunk:
-                    reason = "server closed"; break
+                    raise _Closed("server closed")
                 buf.extend(chunk)
                 self._drain_frames(buf)
-        self._running = False
-        for s in (self._wake_r, self._wake_w):
-            try:
-                s.close()
-            except OSError:
-                pass
-        self.disconnected.emit(reason)
 
     def _drain_frames(self, buf: bytearray) -> None:
         while len(buf) >= _HDR:
@@ -219,6 +253,46 @@ class LobbyClient(QObject):
             self.peer_left.emit()
         elif op == "error":
             self.error.emit(str(obj.get("msg", "error")))
+
+
+class LobbyPipe:
+    """The lobby relay as a core.netplay Pipe -- so MIRROR play can use it too.
+
+    The relay was built for the cable mode and carries the console's serial bytes; it
+    does not care what the bytes are. Mirror play needs exactly the same thing (an
+    ordered byte pipe to the other PC) for its cartridge trade and its session records,
+    so it gets the room, the NAT traversal and the pairing for free instead of asking
+    the players for an IP address.
+
+    `lost` is the one thing core.netplay asks for beyond send/recv, and it is why this
+    is not just a pair of lambdas: the lobby loses a peer through Qt signals, not
+    through a socket error, and a mirror session that is never told sits at "waiting
+    for the other player" for ever.
+    """
+
+    def __init__(self, client: LobbyClient) -> None:
+        self.client = client
+        self.lost: str | None = None
+        client.peer_left.connect(lambda: self._lose("peer left the room"))
+        client.disconnected.connect(lambda why: self._lose(str(why)))
+
+    def _lose(self, why: str) -> None:
+        if self.lost is None:
+            self.lost = why or "disconnected"
+
+    def send(self, data: bytes) -> None:
+        if data and self.lost is None:
+            self.client.send_serial(data)
+
+    def recv(self) -> bytes:
+        return b"" if self.lost is not None else self.client.read_serial()
+
+    def close(self) -> None:
+        try:
+            self.client.leave()
+            self.client.close()
+        except Exception:  # noqa: BLE001 -- tearing down; nothing left to salvage
+            pass
 
 
 class LobbyLink:

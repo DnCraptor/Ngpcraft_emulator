@@ -56,6 +56,8 @@ import zlib
 from collections import deque
 from typing import Protocol
 
+from core.link import run_two_consoles_interleaved
+
 PROTOCOL_VERSION = 1
 
 # Wire: [type:1][frame:4 LE][payload]. Fixed headers, so a partial read never has to
@@ -468,12 +470,23 @@ class MirrorSession:
         # then mirror" means the host runs P1,P2 and the joiner runs P2,P1 -- the same
         # match, simulated in two different orders, drifting by one received byte within
         # a few hundred frames.
+        #
+        # 🔑 ...AND THE TWO ARE INTERLEAVED, not run a whole frame each. This used to be
+        # `first.run_frames(1); pump; second.run_frames(1); pump`, which freezes one
+        # console for the whole of the other's frame -- a frame of latency on every
+        # answer, in one direction, always. Card Fighters' Clash loses its VS handshake
+        # to exactly that: measured through the shell's local cable, which had the same
+        # shape, the HP exchange that starts a match dies after 118/102 bytes with
+        # "LINK ERROR. CHECK CONNECTIONS AND SETTINGS." on one console and "CHOOSING
+        # HP." for ever on the other. Mirror play is the answer for that game ONLINE --
+        # its cable is local, so it carries no network latency at all -- but only if
+        # the cable is stepped like a cable.
+        #
+        # Deterministic by construction: a fixed slice, a fixed order, the same code on
+        # both PCs. Which console goes first still matters as much as it did above.
         first, second = ((self.local, self.peer) if self.hs.host
                          else (self.peer, self.local))
-        first.run_frames(1)
-        self.link.pump()
-        second.run_frames(1)
-        self.link.pump()
+        run_two_consoles_interleaved(first, second, self.link)
 
         if self.frame % CHECK_EVERY == 0:
             # Fingerprint AFTER the frame ran, labelled with the frame that produced it,

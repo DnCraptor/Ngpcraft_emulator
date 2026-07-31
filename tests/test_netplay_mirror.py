@@ -21,8 +21,9 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from core import lobby  # noqa: E402
 from core import netplay  # noqa: E402
-from core.netplay import Handshake, ListPipe, MirrorSession  # noqa: E402
+from core.netplay import Handshake, ListPipe, MirrorSession, SocketPipe  # noqa: E402
 
 # ⚡ IMPORTED AT MODULE LEVEL ON PURPOSE, not inside the test. The root conftest
 # sandboxes the coin cell by patching `ngpc_shell._SYSTEM_RAM`, and it can only do
@@ -243,6 +244,67 @@ def test_matching_consoles_never_report_a_desync():
     assert a.desync_at is None and b.desync_at is None
 
 
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_the_mirrors_own_cable_is_stepped_like_a_cable():
+    """⚡ The mirror owns BOTH consoles, so it owns the same trap the local 2P cable had.
+
+    It used to run `first.run_frames(1); pump; second.run_frames(1); pump` -- one
+    console frozen for the whole of the other's frame, which is a frame of latency on
+    every answer, in one direction. That is what mirror play exists to avoid: its cable
+    is local and should carry NO latency at all. Card Fighters' Clash is the measure --
+    through a mirror of its VS match, the whole-frame schedule dies at 118/102 bytes
+    (its "LINK ERROR"), the interleaved one reaches 610/617 and plays.
+
+    So: a frame of a real mirror must pump the cable many times, not twice.
+    """
+    from core import native
+    from core.link import InProcessLink
+
+    rom, bios = ROM.read_bytes(), BIOS.read_bytes()
+
+    class Counting(InProcessLink):
+        pumps = 0
+
+        def pump(self):
+            Counting.pumps += 1
+            super().pump()
+
+    local = native.NativeMachine(rom, bios=bios)
+    peer = native.NativeMachine(rom, bios=bios)
+    try:
+        local.reset(bios_handoff=True)
+        peer.reset(bios_handoff=True)
+        Counting.pumps = 0
+        pa, _pb = ListPipe.pair()
+        FRAMES = 10
+        # The input delay pre-fills that many frames of both streams, so this session
+        # can run on its own without a peer answering.
+        sess = MirrorSession(local, peer, Counting(local, peer), pa,
+                             Handshake(rom_hash="r", bios_hash="b", core_version="c",
+                                       delay=FRAMES + 2, host=True))
+        for _ in range(FRAMES):
+            assert sess.step(0) == "ran"
+        real = Counting.pumps
+
+        # CONTROL: the same session over machines with no sliced interface takes the
+        # whole-frame path -- two pumps a frame. Without it, "many pumps" could just
+        # mean "many frames".
+        Counting.pumps = 0
+        fake = MirrorSession(FakeMachine(), FakeMachine(), Counting(local, peer),
+                             ListPipe.pair()[0],
+                             Handshake(rom_hash="r", bios_hash="b", core_version="c",
+                                       delay=FRAMES + 2, host=True))
+        for _ in range(FRAMES):
+            assert fake.step(0) == "ran"
+        assert Counting.pumps == FRAMES * 2, "the fallback should pump twice a frame"
+        assert real > FRAMES * 5, (
+            f"a mirrored frame pumped the cable {real / FRAMES:.1f} times on average; "
+            "a whole frame per console is the latency CFC's VS handshake cannot survive")
+    finally:
+        local.close(); peer.close()
+
+
 # --------------------------------------------------------------------------- #
 # The real thing: four consoles, two PCs' worth of session, one probe ROM.
 # --------------------------------------------------------------------------- #
@@ -319,7 +381,7 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
     try:
         sh.play.start(ROM)
         sh.play.held = 0x08                      # this player holds RIGHT
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, sh.play.session._rom)
         assert sh.play.link_mode() == "mirror"
 
@@ -400,7 +462,7 @@ def test_the_shell_ends_the_session_when_the_peer_goes(sh, app):
     ended = []
     try:
         sh.play.start(ROM)
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, sh.play.session._rom)
         sh.play.mirror_ended.connect(ended.append)
         sh.play._mirror.pipe.lost = "peer closed the connection"
@@ -452,7 +514,7 @@ def test_stopping_the_game_lets_go_of_the_mirror(sh, app):
     s1, _s2 = socket.socketpair()
     try:
         sh.play.start(ROM)
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, _s2, sh.play.session._rom)
         peer = sh.play._mirror_peer_session
         assert peer is not None and sh.play.link_mode() == "mirror"
@@ -469,7 +531,7 @@ def test_stopping_the_game_lets_go_of_the_mirror(sh, app):
         sh.play.start(ROM)
         s3, s4 = socket.socketpair()
         try:
-            sh._begin_mirror(s3, host=True)
+            sh._begin_mirror(SocketPipe(s3), host=True)
             _bring_up(sh, s4, sh.play.session._rom)
             assert sh.play._mirror_desynced is False, "it inherited the last verdict"
             assert sh.play._mirror_waits == 0
@@ -497,7 +559,7 @@ def test_mirror_play_refuses_what_would_rewind_this_console_only(sh, app):
         sh.play.start(ROM)
         for _ in range(20):
             sh.play._tick()
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, sh.play.session._rom)
         before = sh.play.machine.read(0x4000, 0x1000)
 
@@ -526,6 +588,64 @@ def test_mirror_play_refuses_what_would_rewind_this_console_only(sh, app):
 
 @pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
                     reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_a_lobby_room_starts_the_link_it_advertised(sh, app):
+    """⚡ MIRROR PLAY THROUGH THE LOBBY -- the mode the players can actually reach.
+
+    Mirror play used to be direct-address only (an IP, a port, and whatever it takes
+    to be reachable), while the lobby -- rooms, pairing, NAT traversal -- only ever
+    opened the cable. That is backwards for Card Fighters' Clash, which is the game
+    that NEEDS the mirror: its VS handshake gives up on latency the cable cannot avoid.
+
+    The relay carries opaque bytes, so the same room works for either; what the joiner
+    must not do is guess. So a room that says "mirror" starts the cartridge trade, and
+    one that says nothing is a cable room -- which is what every room made by an older
+    client says.
+    """
+    from core.lobby import LobbyPipe
+
+    def client():
+        # Never started: no thread, no socket. What is exercised here is the routing
+        # and the pipe, and both only need the object's signals and queues.
+        return lobby.LobbyClient("127.0.0.1", 1, "tester")
+
+    sh.play.start(ROM)
+    c = client()
+    try:
+        sh._on_lobby_linked(c, {"mode": "mirror", "role": "host", "delay": 5})
+        assert sh._mirror_boot is not None, "a mirror room did not start the trade"
+        assert sh.play._net_link is None, "it opened the cable as well"
+        assert sh._mirror_boot.hs.delay == 5, "the room's input delay was ignored"
+        assert sh._mirror_boot.hs.host is True
+        sh._end_mirror_bringup()
+    finally:
+        c.close()
+
+    # CONTROL: a room with no mode is the cable, and takes the other path entirely.
+    c2 = client()
+    try:
+        sh._on_lobby_linked(c2, {"role": "guest"})
+        assert sh._mirror_boot is None, "a cable room started a mirror"
+        assert sh.play._net_link is not None, "a cable room did not open the cable"
+        assert sh.play.link_mode() == "lobby"
+    finally:
+        sh._end_net_link()
+        c2.close()
+
+    # ...and the pipe reports a peer that leaves. The lobby loses one through a Qt
+    # signal, not a socket error, so a session never told sits at "waiting" for ever.
+    c3 = client()
+    try:
+        pipe = LobbyPipe(c3)
+        assert pipe.lost is None
+        c3.peer_left.emit()
+        assert pipe.lost, "a peer leaving the room went unnoticed"
+        assert pipe.recv() == b"", "a dead pipe still handed bytes over"
+    finally:
+        c3.close()
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
 def test_the_two_online_modes_are_exclusive(sh, app):
     """They drive the same console two different ways -- the cable relays its serial
     FIFO, the mirror owns the pad byte and runs a second console here. Both at once is
@@ -533,7 +653,7 @@ def test_the_two_online_modes_are_exclusive(sh, app):
     s1, s2 = socket.socketpair()
     try:
         sh.play.start(ROM)
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, sh.play.session._rom)
 
         assert sh._one_link_at_a_time(False) is True, "a cable was allowed over a mirror"
@@ -595,7 +715,7 @@ def test_the_debugger_tap_reaches_the_mirror_cable(sh, app):
     s1, s2 = socket.socketpair()
     try:
         sh.play.start(ROM)
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, sh.play.session._rom)
         mon = LinkMonitor()
         sh.play.set_link_monitor(mon)
@@ -640,7 +760,7 @@ def test_the_two_players_may_hold_DIFFERENT_cartridges(sh, app):
         theirs = bytes(theirs)
         assert theirs != mine
 
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         _bring_up(sh, s2, theirs)
         assert sh.play._mirror is not None, "a different cartridge was refused"
 
@@ -673,7 +793,7 @@ def test_a_cartridge_that_arrives_different_from_its_announcement_is_refused(sh,
     s1, s2 = socket.socketpair()
     try:
         sh.play.start(ROM)
-        sh._begin_mirror(s1, host=True)
+        sh._begin_mirror(SocketPipe(s1), host=True)
         # The far end promises one cartridge and sends another.
         _bring_up(sh, s2, sh.play.session._rom, announce="0123456789abcdef")
         assert sh.play._mirror is None, "a cartridge that did not match was accepted"

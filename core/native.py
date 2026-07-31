@@ -688,6 +688,16 @@ class NativeMachine:
         BIOS grey ramp stands. Must be set BEFORE reset. See Machine::k1ge_console.
         """
         self._lib.ngpc_set_k1ge_console(self._h, 1 if on else 0)
+        # Shadowed so callers can READ it back: the C core has no getter, and a tool
+        # that renders VRAM itself (the tilemap viewer) resolves colours down a
+        # different path on a mono console. Asking 0x87E2 instead is not the same
+        # question -- the mono NGP does not have that register at all.
+        self._k1ge_console = bool(on)
+
+    @property
+    def k1ge_console(self) -> bool:
+        """Whether this machine is emulating the original mono NGP."""
+        return getattr(self, "_k1ge_console", False)
 
     def set_vram_wait(self, cycles_per_byte: int) -> None:
         """EXPERIMENTAL wait-states per byte written to display RAM (0x8000-0xBFFF).

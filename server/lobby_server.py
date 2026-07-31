@@ -56,7 +56,8 @@ class Session:
 
 class Lobby:
     def __init__(self):
-        # room code -> {"host": Session, "name", "game", "creator", "password", "public"}
+        # room code -> {"host": Session, "name", "game", "creator", "password",
+        #               "public", "mode", "delay"}
         self.games: dict[str, dict] = {}
 
     def open_list(self) -> list[dict]:
@@ -67,6 +68,13 @@ class Lobby:
                     "room": room, "name": g["name"], "game": g["game"],
                     "creator": g["creator"], "private": bool(g["password"]),
                     "public": g["public"],
+                    # WHICH LINK the room is for. The relay carries opaque bytes either
+                    # way -- but the two clients have to agree on what those bytes MEAN,
+                    # and only the host knows. "cable" = the console's own serial
+                    # stream; "mirror" = core/netplay's session records. `delay` is the
+                    # mirror's input delay, which must be identical on both PCs (the
+                    # handshake refuses a mismatch), so the joiner adopts the host's.
+                    "mode": g["mode"], "delay": g["delay"],
                 })
         # public games (and private ones so a friend with the code can still see it)
         return out
@@ -93,6 +101,10 @@ async def handle_control(lobby: Lobby, s: Session, obj: dict) -> None:
             "creator": s.pseudo,
             "password": str(obj.get("password", "")),
             "public": bool(obj.get("public", True)),
+            # Absent -> "cable": a client that predates the mirror rooms says nothing
+            # here, and the cable is what it means.
+            "mode": "mirror" if obj.get("mode") == "mirror" else "cable",
+            "delay": max(0, min(30, int(obj.get("delay", 0) or 0))),
         }
         s.room = room
         await s.send_control({"op": "created", "room": room})
@@ -114,9 +126,11 @@ async def handle_control(lobby: Lobby, s: Session, obj: dict) -> None:
         host.peer = s
         s.peer = host
         s.pseudo = str(obj.get("pseudo", s.pseudo))[:24]
-        await host.send_control({"op": "joined", "peer": s.pseudo, "role": "host"})
+        await host.send_control({"op": "joined", "peer": s.pseudo, "role": "host",
+                                 "mode": g["mode"], "delay": g["delay"]})
         await s.send_control({"op": "joined", "peer": host.pseudo, "role": "guest",
-                              "game": g["game"], "name": g["name"]})
+                              "game": g["game"], "name": g["name"],
+                              "mode": g["mode"], "delay": g["delay"]})
 
     elif op == "leave":
         await drop_pairing(lobby, s)

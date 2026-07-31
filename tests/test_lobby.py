@@ -106,6 +106,55 @@ def test_lobby_create_list_join(app):
     host.close(); guest.close()
 
 
+def test_a_room_says_which_link_it_is_for(app):
+    """⚡ The relay carries opaque bytes; the two clients must agree what they MEAN.
+
+    A cable room carries the console's own serial stream, a mirror room carries
+    core.netplay's session records. Only the host chooses, so the room has to
+    advertise it -- in the listing (a player picks a room before joining it) and in
+    the `joined` record (the joiner starts the right mode without being asked). The
+    mirror's input delay rides along for the same reason: it must be identical on both
+    PCs, so the host's is the one that counts.
+    """
+    port = _start_server()
+    box = {"room": None, "list": None, "guest": None, "host": None}
+
+    host = LobbyClient("127.0.0.1", port, "Alice")
+    host.created.connect(lambda r: box.__setitem__("room", r))
+    host.joined.connect(lambda o: box.__setitem__("host", o))
+    host.start()
+    assert _wait(app, lambda: host._sock is not None)
+    host.create("mirror room", "Card Fighters", public=True, mode="mirror", delay=7)
+    assert _wait(app, lambda: box["room"])
+
+    # ...and a plain cable room alongside it, so "mirror" cannot be what every room
+    # says by accident.
+    cable = LobbyClient("127.0.0.1", port, "Carol")
+    cable.start()
+    assert _wait(app, lambda: cable._sock is not None)
+    cable.create("cable room", "Fatal Fury", public=True)
+
+    guest = LobbyClient("127.0.0.1", port, "Bob")
+    guest.game_list.connect(lambda g: box.__setitem__("list", g))
+    guest.joined.connect(lambda o: box.__setitem__("guest", o))
+    guest.start()
+    assert _wait(app, lambda: guest._sock is not None)
+    guest.refresh()
+    assert _wait(app, lambda: box["list"] and len(box["list"]) >= 2)
+    rooms = {g["name"]: g for g in box["list"]}
+    assert rooms["mirror room"]["mode"] == "mirror"
+    assert rooms["mirror room"]["delay"] == 7
+    assert rooms["cable room"]["mode"] == "cable", "a room defaults to the cable"
+
+    guest.join(box["room"])
+    assert _wait(app, lambda: box["guest"] and box["host"])
+    assert box["guest"]["mode"] == "mirror" and box["guest"]["delay"] == 7
+    assert box["guest"]["role"] == "guest"
+    assert box["host"]["mode"] == "mirror", "the host is told which link it opened too"
+
+    host.close(); guest.close(); cable.close()
+
+
 def test_lobby_password_protects_private_game(app):
     port = _start_server()
     box = {"created": None, "error": None, "joined": None}
@@ -301,3 +350,49 @@ def test_the_relay_hop_has_nagle_off():
             "the server must disable Nagle on every accepted connection")
     finally:
         a.close(); b.close()
+
+
+# --------------------------------------------------------------------------
+# Leaving the socket loop. Every exit must land on the SAME teardown.
+# --------------------------------------------------------------------------
+def test_a_socket_closed_under_select_is_reported_not_raised():
+    """`close()` runs on the Qt thread and can shut the socket between the loop's
+    `while self._running` test and its select(). A closed socket's fileno() is -1,
+    and select rejects a negative descriptor as a bad ARGUMENT — a ValueError, not
+    an OSError. Catching only OSError killed the thread on the way out."""
+    import socket as _socket
+
+    from core import lobby as lobby_mod
+
+    c = LobbyClient("127.0.0.1", 1, "nobody")      # never started: no thread to race
+    dead = _socket.socket()
+    dead.close()
+    c._sock = dead
+    c._running = True
+    try:
+        with pytest.raises(lobby_mod._Closed):
+            c._pump(bytearray(), bytearray())
+    finally:
+        c.close()
+
+
+def test_the_teardown_runs_even_when_the_loop_leaves_unexpectedly(app, monkeypatch):
+    """The teardown closes the wake socketpair and emits `disconnected`, and the UI
+    waits on that signal. A thread that dies on the way out leaks two descriptors
+    and leaves the session looking alive forever."""
+    from core import lobby as lobby_mod
+
+    port = _start_server()
+    c = LobbyClient("127.0.0.1", port, "tester")
+    seen: list[str] = []
+    c.disconnected.connect(seen.append)
+
+    def explode(self, buf, pending):
+        raise lobby_mod._Closed("boom")
+
+    monkeypatch.setattr(type(c), "_pump", explode)
+    c.start()
+    assert _wait(app, lambda: seen), "disconnected must be emitted whatever happened"
+    assert seen[0] == "boom", "and it must carry the real reason, not a placeholder"
+    assert c._wake_r.fileno() == -1 and c._wake_w.fileno() == -1, \
+        "the wake socketpair is closed, not leaked"

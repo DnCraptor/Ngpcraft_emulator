@@ -1147,6 +1147,7 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
         m.serial_tx.clear();
         m.serial_rx.clear();
         m.serial_tx_busy = false;
+        m.serial_tx_shifting = false;
         m.serial_rx_pending = false;
         m.serial_tx_cycles = 0;
         m.serial_rx_cycles = 0;

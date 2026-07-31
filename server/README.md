@@ -10,6 +10,13 @@ raw serial bytes between paired players, so it works through any NAT/firewall
   any free tier comfortably.
 - Protocol: length-prefixed TCP frames (type 1 = JSON control, type 2 = serial
   relay). See the docstring in `lobby_server.py`.
+- **A room says which link it is for.** `create` takes `mode` (`cable` or `mirror`)
+  and, for a mirror, `delay` — the input delay, which has to be identical on both PCs,
+  so the joiner adopts the host's. Both travel back in `list` and in `joined`. The
+  relay itself does not care: it moves opaque bytes either way. A room created by a
+  client that predates this sends no `mode`, and that reads as `cable`.
+  ⚠️ **Redeploy the server after updating**, or every room reads as a cable room and
+  mirror rooms cannot be joined.
 
 ## Run it locally (test before deploying)
 

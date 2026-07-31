@@ -28,9 +28,10 @@ from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (Qt, QTimer, QSize, QObject, QThread, QEvent, QDateTime,
-                          pyqtSignal)
+                          QRect, pyqtSignal)
 from PyQt6.QtGui import (
     QImage, QPixmap, QKeyEvent, QKeySequence, QFont, QFontMetrics, QIcon,
+    QPainter, QColor,
 )
 from PyQt6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 from PyQt6.QtWidgets import (
@@ -54,6 +55,8 @@ from core.native_session import (  # noqa: E402
 )
 from core.frame_pacer import FramePacer  # noqa: E402
 from core.watches import WatchSet  # noqa: E402
+from core.cheats import CheatSet  # noqa: E402
+from core import link as core_link  # noqa: E402  (the cable's own constants)
 from core import link_debug  # noqa: E402  (the debugger's cable tap)
 from core.exec_breaks import ExecBreakSet  # noqa: E402
 import ngpc_settings as cfg  # noqa: E402
@@ -2379,6 +2382,193 @@ class _OverlayLabel(QLabel):
         self.setVisible(bool(text))
 
 
+# How fast a HELD rewind runs, as frames dropped per step (a step is ~1/60 s).
+# The first half-second stays at 1x so a short tap still lands on the frame you
+# meant; then it doubles every half-second up to 8x, which crosses a 30-second
+# buffer in under four seconds. Kept as data, and as a pure function, because
+# "why did it jump" is a question you should be able to answer by reading it.
+REWIND_RAMP = ((30, 1), (60, 2), (90, 4))
+REWIND_MAX_SPEED = 8
+
+
+def rewind_speed(steps_held: int) -> int:
+    for limit, speed in REWIND_RAMP:
+        if steps_held < limit:
+            return speed
+    return REWIND_MAX_SPEED
+
+
+class _RewindBar(QWidget):
+    """The rewind history as a strip under the game, while you are in it.
+
+    Rewind used to say `⏪ 137` in the middle of the screen. That is a number of
+    frames, which nobody thinks in, over the picture you are trying to look at --
+    and it says nothing about the one thing that actually matters while you hold
+    the key: how much history is LEFT before you run out of it.
+
+    So: a strip along the bottom, the width of the ring, filled up to where you
+    are, with the time in seconds. It appears when you rewind and goes away when
+    you stop -- there is nothing to look at the rest of the time, and a permanent
+    bar under the picture is a permanent tax on the picture.
+
+    Dragging it scrubs. That falls out of the same data and is the reason a strip
+    beats a counter: you can go BACK TO A MOMENT rather than feel your way there
+    one key-press at a time.
+    """
+
+    scrubbed = pyqtSignal(int)          # requested position in the ring
+    grabbed = pyqtSignal()              # the mouse took hold of it
+    dropped = pyqtSignal()              # ...and let go
+
+    HEIGHT = 30
+    MARGIN = 10
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(self.HEIGHT)
+        self.setVisible(False)
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        # It floats OVER the picture, so it draws its own backing -- without one the
+        # game would show through the text and neither would be readable.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._total = 0
+        self._pos = 0
+        self._speed = 1
+        self._dragging = False
+
+    def set_range(self, total: int, pos: int, speed: int = 1) -> None:
+        total = max(0, int(total))
+        pos = max(0, min(total - 1, int(pos))) if total else 0
+        speed = max(1, int(speed))
+        if (total, pos, speed) == (self._total, self._pos, self._speed):
+            return          # nothing moved: the paused loop calls this every tick
+        self._total, self._pos, self._speed = total, pos, speed
+        self.update()
+
+    @property
+    def frames_back(self) -> int:
+        return max(0, self._total - 1 - self._pos)
+
+    def _label(self) -> str:
+        # Kept SHORT: every character the label takes is a character of track, and
+        # the track is the part you aim at. The first wording spelled out "of 10 s
+        # held" and left the bar less than half the width of its own strip.
+        # The speed is shown while it ramps, because a picture that suddenly runs
+        # eight times faster with nothing on screen to say so reads as a glitch.
+        rate = f"  ×{self._speed}" if self._speed > 1 else ""
+        return (f"−{self.frames_back / 60.0:.1f}s / "
+                f"{self._total / 60.0:.0f}s{rate}")
+
+    INSET = 12                       # the rounded plate's left+right padding
+
+    def _track_width(self) -> int:
+        """The track stops BEFORE the label. Drawing them over each other put the
+        text on top of the fill exactly when the fill was full -- which is where
+        the cursor sits most of the time."""
+        metrics = QFontMetrics(self._font())
+        usable = self.width() - self.INSET
+        return max(20, usable - metrics.horizontalAdvance(self._label()) - 18)
+
+    def _font(self):
+        f = self.font(); f.setPointSize(9)
+        return f
+
+    def _index_at(self, x: int) -> int:
+        x -= self.INSET // 2             # the plate's left padding
+        track = self._track_width()
+        if self._total <= 1 or track <= 1:
+            return 0
+        frac = min(1.0, max(0.0, x / track))
+        return int(round(frac * (self._total - 1)))
+
+    def mousePressEvent(self, e) -> None:  # type: ignore[override]
+        self._dragging = True
+        self.grabbed.emit()             # stop the linger timer: it is in use now
+        self.scrubbed.emit(self._index_at(int(e.position().x())))
+
+    def mouseMoveEvent(self, e) -> None:  # type: ignore[override]
+        if self._dragging:
+            self.scrubbed.emit(self._index_at(int(e.position().x())))
+
+    def mouseReleaseEvent(self, e) -> None:  # type: ignore[override]
+        if self._dragging:
+            self._dragging = False
+            self.dropped.emit()
+
+    def paintEvent(self, e) -> None:  # type: ignore[override]
+        p = ngpc_theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        plate = QColor(p.bg_window)
+        plate.setAlpha(216)             # readable over any frame, still not opaque
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(plate)
+        painter.drawRoundedRect(0, 0, w, h, 8, 8)
+        w -= 12                          # inset, so nothing touches the rounded edge
+        painter.translate(6, 0)
+        track = self._track_width()
+        track_h = 6
+        y = (h - track_h) // 2
+        painter.setBrush(QColor(p.bg_hover))
+        painter.drawRoundedRect(0, y, track, track_h, 3, 3)
+        fill = 0
+        if self._total > 1:
+            # Filled from the OLDEST frame still held up to where you are, so the
+            # LEFT edge is the end of the history -- which is the thing you want to
+            # see coming while the key is down.
+            fill = int(track * (self._pos / (self._total - 1)))
+            painter.setBrush(QColor(p.accent))
+            painter.drawRoundedRect(0, y, max(2, fill), track_h, 3, 3)
+        # A tick per second of history, drawn AFTER the fill -- underneath it they
+        # vanished exactly where the cursor spends its time. Without them the strip
+        # says how far back you are only in words; with them you can see it, which
+        # is the difference between reading a number and knowing where you are.
+        if self._total > 60:
+            tick = QColor(p.text)
+            tick.setAlpha(90)          # readable over the fill AND over the track
+            painter.setBrush(tick)
+            seconds = self._total / 60.0
+            for i in range(1, int(seconds) + 1):
+                x = int(track * (i / seconds))
+                if 2 < x < track - 2:
+                    painter.drawRect(x, y - 3, 1, track_h + 6)
+        if self._total > 1:
+            painter.setBrush(QColor(p.accent))
+            painter.drawEllipse(max(5, min(track - 5, fill)) - 5, h // 2 - 5, 10, 10)
+        painter.setPen(QColor(p.text))
+        painter.setFont(self._font())
+        painter.drawText(QRect(track, 0, w - track - 4, h),
+                         int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                         self._label())
+        painter.end()
+
+
+def _close_pipe(pipe) -> None:
+    """Let go of whatever a core.netplay pipe is carrying.
+
+    Mirror play runs over more than one transport now -- a direct socket
+    (core.netplay.SocketPipe) or the lobby relay (core.lobby.LobbyPipe) -- and each
+    owns something nobody else will close. The socket one exposes `sock`; the lobby
+    one has a room to leave and a client thread to stop, behind `close()`.
+    """
+    if pipe is None:
+        return
+    closer = getattr(pipe, "close", None)
+    if callable(closer):
+        try:
+            closer()
+        except Exception:  # noqa: BLE001 -- tearing down; nothing left to salvage
+            pass
+        return
+    sock = getattr(pipe, "sock", None)
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 class PlayPage(QWidget):
     exit_requested = pyqtSignal()
     debug_requested = pyqtSignal()
@@ -2403,6 +2593,9 @@ class PlayPage(QWidget):
         # single-player page; a second page (P2) is created in its own window.
         self._player = 1
         self._link_peer = None               # the other PlayPage, when linked (local 2P)
+        # Frames this console already ran inside the peer's interleaved step, waiting
+        # for our own tick to collect them. See _run_frame_interleaved.
+        self._prerun = deque()
         self._net_link = None                # a core.link.TcpLink, when linked online
         # Mirror netplay (core/netplay.py): both consoles run HERE and only the
         # controller bytes cross the network. None = not in that mode.
@@ -2436,6 +2629,9 @@ class PlayPage(QWidget):
         self._bp_step_off = False          # parked on a breakpoint: step past it on resume
         self._rewind: deque[bytes] = deque()           # frame-perfect history
         self._rw_pos: int | None = None    # scrub cursor, or None when live at the tip
+        self._rw_hold = 0                  # steps the rewind key has been held
+        self._rw_bar_timer = None          # keeps the strip up after a rewind
+        self._rw_resume_after_drag = False  # was the game running when you grabbed it
         self._rewind_on = True
         self._rewinding = False            # held-rewind active (running backward)
         self._rw_accum = 0                 # tick divider so rewind plays at ~60 fps
@@ -2467,6 +2663,11 @@ class PlayPage(QWidget):
         self._frame = 0                    # free-running EMULATED frame counter
         self.pending = bytearray()
         self.watches = WatchSet()          # named memory watches, loaded per-ROM
+        # Named cheats: groups of addresses held at a value. NOT a second freezing
+        # mechanism -- they are written at the same point in the frame as the
+        # locked watches below, because two things that both "hold a value" would
+        # eventually disagree about which one won.
+        self.cheats = CheatSet()
         self.breaks = ExecBreakSet()       # PC execution breakpoints, loaded per-ROM
         # Debug tools that need to sample state once per EMULATED frame rather than at
         # the UI's refresh rate -- the RAM-search change counter is meaningless unless
@@ -2478,6 +2679,13 @@ class PlayPage(QWidget):
         # Rather than let them silently clobber each other, the viewer sets this and the
         # debug UI says out loud that watchpoints are suspended while it is on.
         self.access_probe: tuple[int, int] | None = None
+        # Input recording / replay. The console takes ONE byte of input per frame,
+        # so a session IS a snapshot plus a list of bytes -- see core/movie.py.
+        # Exactly one of these is ever set: recording a replay would just copy the
+        # file back out, which is not a thing anyone means to do.
+        self.movie_rec = None              # core.movie.Recorder while recording
+        self.movie_play = None             # core.movie.Player while replaying
+        self.movie_ended = None            # set to the finished Player, for the UI
         # Symbol table for breakpoint CONDITIONS, so a guard can say `[_player_hp] == 0`.
         # The debug window owns the loading and pushes it here.
         self.symbols = None
@@ -2505,6 +2713,19 @@ class PlayPage(QWidget):
         self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.overlay.setVisible(False)   # empty -> takes no space (no stray bottom bar)
         outer.addWidget(self.overlay, 0, Qt.AlignmentFlag.AlignCenter)
+        # The rewind history, under the picture and ONLY while you are in it. It
+        # belongs here rather than in the debug window: rewinding is something you
+        # do with the game in front of you, and a strip you have to open another
+        # window to look at is a strip you never look at.
+        # ⛔ NOT `outer.addWidget`. In the layout it TOOK SPACE, so the picture shrank
+        # the moment you touched rewind and grew back when you let go -- the image
+        # jumping around is worse than the information is worth. It is a floating
+        # child over the bottom of the canvas instead, like the OSD, and `_place_
+        # rewind_bar` follows the window.
+        self.rewind_bar = _RewindBar(self)
+        self.rewind_bar.scrubbed.connect(self._scrub_to)
+        self.rewind_bar.grabbed.connect(self._begin_scrub)
+        self.rewind_bar.dropped.connect(self._end_scrub)
         # On-screen stats (FPS etc.), a floating child pinned top-left over the canvas.
         self.osd = QLabel("", self); self.osd.setObjectName("osd")
         self.osd.move(10, 8); self.osd.setVisible(False)
@@ -2554,6 +2775,17 @@ class PlayPage(QWidget):
     def _break_path(self) -> Path:
         stem = self._rom_path.stem if self._rom_path else "ngpc"
         return WATCH_DIR / f"{stem}.breaks.json"
+
+    def _cheat_path(self) -> Path:
+        stem = self._rom_path.stem if self._rom_path else "ngpc"
+        return WATCH_DIR / f"{stem}.cheats.json"
+
+    def save_cheats(self) -> None:
+        if self._rom_path is not None:
+            try:
+                self.cheats.save(self._cheat_path())
+            except OSError:
+                pass
 
     def _save_watches(self) -> None:
         if self._rom_path is not None:
@@ -2623,8 +2855,13 @@ class PlayPage(QWidget):
         cartridge -- so the game boots on its own after the intro, like real hardware.
         A first-boot (unconfigured coin cell) still stops at the language/date setup."""
         self.stop()
+        # A frame a link peer ran ahead belonged to the console just closed; the new one
+        # has run nothing. (stop() detaches a mirror, but a local cable peer is detached
+        # by the shell, so this cannot be left to it.)
+        self._prerun.clear()
         self._rom_path = Path(rom)
         self.watches.load(self._watch_path())   # this ROM's named watches, if any
+        self.cheats.load(self._cheat_path())    # ...and its cheats
         self.breaks.load(self._break_path())    # ...and its execution breakpoints
         self._crashed = False
         # Console boot needs a real BIOS; the clean-room HLE only does the hand-off.
@@ -3157,11 +3394,13 @@ class PlayPage(QWidget):
         elif self._raw is not None:
             self._raw.reset(real_bios=True)
         self.held = 0
+        self._prerun.clear()          # those frames belong to the console we just reset
         self._power_pressed = False
         self._crashed = False
         self._bp_step_off = False
         self._did_handoff = False; self._menu_ticks = 0; self._bios_frames = 0
         self._rewind.clear(); self._rw_pos = None
+        self.rewind_bar.setVisible(False)   # no history left to show
         self.watches.rearm()
         self.apply_debug()                 # a reboot clears core breakpoints -> re-arm
 
@@ -3231,7 +3470,9 @@ class PlayPage(QWidget):
         rw.pressed.connect(self.start_rewind); rw.released.connect(self.stop_rewind)
         self._bar_tips.append((rw, "tb_rewind", cfg.HK_REWIND))
         h.addWidget(rw)
-        btn("⏵", "tb_step", self.step_forward, action=cfg.HK_STEP)
+        # ⏭, not ⏵: this steps ONE FRAME and pauses. With a play triangle on it
+        # people press it to resume, nothing resumes, and the emulator looks stuck.
+        btn("⏭", "tb_step", self.step_forward, action=cfg.HK_STEP)
         h.addSpacing(10)
         btn("−", "tb_slower", lambda: self.cycle_speed(False), action=cfg.HK_SLOWER)
         self._speed_lbl = QLabel("1×"); self._speed_lbl.setObjectName("barSpeed")
@@ -3450,6 +3691,10 @@ class PlayPage(QWidget):
                 + self.machine.read(0, STATE_MEM_LEN))
 
     def _apply_state(self, body: bytes, aux: bool = True) -> None:
+        # Frames a link peer ran ahead for us describe the console we are about to
+        # overwrite; collecting them after the load would report work this timeline
+        # never did (and rewind calls this for every step).
+        self._prerun.clear()
         cpu_len = ctypes.sizeof(type(self.machine.cpu()))
         aux_len = ctypes.sizeof(native.AuxState) if aux else 0
         cpu = type(self.machine.cpu()).from_buffer_copy(body[:cpu_len])
@@ -3496,6 +3741,7 @@ class PlayPage(QWidget):
         else:
             self._flash("bad state"); return
         self._rewind.clear(); self._rw_pos = None      # a loaded state starts a new timeline
+        self.rewind_bar.setVisible(False)
         self._blit()
         self._flash(cfg.tr(cfg.language(self._settings), "state_loaded").format(n=slot + 1))
 
@@ -3518,6 +3764,7 @@ class PlayPage(QWidget):
         self.paused = False
         self._rewinding = True
         self._rw_accum = 0
+        self._rw_hold = 0                  # steps held, for the acceleration ramp
 
     def stop_rewind(self) -> None:
         """Release rewind -> resume normal forward play, cleanly (fresh pacing + sink so
@@ -3526,7 +3773,9 @@ class PlayPage(QWidget):
             return
         self._rewinding = False
         self._rw_pos = None
+        self._rw_hold = 0                  # next hold starts slow again
         self.overlay.setText("")
+        self._linger_rewind_bar()          # stays grabbable for a few seconds
         self._reset_pacing()
         self._restart_audio()
 
@@ -3542,7 +3791,7 @@ class PlayPage(QWidget):
         self._apply_state(self._rewind[self._rw_pos])
         self._drain_audio_silently()
         self._blit()
-        self._flash(f"⏪ −{len(self._rewind) - 1 - self._rw_pos} f")
+        self._show_rewind_bar()
 
     def step_forward(self) -> None:
         """Go one frame toward the present: replay a buffered frame, or run a fresh one
@@ -3571,9 +3820,123 @@ class PlayPage(QWidget):
                 self._rewind.pop()
             self._rw_pos = None
         self.overlay.setText("")
+        self._linger_rewind_bar()
         self._drain_audio_silently()
         self._reset_pacing()
         self._restart_audio()          # a fresh sink -> pacing can never stay stalled
+
+    # ---- the rewind strip --------------------------------------------------
+    # It LINGERS after you let go of the key. Before that it vanished the instant
+    # the key came up -- so the only moment it existed was the moment your hand was
+    # busy holding a key, and the draggable cursor could never actually be grabbed.
+    # Two ways to use rewind means both have to be reachable from the other.
+    LINGER_MS = 4000
+
+    def _place_rewind_bar(self) -> None:
+        """Sit it over the bottom of the canvas, inside the picture's own width."""
+        bar = getattr(self, "rewind_bar", None)
+        if bar is None:
+            return
+        width = max(240, min(self.lcd.width() - 40, 560))
+        x = (self.width() - width) // 2
+        bottom = self.lcd.y() + self.lcd.height()
+        y = min(self.height(), bottom) - bar.HEIGHT - bar.MARGIN
+        bar.setGeometry(x, max(0, y), width, bar.HEIGHT)
+        bar.raise_()
+
+    def _hold_rewind_bar(self) -> None:
+        """Keep the strip up: it is in use, so it must not vanish under the cursor."""
+        if self._rw_bar_timer is not None:
+            self._rw_bar_timer.stop()
+
+    def _begin_scrub(self) -> None:
+        """The mouse took hold of the strip.
+
+        ⚠️ The "was it running" question can only be answered HERE, before the
+        first `_scrub_to` pauses the game. Asking it from inside `_scrub_to` reads
+        the pause that scrubbing itself just set, so the answer is always "it was
+        paused" and the game never resumes -- which is exactly the trap this whole
+        change exists to close.
+        """
+        self._hold_rewind_bar()
+        self._rw_resume_after_drag = not self.paused
+
+    def _end_scrub(self) -> None:
+        """Let go of the strip: carry on playing from where you dropped it.
+
+        ⛔ THE TRAP THIS CLOSES. Dragging pauses -- it has to, or the game runs out
+        from under the position you are choosing. But leaving it paused afterwards
+        strands you: this toolbar has NO play button. `⏵` is a one-frame step
+        (which pauses again) and `⏩` does nothing at all while paused, because the
+        loop returns before it. The only ways out were a key and the menu, and a
+        mouse gesture should not require finding either.
+
+        So the mouse mirrors the rewind key exactly: hold to move through time,
+        let go to carry on. A game that was already paused before the drag stays
+        paused, because then pausing was the thing you asked for.
+        """
+        if getattr(self, "_rw_resume_after_drag", False):
+            self.paused = False
+            self.overlay.setText("")
+        self._linger_rewind_bar()
+
+    def _linger_rewind_bar(self) -> None:
+        """Leave it up for a few seconds so it can be grabbed, then put it away."""
+        if not self.rewind_bar.isVisible():
+            return
+        if self._rw_bar_timer is None:
+            # ⛔ PARENTED, never `QTimer.singleShot`. A timer that belongs to nobody
+            # outlives the page, and firing into a torn-down widget kills the
+            # process with no traceback (see _flash).
+            self._rw_bar_timer = QTimer(self)
+            self._rw_bar_timer.setSingleShot(True)
+            self._rw_bar_timer.timeout.connect(self._hide_rewind_bar)
+        self._rw_bar_timer.start(self.LINGER_MS)
+
+    def _hide_rewind_bar(self) -> None:
+        if self._rewinding or self._rw_pos is not None:
+            return                      # still in use: the timer lost the race
+        self.rewind_bar.setVisible(False)
+
+    def _show_rewind_bar(self, speed: int = 1) -> None:
+        """Show the history strip at the position we are actually at.
+
+        While the key is HELD the ring is being popped, so the present is always
+        its last frame. While frame-stepping, `_rw_pos` is the cursor and the ring
+        is left intact -- two different truths, and the strip has to ask which one
+        applies rather than assume one of them.
+        """
+        total = len(self._rewind)
+        if total <= 1:
+            self.rewind_bar.setVisible(False)
+            return
+        pos = self._rw_pos if self._rw_pos is not None else total - 1
+        self.rewind_bar.set_range(total, pos, speed)
+        if not self.rewind_bar.isVisible():
+            self._place_rewind_bar()
+            self.rewind_bar.setVisible(True)
+            self.rewind_bar.raise_()
+
+    def _scrub_to(self, index: int) -> None:
+        """Jump to a point on the strip.
+
+        Dragging is why a strip beats a counter: you can go back to A MOMENT
+        instead of feeling your way there one key-press at a time.
+        """
+        if self.machine is None or len(self._rewind) <= 1:
+            return
+        index = max(0, min(len(self._rewind) - 1, int(index)))
+        # A drag is a deliberate look at the past, so it pauses -- exactly as
+        # stepping back does. Letting the game run under a dragged cursor would
+        # fight every position you chose.
+        self.paused = True
+        self._rewinding = False
+        self._hold_rewind_bar()
+        self._rw_pos = index
+        self._apply_state(self._rewind[index])
+        self._drain_audio_silently()
+        self._blit()
+        self._show_rewind_bar()
 
     def _rebuild_rewind_buffer(self) -> None:
         """Size the rewind ring from the setting (0 s = off). ~48 KiB per frame."""
@@ -3783,6 +4146,7 @@ class PlayPage(QWidget):
             self._reblit_soon()
         if not self.toolbar.isVisible():
             self._position_bar_show()
+        self._place_rewind_bar()
         super().resizeEvent(e)
 
     def keyReleaseEvent(self, e: QKeyEvent) -> None:  # noqa: N802
@@ -3868,6 +4232,32 @@ class PlayPage(QWidget):
                 return True
         return False
 
+    def _arm_capture(self, probing: bool, wrange, rrange) -> None:
+        """Open a fresh capture window for the frame about to run.
+
+        Called once per frame by whoever is about to RUN that frame: this page's own
+        tick, or -- in a local 2-player link -- the peer that drives it. Arming resets
+        the core's log, so it must happen before the frame and nowhere else.
+        """
+        if wrange is not None:               # fresh per-frame write capture
+            self.machine.set_write_log(wrange[0], wrange[1])
+        if rrange is not None:               # ...and read capture
+            self.machine.set_read_log(rrange[0], rrange[1])
+        if probing:                          # fresh window per frame for the viewer
+            self.machine.set_write_log(*self.access_probe)
+            self.machine.set_read_log(*self.access_probe)
+
+    def _capture_windows(self):
+        """(probing, write range, read range) for this page's next frame.
+
+        While the access probe owns the logs, watchpoints are suspended (see
+        apply_debug) -- so do not try to match against a window it is not watching.
+        """
+        probing = self.access_probe is not None
+        return (probing,
+                None if probing else self.watches.write_range(),
+                None if probing else self.watches.read_range())
+
     def _check_write_break(self) -> bool:
         """After a frame, see if any 'write' watch's address was written; pause on the
         first, naming the PC that did it (from the core write-log)."""
@@ -3902,6 +4292,69 @@ class PlayPage(QWidget):
         if self._turbo_mask:
             held = ngpc_input.apply_turbo(held, self._turbo_mask, self._frame, self._turbo_hz)
         return held & 0x7F
+
+    # ---- input recording / replay -----------------------------------------
+    # The whole feature hangs off ONE call site: the byte written to 0x00B0 once
+    # per emulated frame. Recording taps it, replay replaces it. Nothing else in
+    # the loop knows this exists, which is why it cannot desynchronise from the
+    # emulation -- there is no second clock to drift against.
+    def _movie_byte(self) -> int:
+        """The controller byte this frame: live, recorded, or replayed."""
+        if self.movie_play is not None:
+            b = self.movie_play.next()
+            if b is None:
+                self.movie_ended = self.movie_play
+                self.movie_play = None
+                self._flash("▶ replay finished")
+                return self._joypad_byte()      # the controller is yours again
+            return b
+        b = self._joypad_byte()
+        if self.movie_rec is not None:
+            self.movie_rec.record(b)
+        return b
+
+    def movie_start_recording(self, header: dict) -> bool:
+        """Begin a recording from the machine as it stands right now.
+
+        The starting state is captured HERE, not at the first frame: a recording
+        that begins one frame late replays one frame out of step forever, and a
+        one-frame drift is exactly the kind of difference that reads as an
+        emulation bug rather than as a broken tool.
+        """
+        from core import movie as mv
+        if self.machine is None or self._mirror_blocks():
+            return False
+        self.movie_play = None
+        self.movie_rec = mv.Recorder(header, self._capture_state())
+        self._flash("⏺ recording input")
+        return True
+
+    def movie_stop_recording(self):
+        rec, self.movie_rec = self.movie_rec, None
+        if rec is not None:
+            self._flash(f"⏺ recorded {rec.frames} frames")
+        return rec.movie if rec is not None else None
+
+    def movie_play_back(self, movie) -> bool:
+        """Replay a movie, applying its starting state first if it carries one."""
+        if self.machine is None or self._mirror_blocks():
+            return False
+        from core import movie as mv
+        self.movie_rec = None
+        self.movie_ended = None
+        if movie.state:
+            self._apply_state(movie.state)
+            self._blit()
+        self.movie_play = mv.Player(movie)
+        self.paused = False
+        self._flash(f"▶ replaying {movie.frames} frames")
+        return True
+
+    def movie_stop(self) -> None:
+        if self.movie_play is not None:
+            self._flash("▶ replay stopped")
+        self.movie_play = None
+        self.movie_rec = None
 
     # ---- link cable (two-player) ------------------------------------------
     def _show_link_menu(self) -> None:
@@ -3973,6 +4426,9 @@ class PlayPage(QWidget):
         if self.machine is not None:
             self.machine.serial_set_enabled(False)
         self._link_peer = None
+        # Frames run for us by a peer we no longer have would be collected as if the
+        # console had advanced, and it has not.
+        self._prerun.clear()
 
     def attach_net_link(self, net) -> None:
         """Wire this console to a REMOTE peer over a core.link.TcpLink (LAN/online).
@@ -4057,12 +4513,7 @@ class PlayPage(QWidget):
 
     def detach_mirror(self) -> None:
         if self._mirror is not None:
-            sock = getattr(self._mirror.pipe, "sock", None)
-            if sock is not None:
-                try:
-                    sock.close()          # the pipe owns it; nobody else will
-                except OSError:
-                    pass
+            _close_pipe(self._mirror.pipe)   # the pipe owns its transport
         self._mirror = None
         self._mirror_desynced = False
         self._mirror_waits = 0
@@ -4151,7 +4602,14 @@ class PlayPage(QWidget):
     # 2000 was tried first and judged on the final screen alone -- it fails, which is why
     # an earlier attempt at this concluded "sub-frame relaying does not help". It does;
     # the slice was simply too coarse. Do not raise it without re-running that table.
-    LINK_SLICE = 400
+    # Shared with mirror netplay, which owns two consoles for the same reason.
+    LINK_SLICE = core_link.CABLE_SLICE
+
+    # How far ahead of its own tick a linked peer may be driven. A pacer hands out up
+    # to a few frames at once (PlayPage._frames_due), and every one of those has to be
+    # interleaved or the peer is frozen for it. Past this the peer is not keeping up
+    # and the plain path takes over. See _run_frame_interleaved.
+    PRERUN_MAX = 8
 
     def _run_frame_relaying(self):
         """Run one frame, relaying the cable every `LINK_SLICE` instructions.
@@ -4163,6 +4621,18 @@ class PlayPage(QWidget):
             summ = self.machine.run_frames(1)
             self._pump_link()
             return summ
+        if self._prerun:
+            # Our peer already ran this frame for us, interleaved with its own. Collect
+            # it -- running again here would advance this console twice.
+            return self._prerun.popleft()
+        peer = self._link_peer
+        # Only drive a peer that is actually free to run this frame. A paused or
+        # rewinding console must stay where the user put it, and one that has not yet
+        # collected the frame we ran for it must not be advanced twice.
+        if (peer is not None and peer.machine is not None and not peer.paused
+                and not peer._rewinding
+                and len(peer._prerun) < self.PRERUN_MAX):        # noqa: SLF001
+            return self._run_frame_interleaved(peer)
         # Probe the core's own counter rather than trusting `_core_frames`: a rewind or a
         # savestate can move the core without the page's copy following.
         start = self.machine.run(0, record=False)[0].frame_count
@@ -4186,6 +4656,95 @@ class PlayPage(QWidget):
             self._pump_link()
         summ.executed = total
         return summ
+
+    # ⚡ TWO CONSOLES ON ONE PC MUST ADVANCE TOGETHER, NOT ONE WHOLE FRAME AT A TIME.
+    #
+    # Each page used to run its own frame end to end while the other console stood
+    # frozen. Relaying the cable mid-frame (LINK_SLICE) fixed one direction: player 1's
+    # bytes reach player 2 before player 2 runs, so player 2 can answer in the same
+    # frame. The OTHER direction stayed a whole frame late -- player 1 cannot see that
+    # answer until its next frame, because it has already finished this one.
+    #
+    # ⛔ THE BUG THIS ENDS: "select exhibition, both press A, and the game will not
+    # continue -- the host can back out with B, the other player cannot do anything."
+    # MEASURED end to end (Card Fighters' Clash, SNK + Capcom carts, from the VS menu):
+    # the HP exchange that starts a match dies after 118/102 bytes, one console showing
+    # "LINK ERROR. CHECK CONNECTIONS AND SETTINGS." and the other waiting at "CHOOSING
+    # HP." for ever. The game side is not subtle: its packet reader (0x24277C) polls
+    # COMGETDATA a few dozen times and, if the next byte is not in the BIOS ring yet,
+    # jumps to 0x242735 -> 0x242759, which raises its error flag. One frame of one-sided
+    # latency is enough to lose that race.
+    #
+    # PROVEN, same bench, only this scheduling changed, sweeping an arbitrary
+    # instruction-level phase offset between the two consoles (0/97/1000/5000/20000):
+    #     a frame each, then relay   -> 2 runs of 5 reach the match
+    #     interleaved by LINK_SLICE  -> 5 of 5, every time
+    # and with it the match actually starts (both consoles at SHUFFLE PILE, 428/482
+    # bytes and climbing) -- which no CFC link had ever reached here.
+    #
+    # 🔑 AND IT HAS TO SURVIVE A LUMPY PACER. `_frames_due()` is not 1 every tick: the
+    # audio clock (player 1) and the wall clock (player 2) hand out 0 frames for a
+    # while and then 3. Driving the peer for only the FIRST frame of such a batch
+    # leaves it frozen for the other two -- the very gap this exists to close.
+    # MEASURED with the same CFC bench, one page running its frames in batches:
+    #     batch of 1 or 2 -> the match starts;  batch of 3 or 4 -> LINK ERROR again,
+    # and the tester's report of the batched case is "it gets further now, but it
+    # blocks on the last screen before the match, CHOOSE FIRST PLAYER".
+    # So the peer's ready-run frames QUEUE (`_prerun`) instead of occupying one slot,
+    # and the driver keeps interleaving until the queue is PRERUN_MAX deep -- past
+    # that the peer is simply not keeping up, and falling back to the plain path is
+    # better than running it further and further ahead of its own tick.
+    #
+    # ⚠️ Online this cannot be done: the peer is on another PC, and its answer is a
+    # network round trip away. How much of that a game survives is its own business --
+    # MEASURED for CFC's VS handshake, with a smooth (not frame-bunched) delay on the
+    # wire: fine up to ~60 ms one way, dead by ~77 ms. So a cable-relayed CFC match
+    # wants a good connection, and mirror play (core/netplay.py) is the mode that does
+    # not care at all.
+    # ⚠️ Beware of measuring this with a delay quantised to whole FRAMES: that delivers
+    # in bursts and dies far earlier, which is how "CFC tolerates no latency" was once
+    # concluded. It measures the burst, not the latency.
+    def _run_frame_interleaved(self, peer: "PlayPage"):
+        """Advance this console AND its local peer by one frame, a slice at a time."""
+        # The peer's own tick writes its controller before ITS frame; that frame is
+        # about to happen here instead, so give it the freshest pad state rather than
+        # the one left over from last time.
+        peer.machine.write(0x00B0, bytes([peer._joypad_byte()]))   # noqa: SLF001
+        # ...and its debug capture, for the same reason: this frame is the peer's, so
+        # its watchpoints and its access probe have to be armed for it HERE. Its own
+        # tick cannot do it -- by the time it runs, the frame is over.
+        peer._arm_capture(*peer._capture_windows())                # noqa: SLF001
+        pages = (self, peer)
+        starts = [p.machine.run(0, record=False)[0].frame_count for p in pages]
+        totals = [0, 0]
+        summaries = [None, None]
+        done = [False, False]
+        for _ in range(256):
+            for i, p in enumerate(pages):
+                if done[i]:
+                    continue
+                summ, _ = p.machine.run(p.LINK_SLICE, record=False)
+                summaries[i] = summ
+                totals[i] += summ.executed
+                if (summ.stop_status in _CRASH_STATUSES
+                        or summ.stop_status == native.STATUS_BREAKPOINT
+                        or summ.executed == 0                 # core refused to advance
+                        or summ.frame_count != starts[i]):    # this console's frame is done
+                    done[i] = True
+            for p in pages:
+                p._pump_link()                    # noqa: SLF001 -- same class
+            if all(done):
+                break
+        for i, p in enumerate(pages):
+            if summaries[i] is None or not done[i]:
+                # Never leave a frame half-run: finish it the plain way.
+                summaries[i] = p.machine.run_frames(1)
+                totals[i] += summaries[i].executed
+                p._pump_link()                    # noqa: SLF001
+            summaries[i].executed = totals[i]
+        # The peer's frame is spent; its own tick collects it instead of running again.
+        peer._prerun.append(summaries[1])         # noqa: SLF001
+        return summaries[0]
 
     def _pump_link(self) -> None:
         mon = self.link_monitor
@@ -4244,17 +4803,39 @@ class PlayPage(QWidget):
             self._rw_accum += 1
             if self._rw_accum >= 4:          # ~60 fps reverse (the timer ticks ~4 ms)
                 self._rw_accum = 0
-                if len(self._rewind) > 1:
+                # ⚡ IT SPEEDS UP THE LONGER YOU HOLD IT. At one frame per step this
+                # ran backwards in real time, so reaching the far end of a 30-second
+                # buffer took thirty seconds of holding a key -- which is not
+                # rewinding, it is waiting. The first half-second stays at 1x so a
+                # short tap still lands on the frame you meant; after that it ramps
+                # to 8x, and the whole buffer is a couple of seconds away.
+                self._rw_hold += 1
+                steps = rewind_speed(self._rw_hold)
+                popped = 0
+                while popped < steps and len(self._rewind) > 1:
                     self._rewind.pop()       # drop the current frame...
+                    popped += 1
+                if popped:
                     self._apply_state(self._rewind[-1])   # ...show the one before it
-                self._drain_audio_silently()
-                self.overlay.setText(f"⏪ {len(self._rewind)}")
+                    self._drain_audio_silently()
+                # The strip below the picture, not a frame count over it: `⏪ 137`
+                # is a unit nobody thinks in, printed on the thing you are trying
+                # to look at, and it never said the one thing that matters while
+                # you hold the key -- how much history is LEFT.
+                self._show_rewind_bar(speed=steps)
                 self._blit()
             return
         if self.paused:
+            # ⚡ THE STRIP IS REACHABLE WHILE PAUSED, and that is the whole point of
+            # having a draggable one. It first appeared ONLY while rewinding -- so
+            # to see it you had to hold the key, and while holding the key you
+            # cannot drag it. A scrubber you can never grab is a decoration.
+            self._show_rewind_bar()
             return
         if self._rw_pos is not None:         # resuming after a frame-step scrub
-            self._leave_rewind()
+            self._leave_rewind()             # ...which puts the strip away itself
+        elif self._rw_bar_timer is None or not self._rw_bar_timer.isActive():
+            self.rewind_bar.setVisible(False)   # live, and the linger has expired
         if self._bp_step_off:                # resuming while parked on a breakpoint
             self._step_off_breakpoint()
             self._bp_step_off = False
@@ -4276,11 +4857,7 @@ class PlayPage(QWidget):
                 self._restart_audio()
             return
         self._stall_ticks = 0
-        # While the access probe owns the logs, watchpoints are suspended (see
-        # apply_debug) -- so do not try to match against a window it is not watching.
-        probing = self.access_probe is not None
-        wrange = None if probing else self.watches.write_range()
-        rrange = None if probing else self.watches.read_range()
+        probing, wrange, rrange = self._capture_windows()
         locked = self.watches.locked()
         ran = 0
         emu_t0 = time.perf_counter()
@@ -4293,16 +4870,18 @@ class PlayPage(QWidget):
             # In mirror mode the session owns the controller byte: it plays the one
             # captured `delay` frames ago, so both PCs feed the two consoles the same
             # streams. Writing the live pad here would fight it.
-            if self._mirror is None:
-                self.machine.write(0x00B0, bytes([self._joypad_byte()]))
+            # ⛔ ...UNLESS A LINK PEER ALREADY RAN THIS FRAME FOR US. Arming the capture
+            # windows RESETS them, so doing it here would wipe what that frame recorded
+            # a moment ago -- and the watchpoint check below would then read an empty
+            # log every time. MEASURED before this guard: player 2's frame captured 801
+            # writes inside player 1's tick, and player 2's own tick saw 0. The driver
+            # arms them instead (see _run_frame_interleaved).
+            already_ran = bool(self._prerun)
+            if self._mirror is None and not already_ran:
+                self.machine.write(0x00B0, bytes([self._movie_byte()]))
             self._frame += 1
-            if wrange is not None:               # fresh per-frame write capture
-                self.machine.set_write_log(wrange[0], wrange[1])
-            if rrange is not None:               # ...and read capture
-                self.machine.set_read_log(rrange[0], rrange[1])
-            if probing:                          # fresh window per frame for the viewer
-                self.machine.set_write_log(*self.access_probe)
-                self.machine.set_read_log(*self.access_probe)
+            if not already_ran:
+                self._arm_capture(probing, wrange, rrange)
             if self._mirror is not None:
                 summ = self._step_mirror()
                 if summ is None:
@@ -4346,6 +4925,10 @@ class PlayPage(QWidget):
                     return
             for w in locked:                     # freeze: pin each locked value
                 self.machine.write(w.addr, w.lock_bytes())
+            # Cheats ride the SAME point in the frame as the locks above, on
+            # purpose: a second place that also holds values would race this one,
+            # and which won would depend on where in the frame each ran.
+            self.cheats.apply(self.machine)
             for hook in self.frame_hooks:        # per-frame debug sampling, if subscribed
                 try:
                     hook()
@@ -4678,6 +5261,11 @@ class Shell(QMainWindow):
     def __init__(self, rom: str | None = None) -> None:
         super().__init__()
         self._settings = cfg.make_settings()
+        # Settings live in the registry by default, which has no undo. Keep a copy
+        # beside the app and put it back when the store comes up empty -- see
+        # `cfg.protect_settings`. Reported, never silent: settings reappearing on
+        # their own is nearly as confusing as losing them.
+        self._settings_recovered = cfg.protect_settings(self._settings)
         self.setWindowTitle("NgpCraft Emulator")
         if APP_ICON.is_file():
             self.setWindowIcon(QIcon(str(APP_ICON)))
@@ -4795,6 +5383,27 @@ class Shell(QMainWindow):
         self._toggle_rail(not bool(self._settings.value("win/rail_collapsed", False, type=bool)))
         if rom:
             self._launch(rom)
+
+    def showEvent(self, e) -> None:  # type: ignore[override]
+        super().showEvent(e)
+        # Say it ONCE, and only when settings really came back. Restoring somebody's
+        # preferences behind their back is nearly as confusing as losing them: they
+        # would have no idea why the app knows their BIOS path again.
+        recovered, self._settings_recovered = self._settings_recovered, 0
+        if not recovered:
+            return
+        lang = cfg.language(self._settings)
+        # ⛔ NOT `QMessageBox.information()`. That call is MODAL and blocks until
+        # someone clicks it -- so the emulator stops dead at startup behind a box
+        # nobody asked for, and anything driving it without a human (the test
+        # suite, a script) hangs forever. Measured: it took the suite from 2
+        # minutes to "never finishes".
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle(cfg.tr(lang, "settings_restored_title"))
+        box.setText(cfg.tr(lang, "settings_restored").format(n=recovered))
+        box.setModal(False)
+        box.show()
 
     @staticmethod
     def _wrap_nav(label: str, fm: QFontMetrics) -> str:
@@ -5060,7 +5669,12 @@ class Shell(QMainWindow):
         if getattr(self, "_link_status", None) is not None:
             self._link_status.stop(); self._link_status = None
         QApplication.instance().removeEventFilter(self._link_input)
+        # BOTH pages, not just this one. Player 2's page still points at player 1's, and
+        # a single tick from its timer before it is destroyed would drive a console that
+        # believes it is on its own again.
+        peer = self._link2p.play
         self.play.detach_link()
+        peer.detach_link()
         if getattr(self, "_link_framed", False):
             # Hand player 1's page back to the shell, exactly where it lives, and come
             # out from behind the frame. Called BEFORE `_to_library` switches pages
@@ -5120,8 +5734,9 @@ class Shell(QMainWindow):
     def _on_net_connected(self, sock) -> None:
         from core.link import TcpLink
         if self._mirror_pending is not None:        # the other online mode
+            from core.netplay import SocketPipe
             mode, self._mirror_pending = self._mirror_pending, None
-            self._begin_mirror(sock, host=(mode == "host"))
+            self._begin_mirror(SocketPipe(sock), host=(mode == "host"))
             return
         if self.play.machine is None:
             try: sock.close()
@@ -5216,7 +5831,7 @@ class Shell(QMainWindow):
             self._settings.setValue("online/mirror_delay", int(d))
         return bool(ok)
 
-    def _mirror_handshake(self, host: bool):
+    def _mirror_handshake(self, host: bool, delay: int | None = None):
         """The fingerprint both PCs must agree on, and our own cartridge's.
 
         The cartridge is ANNOUNCED, not compared: the images are traded (see
@@ -5237,11 +5852,19 @@ class Shell(QMainWindow):
         return Handshake(
             rom_hash=hashlib.sha1(page.session._rom).hexdigest()[:16],
             bios_hash=bios_hash,
+            # ...and the SCHEDULE the two consoles are stepped on. core_fingerprint
+            # hashes the DLL, so a change to how Python interleaves them would not
+            # move it -- and two builds stepping the pair differently drift.
             core_version=(native.core_fingerprint()
+                          + f"+ilv{core_link.CABLE_SLICE}"
                           + ("+waits" if cfg.cart_wait_states(self._settings) else "")),
-            delay=cfg.mirror_delay(self._settings), host=host)
+            # The input delay MUST be identical on both PCs (the handshake refuses a
+            # mismatch), so when the room advertises one, that is the one -- the joiner
+            # follows the host rather than its own setting.
+            delay=(cfg.mirror_delay(self._settings) if delay is None else int(delay)),
+            host=host)
 
-    def _begin_mirror(self, sock, host: bool) -> None:
+    def _begin_mirror(self, pipe, host: bool, delay: int | None = None) -> None:
         """Trade cartridges with the peer, then start the mirror session.
 
         ⚡ TWO PHASES, AND THE FIRST ONE IS WHY THE MODE IS USABLE AT ALL. Building the
@@ -5251,16 +5874,18 @@ class Shell(QMainWindow):
         link. So each side sends its own image and builds the peer's console from the
         one it receives. A few MiB, once, with progress on screen.
         """
-        from core.netplay import CartExchange, SocketPipe
+        from core.netplay import CartExchange
 
+        # A trade already running belongs to an attempt nobody is waiting for any more:
+        # end it (and let go of its transport) rather than leak a timer and a socket --
+        # or, over the lobby, a live client thread sitting in a room.
+        self._end_mirror_bringup()
         page = self.play
         if page.machine is None or page.session is None or page._rom_path is None:
-            try: sock.close()
-            except OSError: pass
+            _close_pipe(pipe)
             return
-        pipe = SocketPipe(sock)
         self._mirror_boot = CartExchange(pipe, page.session._rom,
-                                         self._mirror_handshake(host))
+                                         self._mirror_handshake(host, delay))
         self._mirror_boot_host = host
         page._flash(cfg.tr(cfg.language(self._settings), "mirror_trading"), 60_000)
         self._mirror_timer = QTimer(self)
@@ -5271,6 +5896,11 @@ class Shell(QMainWindow):
         """Drive the cartridge trade, then hand over to the session."""
         x = self._mirror_boot
         if x is None:
+            return
+        if self.play.machine is None:
+            # The game was closed mid-trade. There is nothing left to build a session
+            # for, and pumping on would leave the player sitting in a lobby room.
+            self._end_mirror_bringup()
             return
         for _ in range(8):          # a few chunks per tick: a 4 MiB cart is ~128 of them
             x.pump()
@@ -5288,12 +5918,21 @@ class Shell(QMainWindow):
             return
         peer_image, prime = x.peer_image, x.leftover
         pipe, hs = x.pipe, x.hs
-        self._end_mirror_bringup()
+        self._end_mirror_bringup(close=False)   # the session takes the transport over
         self._start_mirror(pipe, hs, peer_image, prime)
 
-    def _end_mirror_bringup(self) -> None:
+    def _end_mirror_bringup(self, close: bool = True) -> None:
+        """Stop the cartridge trade, and by default let go of its transport.
+
+        ⛔ `close=False` is for the ONE caller that hands the pipe straight to the
+        session -- everybody else is abandoning, and an abandoned trade used to leave
+        its socket open (and, over the lobby, a client thread and a room the player
+        never left).
+        """
         if self._mirror_timer is not None:
             self._mirror_timer.stop(); self._mirror_timer = None
+        if close and self._mirror_boot is not None:
+            _close_pipe(self._mirror_boot.pipe)
         self._mirror_boot = None
 
     def _start_mirror(self, pipe, hs, peer_image: bytes, prime: bytes) -> None:
@@ -5302,6 +5941,7 @@ class Shell(QMainWindow):
 
         page = self.play
         if page.machine is None or page.session is None or page._rom_path is None:
+            _close_pipe(pipe)          # nobody else holds it now
             return
         # The mirror is a session like any other, minus the two things a copy of
         # somebody else's console must not have: it never writes a save, and it has no
@@ -5375,10 +6015,21 @@ class Shell(QMainWindow):
         dlg.linked.connect(self._on_lobby_linked)
         dlg.exec()
 
-    def _on_lobby_linked(self, client) -> None:
-        from core.lobby import LobbyLink
+    def _on_lobby_linked(self, client, info: dict | None = None) -> None:
+        from core.lobby import LobbyLink, LobbyPipe
         if self.play.machine is None:
             client.close(); return
+        # ⚡ THE ROOM SAYS WHICH LINK IT IS. The relay carries opaque bytes, so the two
+        # clients have to agree on what they mean -- and only the host chose. A room
+        # made by a client that predates mirror rooms says nothing, which means cable.
+        info = info or {}
+        if info.get("mode") == "mirror":
+            # Mirror play over the lobby: the room, the pairing and the NAT traversal
+            # are the same; only what travels on it changes. Card Fighters' Clash needs
+            # this -- its VS handshake gives up on latency the cable mode cannot avoid.
+            self._begin_mirror(LobbyPipe(client), host=(info.get("role") == "host"),
+                               delay=info.get("delay"))
+            return
         net = LobbyLink(self.play.machine, client)
         self.play.attach_net_link(net)
         # The lobby has its OWN way of losing a peer, and it does not go through

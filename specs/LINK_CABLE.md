@@ -56,7 +56,13 @@ Consequences that matter:
   page.
 - **Flow control.** Our RTS = 0xB2 bit0 (0 = ready to receive). The peer's RTS
   drives our CTS0 pin, which halts our transmitter when the game set
-  SC0MOD<CTSE>.
+  SC0MOD<CTSE>. **CTS gates the START of a byte, never one already going out**
+  (datasheet §3.11: "after completion of the current data send"; fig 3.11(16)
+  Note 1: "if the CTS signal rises during transmission, the NEXT data is not
+  sent"). The core used to re-test CTS every tick and freeze the byte in flight
+  — measured at 6001 held ticks inside one frame of a Card Fighters' Clash VS
+  exchange. `Machine::serial_tx_shifting` is what remembers that a byte has
+  committed.
 
 ## 2. Transports
 
@@ -73,13 +79,12 @@ All three present the same interface (`pump()` / `disconnect()` /
 The shell's local 2-player relay is inline in `PlayPage._pump_link` rather than
 using `InProcessLink`; it carries the same tap.
 
-**A linked frame is relayed every `PlayPage.LINK_SLICE` = 400 instructions, and that
-number is a correctness figure, not a comfort setting.** Each page pumps after ITS OWN
-frame and the two tick one after the other, so player 1's bytes reach player 2 before
-player 2 runs — but player 2's answer waits for the next frame. The Last Blade's
-handshake times out on exactly that one frame: measured on the game's own "message
-received" byte `0x4B9D`, the console that speaks first waits from +0 to +6 for the
-reply and gives up at +6, after which both consoles show **LINK ERROR**.
+**A linked frame is relayed every `core.link.CABLE_SLICE` = 400 instructions
+(`PlayPage.LINK_SLICE` points at it), and that number is a correctness figure, not a
+comfort setting.** The Last Blade's handshake times out on a single frame of latency:
+measured on the game's own "message received" byte `0x4B9D`, the console that speaks
+first waits from +0 to +6 for the reply and gives up at +6, after which both consoles
+show **LINK ERROR**.
 
 | slice | message received | consumed | link driver at +900 |
 |---|---|---|---|
@@ -94,6 +99,32 @@ the slice without re-running that table. Slicing is not free (a few percent of h
 time, plus the speed table above `_flash_overlay`), so a console with **no peer** keeps
 the plain one-call-per-frame path. See also [NETPLAY_MIRROR.md §0](NETPLAY_MIRROR.md).
 
+**Relaying mid-frame only fixes ONE direction, and that was not enough.** Each page used
+to run its whole frame while the other console stood still: player 2 could consume
+player 1's bytes and answer inside its own frame, but player 1 had already finished, so
+it saw that answer a frame late — every time. Card Fighters' Clash loses its VS
+handshake to exactly that (its packet reader polls the BIOS ring a few dozen times and,
+finding nothing, raises its error flag). So **two consoles on one PC are INTERLEAVED**:
+`PlayPage._run_frame_interleaved` runs a slice of each in turn, pumping between slices,
+and the driven page collects its frame from `_prerun` instead of running it again.
+
+| scheduling | reaches a CFC match (5 arbitrary phase offsets) |
+|---|---|
+| a whole frame each, then relay | **2 / 5** |
+| interleaved by `CABLE_SLICE` | **5 / 5** |
+
+Two consequences that are easy to get wrong:
+- **`_frames_due()` is not 1 per tick** — the pacers hand out 0 for a while and then 3.
+  Interleaving only the first frame of such a batch freezes the peer for the rest, and
+  CFC fails again at a batch of 3. Ready-run frames therefore **queue** (`PRERUN_MAX`).
+- **Arming a capture window RESETS the core's log**, so the page that RUNS a frame must
+  arm it (`_arm_capture`), and a page that merely collects one must not. Measured when
+  this went in: player 2's frame captured 801 writes and player 2's own tick read 0 —
+  its watchpoints and access viewer silently dead.
+
+`core.link.run_two_consoles_interleaved` is the same loop, shared with mirror netplay,
+which owns two consoles for the same reason.
+
 ⚠️ `TcpLink` writes with `send()` plus a pending buffer, **never `sendall()`**: on a
 non-blocking socket `sendall` raises `BlockingIOError` the moment the kernel buffer
 fills and does not say how much it already handed over, so the old code dropped a whole
@@ -105,7 +136,14 @@ network and slows down with it (0.56x speed at a 67 ms round trip, measured). Mi
 netplay runs BOTH consoles on each PC and sends only the controller bytes, so the
 cable is local and the latency is spent on input delay instead —
 see [NETPLAY_MIRROR.md](NETPLAY_MIRROR.md). Both modes ship; they are mutually
-exclusive at runtime (`Shell._one_link_at_a_time`).
+exclusive at runtime (`Shell._one_link_at_a_time`), and **both are reachable from the
+lobby**: a room advertises which one it is for (`mode`), so the joiner starts the same.
+
+**How much network latency a cable-relayed game survives is the GAME's business.**
+Measured for CFC's VS handshake with a smooth delay on the wire: fine up to ~61 ms one
+way, dead by ~77 ms. ⚠️ Do not measure this with a delay quantised to whole FRAMES —
+that delivers in bursts and dies far earlier, which is how "CFC tolerates no latency at
+all" was once wrongly concluded.
 
 Delivery into the receive FIFO is **unconditional**. The core's `serial_tick` is
 the authoritative flow-control gate (it only PRESENTS a byte once our RTS is

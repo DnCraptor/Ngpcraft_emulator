@@ -267,3 +267,93 @@ def test_a_linked_frame_relays_the_cable_many_times_over(app, monkeypatch):
         if sh._link2p is not None:
             sh._link2p.close()
         sh.play.stop()
+
+
+def test_neither_linked_console_is_frozen_while_the_other_runs_a_frame(app, monkeypatch):
+    """⚡ Relaying mid-frame only fixes ONE direction. The consoles must also RUN
+    together, or the answer is still a whole frame away.
+
+    Player 1 used to run its frame end to end while player 2 stood still. Player 2
+    could then consume player 1's bytes and reply in its own frame -- but player 1
+    had already finished, so it saw that reply a frame late, every time. Card
+    Fighters' Clash loses exactly that race at the HP exchange that starts a VS
+    match: its packet reader (0x24277C) polls the BIOS ring a few dozen times and,
+    finding nothing, jumps to its error branch. MEASURED end to end with the SNK and
+    Capcom carts, sweeping an arbitrary instruction-level phase offset between the
+    two consoles: a frame each reaches the match 2 times in 5, interleaved 5 in 5 --
+    and the losing runs are the user's report, "LINK ERROR. CHECK CONNECTIONS AND
+    SETTINGS." on one console and "CHOOSING HP." for ever on the other.
+
+    So: during ONE call of player 1's frame, player 2's core must have advanced too.
+    """
+    import ngpc_shell
+    from PyQt6.QtWidgets import QFileDialog
+
+    sh = ngpc_shell.Shell()
+    try:
+        sh._settings.setValue("paths/bios", str(BIOS))
+        sh.play._frames_due = lambda: 1
+        sh.play.start(ROM)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                            staticmethod(lambda *a, **k: (str(ROM), "")))
+        sh._launch_link_2p()
+        p2 = sh._link2p.play
+        p2._frames_due = lambda: 1
+        for _ in range(30):                 # past the boot, both consoles running
+            sh.play._tick()
+            p2._tick()
+
+        def core_frame(page):
+            return page.machine.run(0, record=False)[0].frame_count
+
+        # CONTROL first: p2 is not running by itself here -- nothing ticks it.
+        before = core_frame(p2)
+        assert core_frame(p2) == before, "reading the counter must not advance it"
+
+        sh.play._run_frame_relaying()       # exactly one frame of PLAYER 1
+        assert core_frame(p2) > before, (
+            "player 2 stood still for a whole frame of player 1: its reply can only "
+            "reach player 1 next frame, which is the latency CFC's VS handshake "
+            "cannot survive")
+
+        # ...and that frame is player 2's, not an extra one: its own tick collects
+        # the work instead of running it again.
+        assert len(p2._prerun) == 1
+        after = core_frame(p2)
+        p2._tick()
+        assert core_frame(p2) == after, "player 2 ran the same frame twice"
+
+        # 🔑 AND IT HOLDS FOR A BATCH. `_frames_due` is not 1 every tick -- the audio
+        # and wall clocks hand out 0 frames for a while and then 3. If only the first
+        # frame of a batch interleaves, the peer is frozen for the rest, which is the
+        # gap this closes. (CFC bench: batches of 3 brought the LINK ERROR straight
+        # back.) So three of player 1's frames must move player 2 three times.
+        before = core_frame(p2)
+        for _ in range(3):
+            sh.play._run_frame_relaying()
+        assert core_frame(p2) == before + 3, (
+            "player 2 was frozen for part of a multi-frame batch of player 1")
+
+        # ⛔ ...AND PLAYER 2'S DEBUG CAPTURE MUST SURVIVE THE HAND-OVER. Arming a
+        # capture window RESETS the core's log, so a page that arms one in its own tick
+        # and then merely COLLECTS a frame the peer already ran wipes what that frame
+        # recorded. MEASURED when this first went in: player 2's frame captured 801
+        # writes inside player 1's tick, and player 2's own tick then read 0 -- every
+        # watchpoint and the access viewer dead for player 2, silently.
+        window = (0x4000, 0x4FFF)
+        sh.play.access_probe = window
+        p2.access_probe = window
+        seen = []
+        for _ in range(4):
+            sh.play._tick()          # runs player 1's frame AND player 2's
+            p2._tick()               # ...which player 2 only collects
+            seen.append(p2.machine.write_log_count())
+        assert all(n > 0 for n in seen), (
+            f"player 2's frame was captured by nobody: {seen}")
+    finally:
+        sh.play.access_probe = None
+        if sh._link2p is not None:
+            sh._link2p.play.access_probe = None
+        if sh._link2p is not None:
+            sh._link2p.close()
+        sh.play.stop()

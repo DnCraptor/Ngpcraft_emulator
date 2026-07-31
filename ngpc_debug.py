@@ -24,13 +24,14 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PyQt6.QtCore import Qt, QTimer, QRect
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QImage, QPixmap, QFont, QBrush, QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QPlainTextEdit, QTabWidget, QComboBox, QLineEdit, QSpinBox, QCheckBox,
+    QPlainTextEdit, QComboBox, QLineEdit, QSpinBox, QCheckBox,
     QScrollArea, QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QToolTip, QApplication, QMessageBox,
+    QAbstractItemView, QToolTip, QApplication, QMessageBox, QTabBar,
+    QStackedWidget,
 )
 
 from core import native
@@ -399,6 +400,123 @@ class _TileGrid(QLabel):
         super().mousePressEvent(e)
 
 
+class _TwoRowTabs(QWidget):
+    """Tabs on two rows: a category on top, its panels underneath.
+
+    A single row stopped working somewhere around twenty panels -- Qt then either
+    shrinks every label past reading or hides half of them behind scroll arrows,
+    and a tool you cannot see the tabs of is a tool you stop opening.
+
+    This is NOT a wrapping tab bar. Qt has no such thing, and the versions people
+    build by overriding the layout break on every style change. It is two real
+    QTabBars over a QStackedWidget, so the theme dresses them like every other tab
+    in the application for free.
+
+    It deliberately keeps QTabWidget's interface -- `addTab`, `count`, `tabText`,
+    `currentIndex`, `setCurrentIndex`, `currentChanged` -- indexed by a FLAT panel
+    number that ignores the grouping. Callers that want "the Disassembly tab" find
+    it by name across the whole set, exactly as before, and nothing outside this
+    class has to know panels are grouped at all.
+    """
+
+    currentChanged = pyqtSignal(int)
+
+    def __init__(self) -> None:
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self._cat_bar = QTabBar()
+        self._cat_bar.setExpanding(False)
+        self._cat_bar.setDrawBase(False)
+        self._cat_bar.currentChanged.connect(self._on_category)
+        lay.addWidget(self._cat_bar)
+
+        self._tab_bar = QTabBar()
+        self._tab_bar.setExpanding(False)
+        self._tab_bar.setDrawBase(False)
+        self._tab_bar.currentChanged.connect(self._on_tab)
+        lay.addWidget(self._tab_bar)
+
+        self._stack = QStackedWidget()
+        lay.addWidget(self._stack, 1)
+
+        self._titles: list[str] = []          # flat index -> title
+        self._categories: list[str] = []      # flat index -> category
+        self._cat_order: list[str] = []
+        self._row: list[int] = []             # second-row position -> flat index
+        self._current = -1
+
+    # ---- the QTabWidget-shaped interface
+    def addTab(self, widget: QWidget, title: str, category: str = "") -> int:
+        index = len(self._titles)
+        self._titles.append(title)
+        self._categories.append(category or title)
+        self._stack.addWidget(widget)
+        if self._categories[index] not in self._cat_order:
+            self._cat_order.append(self._categories[index])
+            self._cat_bar.blockSignals(True)
+            self._cat_bar.addTab(self._categories[index])
+            self._cat_bar.blockSignals(False)
+        if index == 0:
+            self.setCurrentIndex(0)
+        return index
+
+    def count(self) -> int:
+        return len(self._titles)
+
+    def tabText(self, index: int) -> str:
+        return self._titles[index] if 0 <= index < len(self._titles) else ""
+
+    def currentIndex(self) -> int:
+        return self._current
+
+    def setCurrentIndex(self, index: int) -> None:
+        if not (0 <= index < len(self._titles)) or index == self._current:
+            return
+        category = self._categories[index]
+        if self._cat_order.index(category) != self._cat_bar.currentIndex():
+            self._cat_bar.blockSignals(True)
+            self._cat_bar.setCurrentIndex(self._cat_order.index(category))
+            self._cat_bar.blockSignals(False)
+        self._fill_row(category)
+        self._select(index)
+
+    # ---- internals
+    def _fill_row(self, category: str) -> None:
+        self._row = [i for i, c in enumerate(self._categories) if c == category]
+        self._tab_bar.blockSignals(True)
+        while self._tab_bar.count():
+            self._tab_bar.removeTab(0)
+        for i in self._row:
+            self._tab_bar.addTab(self._titles[i])
+        self._tab_bar.blockSignals(False)
+        # A category with a single panel does not need a second row saying its name
+        # back to you.
+        self._tab_bar.setVisible(len(self._row) > 1)
+
+    def _select(self, index: int) -> None:
+        self._current = index
+        self._stack.setCurrentIndex(index)
+        if index in self._row:
+            self._tab_bar.blockSignals(True)
+            self._tab_bar.setCurrentIndex(self._row.index(index))
+            self._tab_bar.blockSignals(False)
+        self.currentChanged.emit(index)
+
+    def _on_category(self, cat_index: int) -> None:
+        if not (0 <= cat_index < len(self._cat_order)):
+            return
+        self._fill_row(self._cat_order[cat_index])
+        if self._row:
+            self._select(self._row[0])
+
+    def _on_tab(self, row_index: int) -> None:
+        if 0 <= row_index < len(self._row):
+            self._select(self._row[row_index])
+
+
 def _pixmap(arr: np.ndarray, scale: int) -> QPixmap:
     arr = np.ascontiguousarray(arr)
     h, w = arr.shape[:2]
@@ -425,7 +543,13 @@ class DebugWindow(QMainWindow):
         for lab, token in ((self._dis_goto, PALETTE.error),
                            (self._mem_addr, PALETTE.error),
                            (self._rs_value, PALETTE.error),
-                           (self._break_err, PALETTE.warning)):
+                           (self._break_err, PALETTE.warning),
+                           # These two are only re-coloured when their own panel
+                           # acts (a cheat selected, a trap hit), so unlike the
+                           # ones above they would keep the old theme's colour
+                           # until you happened to click something.
+                           (self._ch_warn, PALETTE.warning),
+                           (self._z80_why, PALETTE.error)):
             if lab.styleSheet():
                 lab.setStyleSheet(f"color:{token}")
         for flag, cb in self._tile_show.items():
@@ -444,6 +568,8 @@ class DebugWindow(QMainWindow):
         self.resize(760, 640)
         self._play = None
         self._settings = settings
+        # Set by `refresh` when a panel raises: (panel name, exception), or None.
+        self.last_refresh_error = None
         self._frozen = False
         self._tiles_arr = None
         self._tiles_usage = None            # last USE_* bitmask per tile, for hover
@@ -491,26 +617,55 @@ class DebugWindow(QMainWindow):
         self._status = QLabel(""); self._status.setObjectName("hint"); bar.addWidget(self._status)
         v.addLayout(bar)
 
-        self._tabs = QTabWidget()
-        self._tabs.addTab(self._cpu_tab(), "CPU")
-        self._tabs.addTab(self._disasm_tab(), "Disassembly")
-        self._tabs.addTab(self._callstack_tab(), "Call Stack")
-        self._tabs.addTab(self._events_tab(), "Events")
-        self._tabs.addTab(self._mem_tab(), "Memory")
-        self._tabs.addTab(self._watch_tab(), "Watch")
-        self._tabs.addTab(self._breaks_tab(), "Breakpoints")
-        self._tabs.addTab(self._ramsearch_tab(), "RAM Search")
-        self._tabs.addTab(self._audio_tab(), "Audio")
-        self._tabs.addTab(self._palette_tab(), "Palette")
-        self._tabs.addTab(self._tiles_tab(), "Tiles")
-        self._tabs.addTab(self._sprites_tab(), "Sprites")
-        self._tabs.addTab(self._layers_tab(), "Layers")
-        self._tabs.addTab(self._load_tab(), "Load")
-        self._tabs.addTab(self._text_tab(), "Text")
-        self._tabs.addTab(self._crack_tab(), "Crack")
-        self._tabs.addTab(self._pointers_tab(), "Pointers")
-        self._tabs.addTab(self._compare_tab(), "Compare")
-        self._tabs.addTab(self._link_tab(), "Link")
+        # Category, title, builder, refresher -- in ONE place. Title and refresher
+        # used to be two lists kept in the same order by hand (a tuple of methods
+        # indexed by tab position); inserting a tab in the middle silently made
+        # every later tab refresh a different panel. Pairing them makes that class
+        # of mistake unrepresentable, and the category rides along the same way.
+        #
+        # The grouping is by WHAT YOU ARE LOOKING AT, not by how the panel is
+        # built: someone chasing a graphics fault wants the palette, the tiles, the
+        # map and the raster timeline next to each other, whatever their internals
+        # have in common.
+        self._tabs = _TwoRowTabs()
+        self._tab_refresh: list = []
+        for category, title, build, refresh in (
+            ("CPU", "CPU", self._cpu_tab, self._refresh_cpu),
+            ("CPU", "HW Regs", self._hwregs_tab, self._refresh_hwregs),
+            ("CPU", "Disassembly", self._disasm_tab, self._refresh_disasm),
+            ("CPU", "Call Stack", self._callstack_tab, self._refresh_callstack),
+            ("CPU", "Breakpoints", self._breaks_tab, self._refresh_breaks),
+
+            ("Memory", "Memory", self._mem_tab, self._refresh_mem),
+            ("Memory", "Watch", self._watch_tab, self._refresh_watch),
+            ("Memory", "RAM Search", self._ramsearch_tab, self._refresh_ramsearch),
+            ("Memory", "Cheats", self._cheats_tab, self._refresh_cheats),
+            ("Memory", "Pointers", self._pointers_tab, self._refresh_pointers),
+
+            ("Video", "Palette", self._palette_tab, self._refresh_palette),
+            ("Video", "Tiles", self._tiles_tab, self._refresh_tiles),
+            ("Video", "Tilemap", self._tilemap_tab, self._refresh_tilemap),
+            ("Video", "Sprites", self._sprites_tab, self._refresh_sprites),
+            ("Video", "Layers", self._layers_tab, self._refresh_layers),
+            ("Video", "Events", self._events_tab, self._refresh_events),
+
+            ("Audio", "Audio", self._audio_tab, self._refresh_audio),
+            ("Audio", "Sound CPU", self._z80_tab, self._refresh_z80),
+
+            ("Analysis", "Profiler", self._profiler_tab, self._refresh_profiler),
+            ("Analysis", "Coverage", self._coverage_tab, self._refresh_coverage),
+            ("Analysis", "Load", self._load_tab, self._refresh_load),
+            ("Analysis", "Console", self._console_tab, self._refresh_console),
+            ("Analysis", "Movie", self._movie_tab, self._refresh_movie),
+
+            ("ROM", "Text", self._text_tab, self._refresh_text),
+            ("ROM", "Crack", self._crack_tab, self._refresh_crack),
+            ("ROM", "Compare", self._compare_tab, self._refresh_compare),
+
+            ("Link", "Link", self._link_tab, self._refresh_link),
+        ):
+            self._tabs.addTab(build(), title, category)
+            self._tab_refresh.append(refresh)
         self._tabs.currentChanged.connect(lambda _i: self.refresh())
         v.addWidget(self._tabs, 1)
 
@@ -552,11 +707,27 @@ class DebugWindow(QMainWindow):
         # would keep sampling a machine that is being torn down.
         self._detach_frame_hooks()
         self._play = play
+        # ⚡ THE CONSOLE MUST LET GO OF THE OUTGOING MACHINE HERE, not whenever its
+        # tab next refreshes. Its namespace holds `m`, and a namespace nobody has
+        # looked at in ten minutes was keeping a torn-down core -- and the DLL
+        # behind it -- alive.
+        #
+        # ⛔ NOT by writing `namespace["m"] = None`: anything put in the namespace
+        # before the first `set_namespace` counts as USER-DEFINED, and user
+        # definitions survive every rebuild. That None would have won forever.
+        # Rebuilding is the supported way to say "different machine now".
+        if getattr(self, "_con", None) is not None:
+            self._con_sync_namespace()
         if play is not None:
             if self._rs_track.isChecked():
                 self._rs_set_tracking(True)
             if self._mem_hl.isChecked():
                 self._mem_set_highlight(True)
+            # A new game is a NEW CORE, and a new core starts with coverage off. The
+            # tick box survives the swap, so without this the box says "recording"
+            # over a core that is not. Same reason the two above are re-armed.
+            if self._cov_on.isChecked():
+                self._cov_set(True)
             # A new game means a new core: re-arm the shadow stack if we are visible.
             self._set_callstack(self.isVisible())
             self._push_symbols()
@@ -645,6 +816,19 @@ class DebugWindow(QMainWindow):
         if self._play is not None:
             self._play._do_reset()  # noqa: SLF001
             self.refresh()
+
+    def _repaint_player(self) -> None:
+        """Put the picture back after running the console blind.
+
+        Tracing and profiling both advance the machine without drawing, so the
+        window is showing a frame that no longer exists. This reaches into the
+        player's own repaint -- ONE place rather than two, and tolerant of a
+        player that does not have one: a button handler is a Qt slot, and an
+        AttributeError in a slot kills the process outright.
+        """
+        blit = getattr(self._play, "_blit", None)
+        if callable(blit):
+            blit()
 
     # ---- export helpers
     def _save_text(self, text: str, default: str) -> None:
@@ -735,6 +919,212 @@ class DebugWindow(QMainWindow):
                 "screen, and misses an update that rewrites identical values.",
             ]
         self._cpu_text.setPlainText("\n".join(lines))
+
+    # ---- HW Regs tab -------------------------------------------------------
+    # The hardware registers, decoded field by field, with the documented illegal
+    # states called out. The Memory tab can already show you that 0x8118 holds
+    # 0x87 -- what it cannot say is that 0x87 means "backdrop on, palette 7" while
+    # 0x07 means "off, picture goes black". One bit apart, opposite meaning.
+    #
+    # All the decoding lives in `core/hwregs.py` (pure, tested without Qt). This
+    # is only the table around it.
+    HW_COL_ADDR, HW_COL_NAME, HW_COL_VALUE, HW_COL_MEANING = range(4)
+
+    def _hwregs_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Every hardware register, decoded. A value cell turns red the refresh "
+            "after the game writes it, so you can watch which registers a scene "
+            "actually touches. Registers marked REVERSE have no manufacturer "
+            "document behind them — hover the name to see the source."))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Filter"))
+        self._hw_filter = QLineEdit()
+        self._hw_filter.setPlaceholderText("name, address or group — e.g. INTE, 8118, timer")
+        self._hw_filter.textChanged.connect(lambda *_: self._hw_build())
+        row.addWidget(self._hw_filter, 1)
+        self._hw_changed_only = QCheckBox("Hide untouched")
+        self._hw_changed_only.setToolTip(
+            "Hide the registers still holding their documented reset value — what is "
+            "left is what this game actually programmed.")
+        self._hw_changed_only.toggled.connect(lambda *_: self._hw_build())
+        row.addWidget(self._hw_changed_only)
+        lay.addLayout(row)
+
+        # The checks panel. Empty means nothing documented-illegal is set, so it
+        # collapses rather than sitting there saying "OK" -- the eye should only be
+        # drawn here when there is something to read.
+        self._hw_checks = QPlainTextEdit(); self._hw_checks.setReadOnly(True)
+        self._hw_checks.setFont(QFont(_MONO, 9))
+        self._hw_checks.setMaximumHeight(110)
+        self._hw_checks.hide()
+        lay.addWidget(self._hw_checks)
+
+        self._hw_table = QTableWidget(0, 4)
+        self._hw_table.setHorizontalHeaderLabels(["Addr", "Register / field", "Value", "Meaning"])
+        self._hw_table.verticalHeader().setVisible(False)
+        self._hw_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._hw_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._hw_table.setFont(QFont(_MONO, 9))
+        hh = self._hw_table.horizontalHeader()
+        hh.setSectionResizeMode(self.HW_COL_ADDR, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self.HW_COL_NAME, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self.HW_COL_VALUE, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(self.HW_COL_MEANING, QHeaderView.ResizeMode.Stretch)
+        lay.addWidget(self._hw_table, 1)
+
+        lay.addLayout(self._export_row(self._hw_export))
+
+        # row -> (register, field or None). Group headers are not in here.
+        self._hw_rows: list = []
+        self._hw_prev: dict[int, int] = {}     # last values seen, for the change tint
+        self._hw_lit: dict[int, int] = {}      # address -> refreshes left lit
+        self._hw_built_filter = None           # what the current rows were built for
+        self._hw_build()
+        return w
+
+    def _hw_visible_regs(self):
+        """The registers matching the filter, grouped. Matching is deliberately
+        loose (name, hex address, group, summary) because you rarely remember
+        which of those you know when you go looking."""
+        from core import hwregs
+        needle = self._hw_filter.text().strip().lower()
+        hide_untouched = self._hw_changed_only.isChecked()
+        for group in hwregs.GROUPS:
+            regs = []
+            for reg in group.regs:
+                # "Untouched" can only be said of a register whose reset value is
+                # documented. One with no known reset is never hidden -- silently
+                # dropping it would read as "this game does not use it".
+                if (hide_untouched and reg.reset is not None
+                        and self._hw_prev.get(reg.addr, reg.reset) == reg.reset):
+                    continue
+                if not needle:
+                    regs.append(reg); continue
+                hay = (f"{reg.name} {reg.addr:06x} {reg.addr:04x} {group.name} "
+                       f"{reg.summary} " + " ".join(f.name for f in reg.fields)).lower()
+                if needle in hay:
+                    regs.append(reg)
+            if regs:
+                yield group, regs
+
+    def _hw_build(self) -> None:
+        """Lay the rows out. Called on a filter change, not every refresh: rebuilding
+        200 rows eight times a second would throw away the scroll position and the
+        selection, which is precisely what you were using to watch one register."""
+        from core import hwregs
+        table = self._hw_table
+        table.setUpdatesEnabled(False)
+        table.clearContents()
+        self._hw_rows = []
+        rows = []
+        for group, regs in self._hw_visible_regs():
+            rows.append((group, None, None))
+            for reg in regs:
+                rows.append((None, reg, None))
+                for f in reg.fields:
+                    rows.append((None, reg, f))
+        table.setRowCount(len(rows))
+        for r, (group, reg, fld) in enumerate(rows):
+            if group is not None:
+                item = QTableWidgetItem(group.name)
+                item.setToolTip(group.note)
+                font = QFont(_MONO, 9); font.setBold(True)
+                item.setFont(font)
+                table.setItem(r, self.HW_COL_ADDR, item)
+                table.setSpan(r, 0, 1, 4)
+                self._hw_rows.append((None, None))
+                continue
+            if fld is None:
+                addr = QTableWidgetItem(f"{reg.addr:06X}")
+                name = QTableWidgetItem(reg.name)
+                name.setToolTip(f"{reg.summary}\n\nsource: {reg.source}")
+                table.setItem(r, self.HW_COL_ADDR, addr)
+                table.setItem(r, self.HW_COL_NAME, name)
+                table.setItem(r, self.HW_COL_VALUE, QTableWidgetItem("—"))
+                meaning = QTableWidgetItem(reg.summary)
+                if reg.source == hwregs.REVERSE:
+                    meaning.setText(reg.summary + "   [REVERSE]")
+                    meaning.setToolTip("No manufacturer document defines this register. "
+                                       "It is inferred from behaviour, and it can be wrong.")
+                table.setItem(r, self.HW_COL_MEANING, meaning)
+            else:
+                name = QTableWidgetItem(f"    {fld.bits_label():<6} {fld.name}")
+                if fld.note:
+                    name.setToolTip(fld.note)
+                table.setItem(r, self.HW_COL_NAME, name)
+                table.setItem(r, self.HW_COL_VALUE, QTableWidgetItem("—"))
+                table.setItem(r, self.HW_COL_MEANING, QTableWidgetItem(""))
+            self._hw_rows.append((reg, fld))
+        table.setUpdatesEnabled(True)
+        self._hw_built_filter = (self._hw_filter.text(),
+                                 self._hw_changed_only.isChecked())
+        self._refresh_hwregs()
+
+    def _hw_export(self) -> None:
+        m = self._m
+        if m is None:
+            self._save_text("(no game running)", "hw_registers.txt"); return
+        from core import hwregs
+        self._save_text(hwregs.format_report(lambda a, n: m.read(a, n)),
+                        "hw_registers.txt")
+
+    def _refresh_hwregs(self) -> None:
+        from core import hwregs
+        m = self._m
+        table = self._hw_table
+        if m is None:
+            for r in range(table.rowCount()):
+                item = table.item(r, self.HW_COL_VALUE)
+                if item is not None:
+                    item.setText("—")
+            self._hw_checks.setPlainText("(no game running)")
+            self._hw_checks.show()
+            return
+
+        values = hwregs.read_all(lambda a, n: m.read(a, n))
+
+        # Which registers moved since the last sample. The tint fades over a few
+        # refreshes so a single write is still visible when you look up, instead of
+        # being gone by the time your eye gets there.
+        for addr, val in values.items():
+            if self._hw_prev.get(addr, val) != val:
+                self._hw_lit[addr] = _ACCESS_FADE // 6
+        self._hw_prev = values
+
+        for r, (reg, fld) in enumerate(self._hw_rows):
+            if reg is None:
+                continue
+            val = values.get(reg.addr)
+            vitem = table.item(r, self.HW_COL_VALUE)
+            if vitem is None:
+                continue
+            if val is None:
+                vitem.setText("—"); continue
+            lit = self._hw_lit.get(reg.addr, 0) > 0
+            if fld is None:
+                vitem.setText(f"{val:0{reg.width * 2}X}")
+                vitem.setBackground(_WRITE_BG if lit else _NO_BRUSH)
+            else:
+                raw = fld.extract(val)
+                vitem.setText(str(raw))
+                vitem.setBackground(_WRITE_BG if lit else _NO_BRUSH)
+                mitem = table.item(r, self.HW_COL_MEANING)
+                if mitem is not None:
+                    mitem.setText(fld.describe(raw))
+        for addr in list(self._hw_lit):
+            self._hw_lit[addr] -= 1
+            if self._hw_lit[addr] <= 0:
+                del self._hw_lit[addr]
+
+        problems = hwregs.checks(values)
+        if not problems:
+            self._hw_checks.hide()
+        else:
+            self._hw_checks.setPlainText("\n".join(
+                f"[{c.severity}] {c.title}\n          {c.why}" for c in problems))
+            self._hw_checks.show()
 
     # ---- symbols -----------------------------------------------------------
     def _auto_load_symbols(self) -> None:
@@ -1153,7 +1543,7 @@ class DebugWindow(QMainWindow):
         Path(path).write_text("\n".join(lines), encoding="utf-8")
         self._status.setText(f"traced {total - remaining} instr -> {Path(path).name}")
         self._play.paused = was_paused
-        self._play._blit()  # noqa: SLF001
+        self._repaint_player()
         self.refresh()
 
     # ---- Call Stack tab
@@ -1254,6 +1644,855 @@ class DebugWindow(QMainWindow):
                                   "the view is truncated, not wrong")
         else:
             self._cs_note.setText(f"{len(frames)} frames")
+
+    # ---- Cheats tab --------------------------------------------------------
+    # The Watch tab already locks ONE address -- that is how "what if HP never
+    # drops" gets answered. What it cannot keep is a NAMED GROUP: a cheat is
+    # usually two or three addresses that only mean anything together, and typing
+    # them back one at a time every session is how a map gets lost.
+    #
+    # Editing is a text box, not a grid of spin boxes. The format is the same one
+    # that gets pasted into a message, so what you edit and what you share are the
+    # same thing -- and there is no second representation to keep in step.
+    def _cheats_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Groups of addresses held at a value, every frame — written at the same "
+            "point in the frame as a locked watch, never a second mechanism racing "
+            "it. Saved per ROM. Tick one to turn it on."))
+
+        self._ch_table = QTableWidget(0, 3)
+        self._ch_table.setHorizontalHeaderLabels(["On", "Name", "Addresses"])
+        self._ch_table.verticalHeader().setVisible(False)
+        self._ch_table.setFont(QFont(_MONO, 9))
+        self._ch_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        hh = self._ch_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._ch_table.itemChanged.connect(self._ch_item_changed)
+        self._ch_table.itemSelectionChanged.connect(self._ch_selected)
+        lay.addWidget(self._ch_table, 1)
+
+        self._ch_warn = QLabel(""); self._ch_warn.setWordWrap(True)
+        lay.addWidget(self._ch_warn)
+
+        lay.addWidget(QLabel("Edit / paste codes — “# name” starts a cheat:"))
+        self._ch_text = QPlainTextEdit()
+        self._ch_text.setFont(QFont(_MONO, 10))
+        self._ch_text.setPlaceholderText("# Infinite health\n4812:1 = 63\n481A:2 = 03E7")
+        self._ch_text.setMaximumHeight(130)
+        lay.addWidget(self._ch_text)
+
+        row = QHBoxLayout()
+        for label, slot, tip in (
+            ("Apply text", self._ch_apply_text,
+             "Replace the list with what is in the box."),
+            ("Copy all", self._ch_copy,
+             "Put every cheat on the clipboard, ready to paste to someone."),
+            ("Import…", self._ch_import, "Read a text file of codes."),
+            ("Export…", self._ch_export, "Write every cheat to a text file."),
+            ("Remove selected", self._ch_remove, ""),
+        ):
+            b = QPushButton(label); b.setObjectName("ghost")
+            if tip:
+                b.setToolTip(tip)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self._ch_building = False       # guards the table's own edits
+        return w
+
+    def _ch_set(self):
+        return getattr(self._play, "cheats", None) if self._play else None
+
+    def _ch_save(self) -> None:
+        if self._play is not None and hasattr(self._play, "save_cheats"):
+            self._play.save_cheats()
+
+    def _ch_apply_text(self) -> None:
+        from core import cheats as ch
+        cheats, problems = ch.parse_text(self._ch_text.toPlainText())
+        target = self._ch_set()
+        if target is None:
+            return
+        # Keep the enabled flags of cheats that are still there by name: re-reading
+        # your own list should not silently switch everything off.
+        was_on = {c.name for c in target.cheats if c.enabled}
+        for c in cheats:
+            if c.name in was_on:
+                c.enabled = True
+        target.cheats = cheats
+        self._ch_save()
+        self._ch_warn.setText("\n".join(problems))
+        self._ch_warn.setStyleSheet(f"color:{PALETTE.error}" if problems else "")
+        self.refresh()
+
+    def _ch_copy(self) -> None:
+        from core import cheats as ch
+        target = self._ch_set()
+        if target is None:
+            return
+        QApplication.clipboard().setText(ch.format_text(target.cheats))
+        self._status.setText("cheats copied")
+
+    def _ch_import(self) -> None:
+        from core import cheats as ch
+        path, _ = QFileDialog.getOpenFileName(self, "Import cheats", "",
+                                              "Text (*.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            QMessageBox.warning(self, "Cheats", str(e)); return
+        cheats, problems = ch.parse_text(text)
+        target = self._ch_set()
+        if target is not None:
+            target.cheats.extend(cheats)          # add to, never replace silently
+            self._ch_save()
+        self._ch_warn.setText("\n".join(problems))
+        self.refresh()
+
+    def _ch_export(self) -> None:
+        from core import cheats as ch
+        target = self._ch_set()
+        if target is None:
+            return
+        self._save_text(ch.format_text(target.cheats), "cheats.txt")
+
+    def _ch_remove(self) -> None:
+        target = self._ch_set()
+        rows = sorted({i.row() for i in self._ch_table.selectedItems()}, reverse=True)
+        if target is None or not rows:
+            return
+        for r in rows:
+            if 0 <= r < len(target.cheats):
+                del target.cheats[r]
+        self._ch_save()
+        self.refresh()
+
+    def _ch_item_changed(self, item) -> None:
+        if self._ch_building:
+            return
+        target = self._ch_set()
+        if target is None or not (0 <= item.row() < len(target.cheats)):
+            return
+        cheat = target.cheats[item.row()]
+        if item.column() == 0:
+            cheat.enabled = item.checkState() == Qt.CheckState.Checked
+        elif item.column() == 1:
+            cheat.name = item.text()
+        self._ch_save()
+
+    def _ch_selected(self) -> None:
+        from core import cheats as ch
+        target = self._ch_set()
+        rows = {i.row() for i in self._ch_table.selectedItems()}
+        if target is None or len(rows) != 1:
+            return
+        row = rows.pop()
+        if not (0 <= row < len(target.cheats)):
+            return
+        problems = ch.validate(target.cheats[row])
+        self._ch_warn.setText("\n".join(problems))
+        # Warnings, never refusals: a debugger that rejected an address because it
+        # looked wrong would be useless the day the address is right.
+        self._ch_warn.setStyleSheet(f"color:{PALETTE.warning}" if problems else "")
+
+    def _refresh_cheats(self) -> None:
+        from core import cheats as ch
+        target = self._ch_set()
+        self._ch_building = True
+        try:
+            if target is None:
+                self._ch_table.setRowCount(0)
+                return
+            self._ch_table.setRowCount(len(target.cheats))
+            for r, c in enumerate(target.cheats):
+                on = QTableWidgetItem()
+                on.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                            | Qt.ItemFlag.ItemIsSelectable)
+                on.setCheckState(Qt.CheckState.Checked if c.enabled
+                                 else Qt.CheckState.Unchecked)
+                self._ch_table.setItem(r, 0, on)
+                self._ch_table.setItem(r, 1, QTableWidgetItem(c.name))
+                summary = " · ".join(e.text() for e in c.entries) or "(no addresses)"
+                cell = QTableWidgetItem(summary)
+                cell.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                problems = ch.validate(c)      # once per row, not twice
+                if problems:
+                    cell.setToolTip("\n".join(problems))
+                self._ch_table.setItem(r, 2, cell)
+            if not self._ch_text.toPlainText().strip() and target.cheats:
+                self._ch_text.setPlainText(ch.format_text(target.cheats))
+        finally:
+            self._ch_building = False
+
+    # ---- Console tab -------------------------------------------------------
+    # Look at what this project does when it needs an answer the debugger does not
+    # have: analyze_glitch_state.py, detect_hdiscontinuity.py, ripoam.py,
+    # triage_vs_oracle.py -- one-off scripts written outside the tool, run against
+    # a dump, then kept forever or lost. Several answered their question in four
+    # lines. This is those four lines with the machine already in scope.
+    #
+    # Nothing here is a new capability. But a debugger you can only use through
+    # the buttons someone thought of in advance stops exactly where your question
+    # starts.
+    class _ConsoleInput(QPlainTextEdit):
+        """Enter runs, Shift+Enter makes a new line, Up/Down walk the history."""
+
+        def __init__(self, submit, history) -> None:
+            super().__init__()
+            self._submit = submit
+            self._history = history
+            self._at = None
+            self.setFont(QFont(_MONO, 10))
+            self.setMaximumHeight(90)
+            self.setPlaceholderText("m.cpu().pc   ·   help()   ·   Shift+Enter for a new line")
+
+        def keyPressEvent(self, e) -> None:  # type: ignore[override]
+            key = e.key()
+            shift = e.modifiers() & Qt.KeyboardModifier.ShiftModifier
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not shift:
+                self._submit()
+                return
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down) and self._history:
+                # Only walk history from a single-line entry: inside a block the
+                # arrows have to keep moving the cursor, or a loop cannot be edited.
+                if "\n" not in self.toPlainText():
+                    step = -1 if key == Qt.Key.Key_Up else 1
+                    at = len(self._history) if self._at is None else self._at
+                    at = max(0, min(len(self._history), at + step))
+                    self._at = at
+                    self.setPlainText(self._history[at] if at < len(self._history) else "")
+                    self.moveCursor(self.textCursor().MoveOperation.End)
+                    return
+            self._at = None
+            super().keyPressEvent(e)
+
+    def _console_tab(self) -> QWidget:
+        from core.console import Console
+
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "A Python prompt with the machine already in scope. Everything it "
+            "exposes, this window already does — the point is the question nobody "
+            "put a button on. Type help() for what is in scope."))
+
+        self._con = Console()
+        self._con_ns_for = None          # the machine the namespace was built for
+        self._con_out = QPlainTextEdit(); self._con_out.setReadOnly(True)
+        self._con_out.setFont(QFont(_MONO, 10))
+        lay.addWidget(self._con_out, 1)
+
+        self._con_in = self._ConsoleInput(self._con_submit, self._con.history)
+        lay.addWidget(self._con_in)
+
+        row = QHBoxLayout()
+        run = QPushButton("Run (Enter)"); run.setObjectName("ghost")
+        run.clicked.connect(self._con_submit)
+        row.addWidget(run)
+        clear = QPushButton("Clear"); clear.setObjectName("ghost")
+        clear.clicked.connect(lambda: self._con_out.clear())
+        row.addWidget(clear)
+        load = QPushButton("Run a file…"); load.setObjectName("ghost")
+        load.setToolTip("Run a .py file in this session — the one-off scripts this "
+                        "project keeps writing, without leaving the debugger.")
+        load.clicked.connect(self._con_run_file)
+        row.addWidget(load)
+        row.addStretch()
+        lay.addLayout(row)
+
+        lay.addLayout(self._export_row(
+            lambda: self._save_text(self._con_out.toPlainText(), "console.txt")))
+        self._con_echo("Python console. help() lists what is in scope.\n")
+        return w
+
+    def _con_echo(self, text: str, error: bool = False) -> None:
+        if not text:
+            return
+        # A traceback that looks exactly like ordinary output is a traceback you
+        # scroll past. `error` was being passed by every call site and used by
+        # none -- a parameter promising something that never happened.
+        cursor = self._con_out.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        fmt = cursor.charFormat()
+        fmt.setForeground(QColor(PALETTE.error if error else PALETTE.text))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text.rstrip("\n") + "\n")
+        self._con_out.setTextCursor(cursor)
+        bar = self._con_out.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def _con_sync_namespace(self) -> None:
+        """Rebuild the machine-facing names when the game changes.
+
+        Whatever the user defined survives -- a console that forgot your helper
+        every time a ROM was loaded would train you not to write one.
+        """
+        from core.console import build_namespace
+        m = self._m
+        if m is self._con_ns_for and self._con.namespace:
+            return
+        self._con_ns_for = m
+        self._con.set_namespace(build_namespace(m, self._play, extra={"dbg": self}))
+
+    def _con_submit(self) -> None:
+        source = self._con_in.toPlainText()
+        if not source.strip():
+            return
+        self._con_sync_namespace()
+        result = self._con.run(source)
+        if result.incomplete:
+            return                              # the block wants more lines
+        self._con_echo(">>> " + source.replace("\n", "\n... "))
+        self._con_echo(result.output, result.failed)
+        self._con_in.clear()
+
+    def _con_run_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Run a Python file", "",
+                                              "Python (*.py);;All files (*)")
+        if not path:
+            return
+        try:
+            source = Path(path).read_text(encoding="utf-8")
+        except OSError as e:
+            self._con_echo(f"cannot read {path}: {e}", True); return
+        self._con_sync_namespace()
+        self._con_echo(f">>> # {Path(path).name}")
+        result = self._con.run(source)
+        self._con_echo(result.output or "(no output)", result.failed)
+
+    def _refresh_console(self) -> None:
+        # Deliberately does nothing per tick. A console that re-ran anything on a
+        # timer would be a machine for surprises; the only thing that executes here
+        # is what you pressed Enter on.
+        self._con_sync_namespace()
+
+    # ---- Movie tab ---------------------------------------------------------
+    # Every playtest report in this project has been a SENTENCE -- "the text
+    # windows get stuck halfway", "the HUD flickers". Sentences cannot be re-run,
+    # so the person who saw it has to see it again on demand while someone else
+    # watches. A movie turns that into a file: the console takes one byte of input
+    # per frame, so a session is a snapshot plus a list of bytes.
+    #
+    # The player owns the recording (it is the thing with the frame loop); this
+    # tab is the controls and the honesty about what a replay can and cannot
+    # reproduce.
+    def _movie_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Record what you press, frame by frame, and replay it exactly. A "
+            "recording carries a snapshot of the machine it started from, so a bug "
+            "you can only reach by playing becomes a file someone else can re-run."))
+
+        bar = QHBoxLayout()
+        self._mov_rec = QPushButton("⏺ Record")
+        self._mov_rec.clicked.connect(self._mov_toggle_record)
+        self._mov_play = QPushButton("▶ Replay…")
+        self._mov_play.clicked.connect(self._mov_open)
+        self._mov_stop = QPushButton("■ Stop")
+        self._mov_stop.clicked.connect(self._mov_stop_clicked)
+        self._mov_save = QPushButton("💾 Save…")
+        self._mov_save.clicked.connect(self._mov_save_clicked)
+        for b in (self._mov_rec, self._mov_play, self._mov_stop, self._mov_save):
+            b.setObjectName("ghost"); bar.addWidget(b)
+        bar.addStretch()
+        lay.addLayout(bar)
+
+        self._mov_note = QLineEdit()
+        self._mov_note.setPlaceholderText(
+            "what to look for — e.g. “the dialogue box stops halfway at 0:12”")
+        lay.addWidget(self._mov_note)
+
+        self._mov_state = QLabel(""); self._mov_state.setWordWrap(True)
+        lay.addWidget(self._mov_state)
+
+        self._mov_info = QPlainTextEdit(); self._mov_info.setReadOnly(True)
+        self._mov_info.setFont(QFont(_MONO, 9))
+        lay.addWidget(self._mov_info, 1)
+
+        lay.addWidget(QLabel(
+            "⚠ A movie does not carry the cartridge's flash save. A game that reads "
+            "its save file mid-session can diverge from the recording — said out "
+            "loud rather than papered over, because a replay that silently drifts is "
+            "worse than no replay at all."))
+
+        self._mov_last = None          # the movie held in memory, for Save
+        return w
+
+    def _mov_rom(self) -> "Path | None":
+        return getattr(self._play, "_rom_path", None) if self._play else None
+
+    def _mov_header(self) -> dict:
+        from core import movie as mv
+        rom = self._mov_rom()
+        head = {"note": self._mov_note.text().strip(),
+                "created": time.strftime("%Y-%m-%d %H:%M")}
+        if rom is not None:
+            head["rom_name"] = rom.name
+            try:
+                head["rom_sha"] = mv.rom_fingerprint(rom.read_bytes())
+            except OSError:
+                pass
+        return head
+
+    def _mov_toggle_record(self) -> None:
+        play = self._play
+        if play is None:
+            return
+        if play.movie_rec is not None:
+            movie = play.movie_stop_recording()
+            self._mov_last = movie
+            self._status.setText(f"recorded {movie.frames if movie else 0} frames")
+        else:
+            if play.movie_start_recording(self._mov_header()):
+                self._mov_last = None
+        self.refresh()
+
+    def _mov_stop_clicked(self) -> None:
+        play = self._play
+        if play is None:
+            return
+        if play.movie_rec is not None:
+            self._mov_last = play.movie_stop_recording()
+        play.movie_stop()
+        self.refresh()
+
+    def _mov_save_clicked(self) -> None:
+        from core import movie as mv
+        play = self._play
+        if play is not None and play.movie_rec is not None:
+            self._mov_last = play.movie_stop_recording()      # save implies stop
+        if self._mov_last is None:
+            self._status.setText("nothing recorded yet")
+            return
+        if self._mov_note.text().strip():
+            self._mov_last.header["note"] = self._mov_note.text().strip()
+        rom = self._mov_rom()
+        default = f"{rom.stem}.ngpcmov" if rom is not None else "session.ngpcmov"
+        path, _ = QFileDialog.getSaveFileName(self, "Save movie", default,
+                                              "NGPC movie (*.ngpcmov)")
+        if path:
+            Path(path).write_bytes(mv.dump(self._mov_last))
+            self._status.setText(f"saved {Path(path).name}")
+        self.refresh()
+
+    def _mov_open(self) -> None:
+        from core import movie as mv
+        play = self._play
+        if play is None or play.machine is None:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Replay a movie", "",
+                                              "NGPC movie (*.ngpcmov);;All files (*)")
+        if not path:
+            return
+        try:
+            movie = mv.load(Path(path).read_bytes())
+        except (mv.BadMovie, OSError) as e:
+            QMessageBox.warning(self, "Movie", str(e))
+            return
+
+        rom = self._mov_rom()
+        sha = ""
+        if rom is not None:
+            try:
+                sha = mv.rom_fingerprint(rom.read_bytes())
+            except OSError:
+                pass
+        problems = mv.check(movie, rom_name=rom.name if rom else "", rom_sha=sha,
+                            state_len=len(play._capture_state()))  # noqa: SLF001
+        fatal = [p for p in problems if p.fatal]
+        if fatal:
+            # ⛔ REFUSED, not warned-and-played. A movie run against the wrong
+            # cartridge produces garbage that looks exactly like an emulation bug,
+            # and this feature exists to make bugs believable.
+            QMessageBox.critical(self, "Movie", "\n\n".join(p.text for p in fatal))
+            return
+        if problems:
+            QMessageBox.information(self, "Movie",
+                                    "\n\n".join(p.text for p in problems))
+        self._mov_last = movie
+        play.movie_play_back(movie)
+        self.refresh()
+
+    def _refresh_movie(self) -> None:
+        from core import movie as mv
+        play = self._play
+        # `getattr` like the cheats and coverage panels: `attach()` takes any player
+        # object, and a bare attribute here is what turned a missing feature into a
+        # dead process.
+        if (play is None or getattr(play, "machine", None) is None
+                or not hasattr(play, "movie_rec")):
+            self._mov_state.setText("(no game running)")
+            self._mov_info.setPlainText("")
+            for b in (self._mov_rec, self._mov_play, self._mov_stop, self._mov_save):
+                b.setEnabled(False)
+            return
+        for b in (self._mov_rec, self._mov_play, self._mov_stop, self._mov_save):
+            b.setEnabled(True)
+
+        recording = play.movie_rec is not None
+        playing = play.movie_play is not None
+        self._mov_rec.setText("⏹ Stop recording" if recording else "⏺ Record")
+        self._mov_play.setEnabled(not recording)
+        self._mov_rec.setEnabled(not playing)
+
+        if recording:
+            frames = play.movie_rec.frames
+            self._mov_state.setText(
+                f"⏺ recording — {frames} frames ({frames / 60.0:.1f} s)")
+        elif playing:
+            p = play.movie_play
+            self._mov_state.setText(
+                f"▶ replaying — frame {p.position} of {p.movie.frames} "
+                f"({100.0 * p.progress:.0f}%)")
+        elif play.movie_ended is not None:
+            self._mov_state.setText(
+                f"▶ replay finished — {play.movie_ended.movie.frames} frames. "
+                f"The controller is yours again.")
+        else:
+            self._mov_state.setText("idle")
+
+        self._mov_info.setPlainText(
+            mv.summary(self._mov_last) if self._mov_last is not None else "")
+
+    # ---- Profiler tab ------------------------------------------------------
+    # Where the frame goes, per function, in CYCLES. Not a sampler: the core can
+    # retire instructions while recording every one of them -- PC, accesses, and
+    # what each cost -- so this is an exact accounting of a captured window. A
+    # sampler at this window's refresh rate would take eight samples a second out
+    # of six hundred thousand instructions and call it a profile.
+    #
+    # Capturing ADVANCES the machine, exactly like Trace to file. That is a
+    # deliberate, one-shot action on a button, never something the refresh does
+    # behind your back.
+    PROFILE_CHUNK = 4096
+
+    def _profiler_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Where the frame goes. Capture a run of instructions and see the cycles "
+            "each function cost — cycles, not instruction counts: the cartridge bus "
+            "is slow and instruction cost varies tenfold, so counting instructions "
+            "ranks a tight loop above the routine that is really eating the frame."))
+
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Capture"))
+        self._prof_count = QSpinBox()
+        self._prof_count.setRange(1000, 2_000_000)
+        self._prof_count.setSingleStep(10_000)
+        self._prof_count.setValue(100_000)
+        self._prof_count.setToolTip("Instructions to record. A frame is a few tens "
+                                    "of thousands, so 100 000 is a few frames.")
+        bar.addWidget(self._prof_count)
+        bar.addWidget(QLabel("instructions"))
+        go = QPushButton("▶ Capture")
+        go.setToolTip("Runs the machine forward while recording. This ADVANCES the "
+                      "game — it is not a passive reading.")
+        go.clicked.connect(self._prof_capture)
+        bar.addWidget(go)
+        bar.addStretch()
+        self._prof_head = QLabel(""); bar.addWidget(self._prof_head)
+        lay.addLayout(bar)
+
+        self._prof_regions = QLabel(""); self._prof_regions.setObjectName("hint")
+        self._prof_regions.setWordWrap(True)
+        lay.addWidget(self._prof_regions)
+
+        t = QTableWidget(0, 7)
+        t.setHorizontalHeaderLabels(
+            ["Where", "Cycles", "Share", "Cycles/frame", "Instructions", "Cyc/instr",
+             "Reads/writes"])
+        t.verticalHeader().setVisible(False)
+        t.setFont(QFont(_MONO, 9))
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.itemDoubleClicked.connect(self._prof_goto)
+        hh = t.horizontalHeader()
+        for c in range(6):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self._prof_table = t
+        lay.addWidget(t, 1)
+
+        lay.addLayout(self._export_row(self._prof_export))
+        self._prof_report = None
+        return w
+
+    def _prof_capture(self) -> None:
+        from core import profile as prof
+        m = self._m
+        if m is None or self._play is None:
+            return
+        total = self._prof_count.value()
+        was_paused = self._play.paused
+        self._play.paused = True
+        self._auto_load_symbols()
+        records = []
+        remaining = total
+        try:
+            while remaining > 0:
+                _summ, recs = m.run(min(remaining, self.PROFILE_CHUNK), record=True)
+                if not recs:
+                    break
+                records.extend(recs)
+                remaining -= len(recs)
+        finally:
+            self._play.paused = was_paused
+        self._prof_report = prof.profile(records, self._symbols)
+        self._repaint_player()
+        self.refresh()
+
+    def _prof_goto(self, item) -> None:
+        report = self._prof_report
+        if report is None:
+            return
+        row = item.row()
+        if 0 <= row < len(report.buckets):
+            self._dis_goto.setText(f"{report.buckets[row].lo:06X}")
+            self._focus_goto()
+
+    def _prof_export(self) -> None:
+        from core import profile as prof
+        if self._prof_report is None:
+            self._save_text("(nothing captured yet)", "profile.txt"); return
+        self._save_text(prof.format_report(self._prof_report, top=500), "profile.txt")
+
+    def _refresh_profiler(self) -> None:
+        report = self._prof_report
+        if report is None:
+            self._prof_head.setText("nothing captured yet")
+            self._prof_regions.setText("")
+            self._prof_table.setRowCount(0)
+            return
+
+        self._prof_head.setText(
+            f"{report.total_instructions:,} instructions · "
+            f"{report.total_cycles:,} cycles · {report.frames:.2f} frames")
+        bits = [f"{name} {100.0 * cyc / report.total_cycles:.1f}%"
+                for name, cyc in sorted(report.by_region.items(), key=lambda kv: -kv[1])]
+        note = "   ·   ".join(bits)
+        if not report.symbols_used:
+            note += "   ·   no .map loaded — rows are address blocks, not functions"
+        elif report.resolved < report.total_instructions:
+            missing = report.total_instructions - report.resolved
+            note += (f"   ·   {missing:,} instructions outside every known symbol "
+                     f"(BIOS, library, or data-driven code)")
+        self._prof_regions.setText(note)
+
+        rows = report.buckets[:300]
+        self._prof_table.setRowCount(len(rows))
+        for r, b in enumerate(rows):
+            cells = (b.name, f"{b.cycles:,}", f"{report.share(b):.1f}%",
+                     f"{report.per_frame(b):,.0f}", f"{b.instructions:,}",
+                     f"{b.cycles_per_instruction:.1f}", f"{b.reads}/{b.writes}")
+            for c, text in enumerate(cells):
+                self._prof_table.setItem(r, c, QTableWidgetItem(text))
+
+    # ---- Coverage tab ------------------------------------------------------
+    # The core has recorded this all along -- one bit per byte of the cart window,
+    # set when an instruction STARTS there -- and nothing ever looked at it:
+    # `coverage_bitmap()` had no caller outside the binding that defines it.
+    #
+    # It settles two things nothing else can. A routine that never runs: a
+    # breakpoint that does not fire proves nothing on its own, because it looks
+    # exactly like a breakpoint on the wrong address, while a cold region says the
+    # CPU has not been there. And whether an input reached NEW code: press a
+    # button, watch the count move.
+    COVERAGE_W, COVERAGE_H = 256, 192
+    COVERAGE_SCALE = 2
+
+    def _coverage_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "Which parts of the cartridge this session has executed. Green ran, "
+            "grey never did. Recording costs a bit of speed, so it is off until you "
+            "arm it — and it starts from empty each time you do."))
+
+        bar = QHBoxLayout()
+        self._cov_on = QCheckBox("record")
+        self._cov_on.setToolTip("Arm the core's coverage bitmap. Enabling resets it.")
+        self._cov_on.toggled.connect(self._cov_set)
+        bar.addWidget(self._cov_on)
+        b = QPushButton("Reset"); b.setObjectName("ghost")
+        b.setToolTip("Start counting again from nothing — the way to ask "
+                     "'does pressing this button reach code we have not seen?'")
+        b.clicked.connect(self._cov_reset)
+        bar.addWidget(b)
+        bar.addStretch()
+        self._cov_head = QLabel(""); bar.addWidget(self._cov_head)
+        lay.addLayout(bar)
+
+        self._cov_warn = QLabel(""); self._cov_warn.setObjectName("hint")
+        self._cov_warn.setWordWrap(True)
+        lay.addWidget(self._cov_warn)
+
+        body = QHBoxLayout()
+        self._cov_label = _TileGrid(self.COVERAGE_SCALE, self.COVERAGE_W,
+                                    self._cov_info)
+        self._cov_label.set_status_sink(self._cov_status)
+        body.addWidget(self._cov_label)
+        self._cov_gaps = QTableWidget(0, 3)
+        self._cov_gaps.setHorizontalHeaderLabels(["Address", "Bytes", "ROM offset"])
+        self._cov_gaps.verticalHeader().setVisible(False)
+        self._cov_gaps.setFont(QFont(_MONO, 9))
+        self._cov_gaps.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._cov_gaps.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self._cov_gaps.itemDoubleClicked.connect(self._cov_goto_gap)
+        hh = self._cov_gaps.horizontalHeader()
+        for c in range(3):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        body.addWidget(self._cov_gaps, 1)
+        lay.addLayout(body, 1)
+
+        self._cov_status_line = QLabel(""); self._cov_status_line.setObjectName("hint")
+        self._cov_status_line.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._cov_status_line)
+
+        lay.addLayout(self._export_row(self._cov_export))
+
+        self._cov_arr = None
+        self._cov_bits = None
+        self._cov_gap_rows: list = []
+        return w
+
+    def _cov_rom_size(self) -> int:
+        rom = getattr(self._play, "_rom_path", None) if self._play else None
+        try:
+            return rom.stat().st_size if rom is not None else 0
+        except OSError:
+            return 0
+
+    def _cov_set(self, on: bool) -> None:
+        m = self._m
+        if m is None:
+            return
+        try:
+            m.set_coverage(bool(on))
+        except Exception:
+            pass
+        self.refresh()
+
+    def _cov_reset(self) -> None:
+        # Disable then enable: the core allocates and CLEARS on enable, so this is
+        # the reset it already has rather than a second path that could drift.
+        m = self._m
+        if m is None:
+            return
+        try:
+            m.set_coverage(False)
+            m.set_coverage(bool(self._cov_on.isChecked()))
+        except Exception:
+            pass
+        self.refresh()
+
+    def _cov_info(self, col: int, row: int) -> "str | None":
+        from core import coverage_map as cov
+        bits = self._cov_bits
+        if bits is None or not (0 <= col < self.COVERAGE_W and 0 <= row < self.COVERAGE_H):
+            return None
+        size = self._cov_rom_size()
+        addr, block = cov.address_at(col, row, size, self.COVERAGE_W, self.COVERAGE_H)
+        off = addr - cov.COVERAGE_LO
+        if size and off >= size:
+            return f"0x{addr:06X} — past the end of this cartridge"
+        chunk = bits[off:off + block] if off < len(bits) else None
+        hit = int(chunk.sum()) if chunk is not None else 0
+        where = self._sym_text(addr)
+        return (f"0x{addr:06X}..0x{addr + block - 1:06X}  (ROM +0x{off:06X}, "
+                f"{block} bytes/pixel)\n"
+                f"{hit} instruction start(s) executed here"
+                + (f"\n{where}" if where else ""))
+
+    def _cov_status(self, text: "str | None", copy: bool) -> None:
+        if text is None:
+            return
+        flat = " · ".join(text.splitlines())
+        if copy:
+            QApplication.clipboard().setText(text)
+            self._cov_status_line.setText("✔ copied — " + flat)
+        else:
+            self._cov_status_line.setText(flat)
+
+    def _cov_goto_gap(self, item) -> None:
+        """Double-click a never-executed run to open it in the disassembly."""
+        row = item.row()
+        if 0 <= row < len(self._cov_gap_rows):
+            self._dis_goto.setText(f"{self._cov_gap_rows[row].addr:06X}")
+            self._focus_goto()
+
+    def _cov_export(self) -> None:
+        from core import coverage_map as cov
+        m = self._m
+        if m is None or self._cov_bits is None:
+            self._save_text("(coverage not recording)", "coverage.txt"); return
+        try:
+            reached = m.coverage_hits()
+        except Exception:
+            reached = 0
+        self._save_text(cov.format_report(reached, self._cov_bits,
+                                          self._cov_rom_size()), "coverage.txt")
+
+    def _refresh_coverage(self) -> None:
+        from core import coverage_map as cov
+        m = self._m
+        if m is None:
+            self._cov_head.setText("(no game running)")
+            self._cov_warn.setText("")
+            self._cov_label.clear()
+            self._cov_bits = self._cov_arr = None
+            self._cov_gaps.setRowCount(0)
+            self._cov_gap_rows = []
+            return
+
+        try:
+            raw = m.coverage_bitmap()
+            reached = m.coverage_hits()
+        except Exception:
+            raw, reached = b"", 0
+
+        if not raw:
+            self._cov_head.setText("not recording")
+            self._cov_warn.setText(
+                "Tick “record” to arm it. Nothing is measured until you do — this is "
+                "not a claim that the game executed nothing.")
+            self._cov_label.clear()
+            self._cov_bits = self._cov_arr = None
+            self._cov_gaps.setRowCount(0)
+            self._cov_gap_rows = []
+            return
+
+        size = self._cov_rom_size()
+        bits = cov.unpack(raw, size or None)
+        self._cov_bits = bits
+        st = cov.stats(reached, size)
+        self._cov_head.setText(
+            f"{st.reached:,} instruction addresses reached — {st.percent:.1f}% of "
+            f"{st.covered_span // 1024} KiB")
+        self._cov_warn.setText(f"⚠ {st.unreachable_note}" if st.unreachable_note else "")
+
+        arr = cov.image(bits, size, self.COVERAGE_W, self.COVERAGE_H)
+        s = self.COVERAGE_SCALE
+        self._cov_arr = np.repeat(np.repeat(arr, s, 0), s, 1)
+        pix = _pixmap(arr, s)
+        self._cov_label.setPixmap(pix)
+        self._cov_label.setFixedSize(pix.size())
+
+        holes = cov.gaps(bits, size)[:200]
+        self._cov_gap_rows = holes
+        self._cov_gaps.setRowCount(len(holes))
+        for r, g in enumerate(holes):
+            for c, text in enumerate((f"{g.addr:06X}..{g.end:06X}",
+                                      f"{g.length:,}",
+                                      f"+0x{g.rom_offset:06X}")):
+                self._cov_gaps.setItem(r, c, QTableWidgetItem(text))
 
     # ---- Events tab (the raster timeline)
     def _events_tab(self) -> QWidget:
@@ -2277,6 +3516,129 @@ class DebugWindow(QMainWindow):
             state = "● rec" if self._play and self._play._vgm is not None else "stopped"  # noqa: SLF001
             self._vgm_lbl.setText(f"{len(self._vgm_rec.events)} writes ({state})")
 
+    # ---- Sound CPU tab -----------------------------------------------------
+    # The Z80 is a whole second processor and it had ONE LINE of text in this
+    # debugger. Two audio bugs -- a tempo doubled by a timer output pin, a Z80
+    # running five times too fast -- were found by reasoning about counters,
+    # because nobody could read what the driver was executing.
+    #
+    # Read-only on purpose: the core has no Z80 breakpoints, and a Pause button
+    # here would stop the MAIN CPU while claiming to stop this one. The decoding
+    # is in `core/z80dasm.py` + `core/z80_debug.py` (pure, tested without Qt).
+    Z80_LISTING_ROWS = 22
+
+    def _z80_tab(self) -> QWidget:
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "The sound CPU, in full: its registers (both banks), its stack, and a "
+            "disassembly that follows its PC. It runs in its OWN address space — "
+            "0x0000 here is the shared RAM the two processors talk through, which "
+            "the main CPU sees at 0x7000."))
+
+        self._z80_why = QLabel(""); self._z80_why.setWordWrap(True)
+        lay.addWidget(self._z80_why)
+
+        self._z80_regs = QPlainTextEdit(); self._z80_regs.setReadOnly(True)
+        self._z80_regs.setFont(QFont(_MONO, 10))
+        self._z80_regs.setMaximumHeight(120)
+        lay.addWidget(self._z80_regs)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Go to"))
+        self._z80_goto = QLineEdit()
+        self._z80_goto.setPlaceholderText("hex, or empty to follow PC")
+        self._z80_goto.setFixedWidth(110); self._z80_goto.setFont(QFont(_MONO, 10))
+        self._z80_goto.textChanged.connect(lambda *_: self.refresh())
+        row.addWidget(self._z80_goto)
+        b = QPushButton("follow PC"); b.setObjectName("ghost")
+        b.clicked.connect(lambda: self._z80_goto.setText(""))
+        row.addWidget(b)
+        row.addStretch()
+        self._z80_map = QLabel(""); self._z80_map.setObjectName("hint")
+        row.addWidget(self._z80_map)
+        lay.addLayout(row)
+
+        body = QHBoxLayout()
+        self._z80_text = QPlainTextEdit(); self._z80_text.setReadOnly(True)
+        self._z80_text.setFont(QFont(_MONO, 10))
+        body.addWidget(self._z80_text, 3)
+        self._z80_stack = QPlainTextEdit(); self._z80_stack.setReadOnly(True)
+        self._z80_stack.setFont(QFont(_MONO, 10))
+        self._z80_stack.setMaximumWidth(150)
+        body.addWidget(self._z80_stack, 1)
+        lay.addLayout(body, 1)
+
+        lay.addLayout(self._export_row(self._z80_export))
+        return w
+
+    def _z80_aux(self):
+        m = self._m
+        if m is None:
+            return None
+        try:
+            return m.aux_state()
+        except Exception:
+            return None
+
+    def _z80_export(self) -> None:
+        aux = self._z80_aux()
+        m = self._m
+        if aux is None or m is None:
+            self._save_text("(no game running)", "sound_cpu.txt"); return
+        from core import z80_debug
+        self._save_text(z80_debug.format_report(aux, lambda a, n: m.read(a, n)),
+                        "sound_cpu.txt")
+
+    def _refresh_z80(self) -> None:
+        from core import z80_debug, z80dasm
+        aux = self._z80_aux()
+        m = self._m
+        if aux is None or m is None:
+            self._z80_why.setText("(no game running)")
+            self._z80_why.setStyleSheet("")
+            for box in (self._z80_regs, self._z80_text, self._z80_stack):
+                box.setPlainText("")
+            return
+
+        read_main = lambda a, n: m.read(a, n)      # noqa: E731
+        why = z80_debug.stop_reason(aux, read_main)
+        self._z80_why.setText(f"{why.title}\n{why.detail}" if why.detail else why.title)
+        # A trap is a hole in the emulator; a halt is the driver sleeping. Only the
+        # first one gets the alarm colour, or the alarm stops meaning anything.
+        self._z80_why.setStyleSheet(f"color:{PALETTE.error}" if why.stopped
+                                    and aux.z80_trapped else "")
+
+        regs = z80_debug.registers(aux)
+        lines = ["  ".join(f"{k} {v}" for k, v in regs.pairs[:4]),
+                 "  ".join(f"{k} {v}" for k, v in regs.pairs[4:]),
+                 "  ".join(f"{k} {v}" for k, v in regs.shadow),
+                 "  ".join(f"{k} {v}" for k, v in regs.control)]
+        self._z80_regs.setPlainText("\n".join(lines))
+
+        # Where to list from. An empty box follows PC, which is what you want while
+        # it runs; type an address to hold still somewhere else.
+        try:
+            base = int(self._z80_goto.text().strip(), 16) & 0xFFFF
+            self._z80_goto.setStyleSheet("")
+        except ValueError:
+            base = aux.z80_pc
+            if self._z80_goto.text().strip():
+                self._z80_goto.setStyleSheet(f"color:{PALETTE.error}")
+
+        name, note = z80_debug.region_of(base)
+        self._z80_map.setText(f"0x{base:04X} — {name}: {note}")
+
+        read = z80_debug.make_reader(read_main)
+        out = []
+        for insn in z80dasm.disassemble(read, base, self.Z80_LISTING_ROWS):
+            mark = "▶" if insn.addr == aux.z80_pc else " "
+            arrow = f"   ; -> 0x{insn.target:04X}" if insn.target is not None else ""
+            out.append(f"{mark} {insn.addr:04X}  {insn.hex:<11} {insn.text}{arrow}")
+        self._z80_text.setPlainText("\n".join(out))
+
+        self._z80_stack.setPlainText("SP\n" + "\n".join(
+            f"{a:04X} {w:04X}" for a, w in z80_debug.stack(read_main, aux.z80_sp)))
+
     # ---- Palette tab
     # Which consumer each palette block belongs to. Unlike character RAM, palettes ARE
     # split by hardware -- sprites and the two planes each own their own 16 sub-palettes.
@@ -2470,6 +3832,141 @@ class DebugWindow(QMainWindow):
         s = TILE_ATLAS_SCALE
         self._tiles_arr = np.repeat(np.repeat(sheet, s, 0), s, 1)
         self._tile_label.setPixmap(_pixmap(sheet, s))
+
+    # ---- Tilemap tab -------------------------------------------------------
+    # The Tiles tab shows character RAM in storage order, which is a picture of
+    # nothing. This one shows the 32x32 MAP each plane draws, as one 256x256 image,
+    # with the region the screen is reading off it marked LINE BY LINE -- because
+    # the scroll registers are re-read every scanline, so the "camera" is not a
+    # rectangle. A straight edge means one scroll value for the frame; a wavy one
+    # means the game is scrolling per line; a torn one means it meant to and missed.
+    #
+    # All of the decoding is in `core/tilemap_view.py` (pure, tested without Qt).
+    TILEMAP_SCALE = 2
+
+    def _tilemap_tab(self) -> QWidget:
+        from core import tilemap_view as tv
+
+        w = QWidget(); lay = QVBoxLayout(w)
+        lay.addWidget(QLabel(
+            "The whole scroll plane — 256×256 and cyclical — with the part the "
+            "screen is showing left bright and the rest dimmed. The bright band is "
+            "drawn one scanline at a time, so line-scroll (raster parallax) shows up "
+            "as a wavy edge instead of hiding behind a single end-of-frame number."))
+
+        bar = QHBoxLayout()
+        self._tm_plane = QComboBox()
+        for name in tv.PLANE_NAMES:
+            self._tm_plane.addItem(name)
+        self._tm_plane.currentIndexChanged.connect(lambda *_: self.refresh())
+        bar.addWidget(self._tm_plane)
+        self._tm_camera = QCheckBox("Screen"); self._tm_camera.setChecked(True)
+        self._tm_camera.setToolTip("Dim everything the screen is not currently reading.")
+        self._tm_grid = QCheckBox("Grid")
+        self._tm_grid.setToolTip("An 8-pixel tile grid.")
+        self._tm_clear = QCheckBox("Mark transparent")
+        self._tm_clear.setToolTip(
+            "Paint pixel value 0 — which is transparent, per PIXEL: there is no "
+            "'tile 0 is blank' rule on this hardware.")
+        for cb in (self._tm_camera, self._tm_grid, self._tm_clear):
+            cb.toggled.connect(lambda *_: self.refresh())
+            bar.addWidget(cb)
+        bar.addStretch()
+        lay.addLayout(bar)
+
+        self._tm_note = QLabel(""); self._tm_note.setObjectName("hint")
+        lay.addWidget(self._tm_note)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(False)
+        self._tm_label = _TileGrid(8 * self.TILEMAP_SCALE, 32, self._tm_info)
+        self._tm_label.set_status_sink(self._tm_status)
+        scroll.setWidget(self._tm_label)
+        lay.addWidget(scroll, 1)
+
+        self._tm_status_line = QLabel(""); self._tm_status_line.setObjectName("hint")
+        self._tm_status_line.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._tm_status_line)
+
+        lay.addLayout(self._export_row(
+            lambda: self._save_png(self._tm_arr, "tilemap.png")))
+
+        self._tm_arr = None            # what is on screen, for the export
+        self._tm_view = None           # the decoded plane, for hover
+        return w
+
+    def _tm_info(self, col: int, row: int) -> "str | None":
+        """One map entry, as the numbers you would go and change."""
+        from core import tilemap_view as tv
+        view = self._tm_view
+        if view is None or not (0 <= col < 32 and 0 <= row < 32):
+            return None
+        e = tv.entry_at(view, col, row)
+        flips = "".join(f for f, on in (("H", e.h_flip), ("V", e.v_flip)) if on) or "—"
+        return (f"map ({col},{row})  entry 0x{e.addr:06X} = {e.raw:04X}\n"
+                f"tile {e.tile} (0x{e.tile:03X})  at 0x{e.tile_addr:06X}\n"
+                f"palette {e.palette}   flip {flips}")
+
+    def _tm_status(self, text: "str | None", copy: bool) -> None:
+        if text is None:
+            return
+        flat = " · ".join(text.splitlines())
+        if copy:
+            QApplication.clipboard().setText(text)
+            self._tm_status_line.setText("✔ copied — " + flat)
+        else:
+            self._tm_status_line.setText(flat)
+
+    def _refresh_tilemap(self) -> None:
+        from core import tilemap_view as tv
+        m = self._m
+        if m is None:
+            self._tm_note.setText("(no game running)")
+            self._tm_view = None
+            self._tm_arr = None
+            self._tm_label.clear()
+            return
+
+        plane = self._tm_plane.currentIndex()
+        view = tv.read_plane(lambda a, n: m.read(a, n),
+                             plane, k1ge_console=getattr(m, "k1ge_console", False))
+        self._tm_view = view
+
+        # The per-line registers, which is the whole point. Without them we could
+        # only show the end-of-frame scroll -- the single-snapshot answer this view
+        # exists to contradict -- so when the log is unavailable the note says so
+        # rather than drawing a confident straight edge.
+        spans, live = None, False
+        if self._tm_camera.isChecked():
+            log = None
+            try:
+                log = m.raster_log()
+                live = True
+            except Exception:
+                live = False
+            h_reg, v_reg = tv.SCROLL_REG[plane]
+            fallback = (m.read(0x008000 + h_reg, 1)[0], m.read(0x008000 + v_reg, 1)[0])
+            spans = tv.camera_spans(log, plane, fallback=fallback)
+
+        arr = tv.compose(view, spans,
+                         grid=self._tm_grid.isChecked(),
+                         mark_transparent=self._tm_clear.isChecked())
+        s = self.TILEMAP_SCALE
+        self._tm_arr = np.repeat(np.repeat(arr, s, 0), s, 1)
+        pix = _pixmap(arr, s)
+        self._tm_label.setPixmap(pix)
+        self._tm_label.setFixedSize(pix.size())
+
+        bits = [f"{view.distinct_tiles()} distinct tiles"]
+        bits.append("K1GE compat colours" if view.compat else "K2GE colour")
+        if spans:
+            spread = tv.line_scroll_spread(spans)
+            bits.append(f"scroll X {spans[0].x}, Y {(spans[0].y) & 0xFF}")
+            bits.append(f"line-scroll {spread} px" if spread
+                        else "no line-scroll this frame")
+            if not live:
+                bits.append("⚠ no raster log — one scroll value shown for every line")
+        self._tm_note.setText("   ·   ".join(bits))
 
     # ---- Sprites tab
     def _sprites_tab(self) -> QWidget:
@@ -3507,12 +5004,23 @@ class DebugWindow(QMainWindow):
             self._btn_pause.setText("▶ Resume" if self._play.paused else "⏸ Pause")
             self._status.setText("paused" if self._play.paused else "running")
         idx = self._tabs.currentIndex()
-        # ⚠️ This tuple is positional: it MUST stay in the same order as the addTab
-        # calls in __init__, or a tab silently refreshes a different panel.
-        (self._refresh_cpu, self._refresh_disasm, self._refresh_callstack,
-         self._refresh_events, self._refresh_mem, self._refresh_watch,
-         self._refresh_breaks, self._refresh_ramsearch, self._refresh_audio,
-         self._refresh_palette, self._refresh_tiles, self._refresh_sprites,
-         self._refresh_layers, self._refresh_load, self._refresh_text,
-         self._refresh_crack, self._refresh_pointers, self._refresh_compare,
-         self._refresh_link)[idx]()
+        # Paired with the tab at construction time, so this cannot drift.
+        if not (0 <= idx < len(self._tab_refresh)):
+            return
+        try:
+            self._tab_refresh[idx]()
+            self.last_refresh_error = None
+        except Exception as exc:                              # noqa: BLE001
+            # ⛔ A DEBUG PANEL MUST NEVER KILL THE EMULATOR. `refresh` runs from a
+            # QTimer and from tab changes -- both Qt slots -- and an exception that
+            # reaches PyQt calls qFatal(): the process dies with no message, no
+            # traceback, and it looks like the CORE crashed. That is exactly the
+            # 0xC0000409 this project spent a session chasing.
+            #
+            # It is REPORTED, not swallowed: the status line names the panel, and
+            # `last_refresh_error` lets a test assert that nothing went wrong --
+            # otherwise "every panel refreshed" would pass on a window full of
+            # broken panels.
+            self.last_refresh_error = (self._tabs.tabText(idx), exc)
+            self._status.setText(
+                f"⚠ {self._tabs.tabText(idx)}: {type(exc).__name__}: {exc}")

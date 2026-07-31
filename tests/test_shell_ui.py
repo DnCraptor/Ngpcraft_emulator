@@ -18,7 +18,7 @@ pytest.importorskip("PyQt6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt, QSettings  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
 
 import ngpc_settings as cfg  # noqa: E402
 import ngpc_shell as shell  # noqa: E402
@@ -38,9 +38,21 @@ def _clean_settings():
     # QSettings at a temp .ini before collection. Without that redirect these two
     # lines delete the user's BIOS path and ROM folder on every test.
     s = cfg.make_settings()
-    s.clear()
+
+    def wipe():
+        s.clear()
+        # The backups are part of how settings persist now, so a fixture that
+        # leaves them behind is not giving the next test a clean store -- the
+        # startup restore would hand it the PREVIOUS test's values.
+        for path in (cfg.backup_path(), cfg.backup_path(previous=True)):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    wipe()
     yield
-    s.clear()
+    wipe()
 
 
 def test_the_suite_never_touches_real_settings():
@@ -472,10 +484,17 @@ def test_debug_exports_and_trace_to_file(app, tmp_path, monkeypatch):
         trace = (tmp_path / "trace.txt").read_text(encoding="utf-8").splitlines()
         assert len(trace) > 1000, "trace file should hold a long run of instructions"
         # text + image exports land on disk
-        dbg._tabs.setCurrentIndex(0); dbg.refresh()
+        # ⚠️ BY NAME, never by index. These were hard-coded 3 and 4, which stopped
+        # being Palette and Tiles long ago -- the test was refreshing Events and
+        # Memory and then saving whatever atlas happened to be left over.
+        def _tab(title: str) -> int:
+            return [dbg._tabs.tabText(i) for i in range(dbg._tabs.count())].index(title)
+        dbg._tabs.setCurrentIndex(_tab("CPU")); dbg.refresh()
         dbg._save_text(dbg._cpu_text.toPlainText(), "cpu_state.txt")
-        dbg._tabs.setCurrentIndex(3); dbg.refresh(); dbg._save_png(dbg._pal_arr, "palette.png")
-        dbg._tabs.setCurrentIndex(4); dbg.refresh(); dbg._save_png(dbg._tiles_arr, "tiles.png")
+        dbg._tabs.setCurrentIndex(_tab("Palette")); dbg.refresh()
+        dbg._save_png(dbg._pal_arr, "palette.png")
+        dbg._tabs.setCurrentIndex(_tab("Tiles")); dbg.refresh()
+        dbg._save_png(dbg._tiles_arr, "tiles.png")
         assert (tmp_path / "cpu_state.txt").stat().st_size > 0
         assert (tmp_path / "palette.png").stat().st_size > 0
         assert (tmp_path / "tiles.png").stat().st_size > 0
@@ -1734,3 +1753,1661 @@ def test_a_plugin_never_returns_more_picture_than_was_asked_for(tmp_path):
                 == vid.render_array(fb, k, vid.FILTER_NONE, vid.COLOR_RAW).shape), k
     at3 = vid.render_array(fb, 3, vid.FILTER_NONE, vid.COLOR_RAW, scaler).shape
     assert at3 == (vid.SCREEN_H * 2, vid.SCREEN_W * 2, 3), "x2 into x3 stays at x2"
+
+
+# --------------------------------------------------------------------------
+# HW Regs tab — the hardware registers decoded field by field.
+# --------------------------------------------------------------------------
+def _tab_index(dbg, title: str) -> int:
+    return [dbg._tabs.tabText(i) for i in range(dbg._tabs.count())].index(title)
+
+
+class _FakeCpu:
+    pc = 0x200000
+    sr_raw = 0
+    flags = 0
+    iff_level = 7
+    regs = (0,) * 8
+
+
+class _FakeRegMem:
+    """A flat address space the tab can read. 64 KiB covers every register in the
+    map (the highest is 0x87E2).
+
+    `cpu()` is here because ANY refresh can land on the CPU tab -- a checkbox that
+    calls `refresh()` does, for one -- and a missing method there raises inside a
+    Qt slot, where PyQt calls qFatal and the process dies with no traceback."""
+
+    def __init__(self, values: dict[int, int]):
+        self._b = bytearray(0x10000)
+        for addr, val in values.items():
+            self._b[addr] = val & 0xFF
+
+    def read(self, addr, n=1):
+        return bytes(self._b[addr:addr + n])
+
+    def poke(self, addr, val):
+        self._b[addr] = val & 0xFF
+
+    def cpu(self):
+        return _FakeCpu()
+
+
+class _FakeBreakSet:
+    items: list = []
+
+
+class _FakeRegPlay:
+    """The slice of PlayPage the debug window reads.
+
+    `paused` is read by `refresh()` before it reaches any tab -- without it the
+    AttributeError is raised inside a Qt slot, PyQt calls qFatal, and the process
+    dies with no traceback at all. `symbols` and `breaks` are what `attach()` hands
+    over so a breakpoint guard can name a symbol. Every one of these is here
+    because a borrowed method really reads it."""
+
+    paused = False
+
+    def __init__(self, mem):
+        self.machine = mem
+        self.symbols = None
+        self.breaks = _FakeBreakSet()
+
+
+def test_every_tab_has_its_own_refresher(app):
+    """The pairing that replaced a positional tuple. If a tab is ever added without
+    a refresher — or the two lists drift — this fails instead of a tab silently
+    redrawing a different panel."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        assert len(dbg._tab_refresh) == dbg._tabs.count()
+        for i in range(dbg._tabs.count()):
+            dbg._tabs.setCurrentIndex(i)
+            dbg.refresh()          # detached: must not raise on any tab
+    finally:
+        dbg.close()
+
+
+def test_hwregs_tab_decodes_the_registers_it_reads(app):
+    """0x8118 = 0x87 is 'backdrop on, palette 7'. The Memory tab can show the byte;
+    only this tab can say what it means — which is the whole reason it exists."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakeRegMem({0x008118: 0x87, 0x000071: 0x32, 0x000020: 0x81,
+                           0x00006E: 0x80, 0x008004: 0xFF, 0x008005: 0x98})
+        dbg._play = _FakeRegPlay(mem)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "HW Regs"))
+        dbg.refresh()
+
+        rows = {}
+        for r, (reg, fld) in enumerate(dbg._hw_rows):
+            if reg is None:
+                continue
+            key = reg.name if fld is None else f"{reg.name}.{fld.name}"
+            rows[key] = (dbg._hw_table.item(r, dbg.HW_COL_VALUE).text(),
+                         dbg._hw_table.item(r, dbg.HW_COL_MEANING).text())
+
+        assert rows["BGC"][0] == "87"
+        assert "ON" in rows["BGC.BGON"][1]
+        assert rows["BGC.BGC"][1] == "backdrop palette entry 7"
+        # INTE45 = 0x32: VBlank at level 2, the sound CPU's INT5 at 3.
+        assert rows["INTE45.INT4"][1] == "level 2"
+        assert rows["INTE45.INT5"][1] == "level 3"
+    finally:
+        dbg.close()
+
+
+def test_hwregs_tab_lights_a_register_the_frame_it_changes(app):
+    """Watching which registers a scene actually touches is the live half of this
+    tab. A value that moved is tinted; one that held still is not."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakeRegMem({0x008032: 0x00, 0x008118: 0x80})
+        dbg._play = _FakeRegPlay(mem)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "HW Regs"))
+        dbg.refresh()
+
+        row_of = {}
+        for r, (reg, fld) in enumerate(dbg._hw_rows):
+            if reg is not None and fld is None:
+                row_of[reg.name] = r
+
+        mem.poke(0x008032, 0x40)        # the game scrolls plane 1
+        dbg.refresh()
+        scrolled = dbg._hw_table.item(row_of["S1SO.H"], dbg.HW_COL_VALUE)
+        still = dbg._hw_table.item(row_of["BGC"], dbg.HW_COL_VALUE)
+        assert scrolled.text() == "40"
+        assert scrolled.background() != still.background(), \
+            "the register that moved must be distinguishable from the one that did not"
+    finally:
+        dbg.close()
+
+
+def test_hwregs_checks_report_a_documented_illegal_state(app):
+    """ngpcspec.txt: a window whose origin plus size passes the hardware limit
+    'disrupts display and Vint/Hint generation'. That is a defect the register
+    values state outright, and it is invisible in hex."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeRegMem({0x008002: 100, 0x008004: 100,
+                                              0x000020: 0x81, 0x00006E: 0x80}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "HW Regs"))
+        dbg.refresh()
+        assert dbg._hw_checks.isVisibleTo(dbg)
+        assert "overflows horizontally" in dbg._hw_checks.toPlainText()
+    finally:
+        dbg.close()
+
+
+def test_hwregs_filter_narrows_the_table(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "HW Regs"))
+        dbg.refresh()
+        everything = dbg._hw_table.rowCount()
+
+        def shown():
+            return {reg.name for reg, _f in dbg._hw_rows if reg is not None}
+
+        # By address — which is how you arrive here from the memory viewer or from
+        # a disassembly line, holding a number and no name at all.
+        dbg._hw_filter.setText("8118")
+        assert 0 < dbg._hw_table.rowCount() < everything
+        assert shown() == {"BGC"}
+
+        # By name.
+        dbg._hw_filter.setText("wdmod")
+        assert shown() == {"WDMOD"}
+
+        # By what it does: matching is deliberately loose over the summary and the
+        # group, so a word you remember finds the register you forgot the name of.
+        dbg._hw_filter.setText("watchdog")
+        assert {"WDMOD", "WDCR"} <= shown()
+
+        dbg._hw_filter.setText("")
+        assert dbg._hw_table.rowCount() == everything
+    finally:
+        dbg.close()
+
+
+def test_hwregs_hide_untouched_keeps_the_ones_with_no_known_reset(app):
+    """'Untouched' is only sayable about a register whose reset value is
+    documented. Hiding the rest would read as 'this game does not use it' — a
+    claim the table has no basis for."""
+    import ngpc_debug as dbg_mod
+    from core import hwregs
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        # Everything at its reset value except BGC, which the game has changed.
+        at_reset = {r.addr: r.reset for r in hwregs.all_registers() if r.reset is not None}
+        at_reset[0x008118] = 0x83
+        dbg._play = _FakeRegPlay(_FakeRegMem(at_reset))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "HW Regs"))
+        dbg.refresh()
+
+        dbg._hw_changed_only.setChecked(True)
+        shown = {reg.name for reg, _f in dbg._hw_rows if reg is not None}
+        assert "BGC" in shown, "the one register the game moved must survive"
+        assert "REF" not in shown, "a register still at its documented reset is hidden"
+        assert "TREG0" in shown, "no documented reset -> never hidden"
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Tilemap tab — the scroll planes as whole maps, with the per-line camera.
+# --------------------------------------------------------------------------
+class _FakePlaneMem(_FakeRegMem):
+    """A machine with VRAM worth drawing and, optionally, a raster log."""
+
+    def __init__(self, *, scroll_of_line=None):
+        super().__init__({})
+        self._scroll_of_line = scroll_of_line
+        from core import tilemap_view as tv
+        # One solid tile, one palette entry, and the whole plane paved with it.
+        self._b[tv.CHAR_RAM:tv.CHAR_RAM + 16] = b"\x00" * 16          # tile 0: value 0
+        self._b[tv.CHAR_RAM + 16:tv.CHAR_RAM + 32] = b"\xFF" * 16     # tile 1: value 3
+        base = tv.PALETTE_BASE[tv.SCR1] + 6      # code 0, value 3 -> white
+        self._b[base], self._b[base + 1] = 0xFF, 0x0F
+        for i in range(32 * 32):
+            self._b[tv.MAP_BASE[tv.SCR1] + i * 2] = 1
+        self._b[0x008032] = 40                   # end-of-frame scroll, for the fallback
+
+    def raster_log(self):
+        from core import tilemap_view as tv
+        if self._scroll_of_line is None:
+            raise RuntimeError("no raster log on this core")
+        rows = []
+        for line in range(tv.SCREEN_H):
+            blk = bytearray(0x40)
+            blk[0x32] = self._scroll_of_line(line) & 0xFF
+            rows.append(bytes(blk))
+        return tuple(rows)
+
+
+def test_tilemap_tab_draws_the_plane_and_counts_what_is_on_it(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakePlaneMem(scroll_of_line=lambda ln: 40))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Tilemap"))
+        dbg.refresh()
+        assert dbg._tm_arr is not None
+        assert dbg._tm_arr.shape[0] == 256 * dbg.TILEMAP_SCALE
+        assert "1 distinct tiles" in dbg._tm_note.text()
+        assert "K2GE colour" in dbg._tm_note.text()
+    finally:
+        dbg.close()
+
+
+def test_tilemap_tab_names_line_scroll_instead_of_hiding_it(app):
+    """A single end-of-frame scroll number cannot tell you the game is scrolling
+    per line — which is exactly how parallax is done here. The tab reads the
+    registers each line was actually drawn with."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakePlaneMem(scroll_of_line=lambda ln: 40))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Tilemap"))
+        dbg.refresh()
+        assert "no line-scroll" in dbg._tm_note.text()
+
+        dbg._play = _FakeRegPlay(_FakePlaneMem(scroll_of_line=lambda ln: 40 + ln % 12))
+        dbg.refresh()
+        assert "line-scroll 11 px" in dbg._tm_note.text()
+    finally:
+        dbg.close()
+
+
+def test_tilemap_tab_says_so_when_it_has_no_per_line_registers(app):
+    """Falling back to one scroll value for the whole frame is the mistake this
+    view exists to expose. It stays reachable — and never silent."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakePlaneMem(scroll_of_line=None))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Tilemap"))
+        dbg.refresh()
+        assert "no raster log" in dbg._tm_note.text()
+        assert "scroll X 40" in dbg._tm_note.text(), "it fell back to the live register"
+    finally:
+        dbg.close()
+
+
+def test_tilemap_hover_reports_the_entry_you_would_go_and_poke(app):
+    import ngpc_debug as dbg_mod
+    from PyQt6.QtWidgets import QApplication
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakePlaneMem(scroll_of_line=lambda ln: 0)
+        mem._b[0x009000 + (4 * 32 + 5) * 2] = 0x21        # tile low bits
+        mem._b[0x009000 + (4 * 32 + 5) * 2 + 1] = 0x93    # 9th bit + palette 9 + H flip
+        dbg._play = _FakeRegPlay(mem)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Tilemap"))
+        dbg.refresh()
+
+        info = dbg._tm_info(5, 4)
+        # entry 133 = ty*32+tx, two bytes each -> 0x9000 + 266
+        assert "0x00910A" in info
+        assert "tile 289 (0x121)" in info
+        assert "0x00B210" in info                 # where those 16 bytes live
+        assert "palette 9" in info and "flip H" in info
+        assert dbg._tm_info(99, 0) is None
+
+        dbg._tm_status(info, copy=True)
+        assert QApplication.clipboard().text() == info
+        assert dbg._tm_status_line.text().startswith("✔ copied")
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Sound CPU tab — the Z80, which used to be one line of text.
+# --------------------------------------------------------------------------
+class _FakeZ80Mem(_FakeRegMem):
+    def __init__(self, aux, shared=b""):
+        super().__init__({})
+        self._aux = aux
+        self._b[0x007000:0x007000 + len(shared)] = shared
+
+    def aux_state(self):
+        return self._aux
+
+
+def _z80_aux(**kw):
+    from types import SimpleNamespace
+    base = dict(
+        z80_a=0, z80_f=0, z80_b=0, z80_c=0, z80_d=0, z80_e=0, z80_h=0, z80_l=0,
+        z80_a2=0, z80_f2=0, z80_b2=0, z80_c2=0, z80_d2=0, z80_e2=0, z80_h2=0, z80_l2=0,
+        z80_ix=0, z80_iy=0, z80_sp=0x0FF0, z80_pc=0,
+        z80_i=0, z80_r=0, z80_im=1, z80_iff1=1, z80_iff2=1,
+        z80_halted=0, z80_running=1, z80_nmi_pending=0, z80_int_pending=0,
+        z80_trapped=0, z80_trap_prefix=0, z80_trap_opcode=0, z80_trap_pc=0,
+        z80_cycle_credit=0, z80_executed=0,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_sound_cpu_tab_disassembles_from_the_z80_pc(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        aux = _z80_aux(z80_pc=0x0003, z80_b=0x12, z80_c=0x34, z80_b2=0x99, z80_c2=0x88)
+        # Z80 0x0000 is main-bus 0x7000 -- the shared RAM the two CPUs talk through.
+        code = bytes([0x21, 0x00, 0x40,     # 0000 ld hl,0x4000
+                      0x7E,                 # 0003 ld a,(hl)   <- PC
+                      0xC9])                # 0004 ret
+        dbg._play = _FakeRegPlay(_FakeZ80Mem(aux, code))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Sound CPU"))
+        dbg.refresh()
+
+        # The listing starts AT the PC and runs forward. It does not try to show
+        # what came before: on a variable-length instruction set, disassembling
+        # backwards is guesswork, and a guessed listing is worse than a short one.
+        listing = dbg._z80_text.toPlainText()
+        assert listing.splitlines()[0].startswith("▶ 0003"), "the PC row is first, and marked"
+        assert "ld a,(hl)" in listing and "ret" in listing
+        regs = dbg._z80_regs.toPlainText()
+        assert "BC 1234" in regs
+        assert "BC' 9988" in regs, "the shadow bank is shown -- exx swaps it in one go"
+        assert "running" in dbg._z80_why.text()
+    finally:
+        dbg.close()
+
+
+def test_sound_cpu_tab_separates_a_halt_from_a_trap(app):
+    """A halt is the driver sleeping between timer ticks. A trap is our core
+    refusing an opcode — a hole in the emulator with an address on it. Only the
+    second one gets the alarm, or the alarm stops meaning anything."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Sound CPU"))
+
+        dbg._play = _FakeRegPlay(_FakeZ80Mem(_z80_aux(z80_halted=1)))
+        dbg.refresh()
+        assert "halted" in dbg._z80_why.text()
+        assert not dbg._z80_why.styleSheet(), "a halt is normal, not an alarm"
+
+        dbg._play = _FakeRegPlay(_FakeZ80Mem(
+            _z80_aux(z80_trapped=1, z80_trap_pc=0x0000,
+                     z80_trap_prefix=0xED, z80_trap_opcode=0xB0),
+            bytes([0xED, 0xB0])))
+        dbg.refresh()
+        assert "TRAPPED" in dbg._z80_why.text()
+        assert "ldir" in dbg._z80_why.text(), "it names the instruction to implement"
+        assert dbg._z80_why.styleSheet(), "this one IS an alarm"
+    finally:
+        dbg.close()
+
+
+def test_sound_cpu_tab_can_be_pointed_somewhere_other_than_pc(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeZ80Mem(_z80_aux(), bytes([0x00] * 0x20)))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Sound CPU"))
+        dbg._z80_goto.setText("0010")
+        dbg.refresh()
+        assert dbg._z80_text.toPlainText().lstrip().startswith("0010")
+        assert "work RAM" in dbg._z80_map.text()
+
+        # An address in the sound chip's window: write-only, so it reads 0xFF.
+        dbg._z80_goto.setText("4000")
+        dbg.refresh()
+        assert "T6W28" in dbg._z80_map.text()
+        assert "WRITE-ONLY" in dbg._z80_map.text()
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Coverage tab — what the cartridge actually executed.
+# --------------------------------------------------------------------------
+class _FakeCovMem(_FakeRegMem):
+    def __init__(self, *, armed=False, executed=()):
+        super().__init__({})
+        from core import coverage_map as cm
+        self._armed = armed
+        raw = bytearray((cm.COVERAGE_SPAN + 7) // 8)
+        for a in executed:
+            i = a - cm.COVERAGE_LO
+            raw[i >> 3] |= 1 << (i & 7)
+        self._raw = bytes(raw)
+        self._hits = len(set(executed))
+        self.calls: list = []
+
+    def set_coverage(self, on):
+        self.calls.append(bool(on))
+        self._armed = bool(on)
+
+    def coverage_bitmap(self):
+        return self._raw if self._armed else b""
+
+    def coverage_hits(self):
+        return self._hits if self._armed else 0
+
+
+class _FakeCovPlay(_FakeRegPlay):
+    def __init__(self, mem, rom_path=None):
+        super().__init__(mem)
+        self._rom_path = rom_path
+
+
+def test_coverage_tab_does_not_claim_zero_when_it_is_simply_not_recording(app):
+    """An empty bitmap means 'nobody armed it'. Showing that as 0% executed would
+    be a measurement the tool never took."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeCovPlay(_FakeCovMem(armed=False))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Coverage"))
+        dbg.refresh()
+        assert "not recording" in dbg._cov_head.text()
+        assert "not a claim" in dbg._cov_warn.text()
+        assert dbg._cov_gaps.rowCount() == 0
+    finally:
+        dbg.close()
+
+
+def test_coverage_tab_reports_reached_addresses_and_the_cold_runs(app, tmp_path):
+    import ngpc_debug as dbg_mod
+    from core import coverage_map as cm
+
+    rom = tmp_path / "game.ngc"
+    rom.write_bytes(b"\x00" * 4096)
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        hot = list(range(cm.COVERAGE_LO, cm.COVERAGE_LO + 512))
+        dbg._play = _FakeCovPlay(_FakeCovMem(armed=True, executed=hot), rom)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Coverage"))
+        dbg.refresh()
+
+        assert "512 instruction addresses reached" in dbg._cov_head.text()
+        assert dbg._cov_arr is not None
+        # Everything from 0x200200 to the end of the 4 KiB file never ran.
+        assert dbg._cov_gaps.rowCount() >= 1
+        biggest = dbg._cov_gap_rows[0]
+        assert biggest.addr == cm.COVERAGE_LO + 512
+        assert biggest.end < cm.COVERAGE_LO + 4096, \
+            "a 4 KiB ROM must not report the rest of the 2 MiB window as dead code"
+    finally:
+        dbg.close()
+
+
+def test_coverage_reset_goes_through_the_cores_own_clear(app, tmp_path):
+    """Enabling is what allocates and clears in the core. Reset rides that path
+    rather than adding a second one that could drift from it."""
+    import ngpc_debug as dbg_mod
+
+    rom = tmp_path / "game.ngc"
+    rom.write_bytes(b"\x00" * 4096)
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakeCovMem(armed=True)
+        dbg._play = _FakeCovPlay(mem, rom)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Coverage"))
+        dbg._cov_on.setChecked(True)
+        mem.calls.clear()
+        dbg._cov_reset()
+        assert mem.calls == [False, True]
+    finally:
+        dbg.close()
+
+
+def test_coverage_hover_maps_a_pixel_back_to_an_address_range(app, tmp_path):
+    import ngpc_debug as dbg_mod
+    from core import coverage_map as cm
+
+    rom = tmp_path / "game.ngc"
+    rom.write_bytes(b"\x00" * 4096)
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeCovPlay(
+            _FakeCovMem(armed=True, executed=[cm.COVERAGE_LO]), rom)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Coverage"))
+        dbg.refresh()
+        info = dbg._cov_info(0, 0)
+        assert "0x200000" in info and "bytes/pixel" in info
+        assert "1 instruction start(s) executed here" in info
+        # Past the end of a 4 KiB cartridge the map says so instead of "unexecuted".
+        assert "past the end" in dbg._cov_info(dbg.COVERAGE_W - 1, dbg.COVERAGE_H - 1)
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Profiler tab — where the frame goes, in cycles.
+# --------------------------------------------------------------------------
+class _FakeProfMem(_FakeRegMem):
+    """A machine that retires a fixed script of instructions when asked to run."""
+
+    def __init__(self, script):
+        super().__init__({})
+        self._script = list(script)
+        self.runs = 0
+
+    def run(self, count, record=True):
+        from types import SimpleNamespace
+        self.runs += 1
+        take = self._script[:count]
+        del self._script[:count]
+        return SimpleNamespace(emitted=len(take)), take
+
+
+def _rec(pc, cycles=4, reads=0, writes=0):
+    from types import SimpleNamespace
+    return SimpleNamespace(pc=pc, cycles=cycles, n_reads=reads, n_writes=writes)
+
+
+class _FakeProfPlay(_FakeRegPlay):
+    def __init__(self, mem):
+        super().__init__(mem)
+        self.paused = False
+        self.blits = 0
+
+    def _blit(self):
+        self.blits += 1
+
+
+def test_profiler_says_nothing_until_you_capture(app):
+    """Capturing ADVANCES the machine, so it never happens behind your back on a
+    refresh. Before that the tab claims nothing."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeProfPlay(_FakeProfMem([]))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Profiler"))
+        dbg.refresh()
+        assert "nothing captured" in dbg._prof_head.text()
+        assert dbg._prof_table.rowCount() == 0
+    finally:
+        dbg.close()
+
+
+def test_profiler_ranks_by_cycles_and_restores_the_pause_state(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        script = ([_rec(0x200000, cycles=2)] * 100      # many instructions, cheap
+                  + [_rec(0x210000, cycles=40)] * 20)   # few instructions, costly
+        mem = _FakeProfMem(script)
+        play = _FakeProfPlay(mem)
+        play.paused = False
+        dbg._play = play
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Profiler"))
+        dbg._prof_count.setValue(1000)
+        dbg._prof_capture()
+
+        assert dbg._prof_table.rowCount() == 2
+        assert dbg._prof_table.item(0, 1).text() == "800", "the costly one leads"
+        assert "120 instructions" in dbg._prof_head.text()
+        assert not play.paused, "the pause state it found is the one it leaves"
+        assert play.blits == 1, "the picture is put back after running blind"
+    finally:
+        dbg.close()
+
+
+def test_profiler_names_the_regions_the_cycles_went_to(app):
+    """'40% of this frame is inside the BIOS' is something no function list can
+    say — and on this console it is often the answer."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        script = [_rec(0x200000, cycles=10)] * 6 + [_rec(0xFF2000, cycles=10)] * 4
+        dbg._play = _FakeProfPlay(_FakeProfMem(script))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Profiler"))
+        dbg._prof_count.setValue(1000)
+        dbg._prof_capture()
+        note = dbg._prof_regions.text()
+        assert "cartridge 60.0%" in note and "BIOS 40.0%" in note
+        assert "no .map loaded" in note, "and it says the rows are blocks, not functions"
+    finally:
+        dbg.close()
+
+
+def test_profiler_capture_stops_when_the_core_stops_emitting(app):
+    """A halted or trapped core emits nothing. The capture loop must end, not spin
+    asking for the rest of a million instructions that will never arrive."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakeProfMem([_rec(0x200000)] * 10)
+        dbg._play = _FakeProfPlay(mem)
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Profiler"))
+        dbg._prof_count.setValue(1_000_000)
+        dbg._prof_capture()
+        assert dbg._prof_report.total_instructions == 10
+        assert mem.runs == 2, "one run that emitted, one that returned nothing"
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Movie — input recording and replay, through the ONE call site that feeds 0x00B0.
+# --------------------------------------------------------------------------
+class _FakeMoviePlay:
+    """The slice of PlayPage the movie feature touches. The real methods are
+    exercised through `_movie_byte`, which is the single point the frame loop
+    calls -- there is no second clock for a replay to drift against."""
+
+    def __init__(self, held=0):
+        from ngpc_shell import PlayPage
+        self.machine = object()
+        self.held = held
+        self.paused = False
+        self.movie_rec = None
+        self.movie_play = None
+        self.movie_ended = None
+        self.flashes: list = []
+        self.applied: list = []
+        self.blits = 0
+        self._state = b"STATE-BLOB"
+        # Bind the real implementations onto this stand-in.
+        for name in ("_movie_byte", "movie_start_recording", "movie_stop_recording",
+                     "movie_play_back", "movie_stop"):
+            setattr(self, name, getattr(PlayPage, name).__get__(self))
+
+    # what the real page provides to those methods
+    def _joypad_byte(self):
+        return self.held & 0x7F
+
+    def _capture_state(self):
+        return self._state
+
+    def _apply_state(self, body, aux=True):
+        self.applied.append(body)
+
+    def _mirror_blocks(self):
+        return False
+
+    def _flash(self, msg, ms=1100):
+        self.flashes.append(msg)
+
+    def _blit(self):
+        self.blits += 1
+
+
+def test_recording_captures_the_byte_the_console_is_given():
+    play = _FakeMoviePlay(held=0x11)
+    assert play.movie_start_recording({"rom_name": "game.ngc"})
+    assert play._movie_byte() == 0x11
+    play.held = 0x02
+    assert play._movie_byte() == 0x02
+    movie = play.movie_stop_recording()
+    assert list(movie.inputs) == [0x11, 0x02]
+    assert movie.state == b"STATE-BLOB", "the snapshot is taken when recording starts"
+
+
+def test_the_starting_state_is_captured_at_the_button_not_the_first_frame():
+    """A recording that begins one frame late replays one frame out of step
+    forever — and a one-frame drift reads as an emulation bug, not a broken tool."""
+    play = _FakeMoviePlay()
+    play._state = b"AT-THE-BUTTON"
+    play.movie_start_recording({})
+    play._state = b"ONE-FRAME-LATER"
+    play._movie_byte()
+    assert play.movie_stop_recording().state == b"AT-THE-BUTTON"
+
+
+def test_replay_overrides_the_live_controller():
+    from core import movie as mv
+
+    play = _FakeMoviePlay(held=0x7F)               # every button mashed
+    movie = mv.Movie({}, b"", bytearray([0x01, 0x00, 0x08]))
+    assert play.movie_play_back(movie)
+    assert [play._movie_byte() for _ in range(3)] == [0x01, 0x00, 0x08]
+
+
+def test_replay_applies_the_recorded_state_first():
+    from core import movie as mv
+
+    play = _FakeMoviePlay()
+    play.movie_play_back(mv.Movie({}, b"SNAP", bytearray([0])))
+    assert play.applied == [b"SNAP"]
+
+
+def test_when_a_replay_ends_the_controller_comes_back():
+    """Past the end it must not hold the final byte: a replay that keeps pressing
+    what was held on the last frame walks the game into a wall."""
+    from core import movie as mv
+
+    play = _FakeMoviePlay(held=0x04)
+    play.movie_play_back(mv.Movie({}, b"", bytearray([0x01])))
+    assert play._movie_byte() == 0x01
+    assert play._movie_byte() == 0x04, "the live pad again"
+    assert play.movie_play is None and play.movie_ended is not None
+
+
+def test_recording_and_replaying_are_mutually_exclusive():
+    """Recording a replay would just copy the file back out."""
+    from core import movie as mv
+
+    play = _FakeMoviePlay()
+    play.movie_start_recording({})
+    play.movie_play_back(mv.Movie({}, b"", bytearray([1])))
+    assert play.movie_rec is None
+    play.movie_start_recording({})
+    assert play.movie_play is None
+
+
+def test_a_mirror_match_refuses_both():
+    """The other PC is simulating both consoles from the shared input stream.
+    Feeding this one a recorded byte desynchronises the match."""
+    from core import movie as mv
+
+    play = _FakeMoviePlay()
+    play._mirror_blocks = lambda: True
+    assert not play.movie_start_recording({})
+    assert not play.movie_play_back(mv.Movie({}, b"", bytearray([1])))
+    assert play.movie_rec is None and play.movie_play is None
+
+
+def test_movie_tab_reports_the_state_it_is_in(app):
+    import ngpc_debug as dbg_mod
+    from core import movie as mv
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        play = _FakeMoviePlay()
+        dbg._play = play
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Movie"))
+        dbg.refresh()
+        assert dbg._mov_state.text() == "idle"
+
+        play.movie_start_recording({})
+        play._movie_byte(); play._movie_byte()
+        dbg.refresh()
+        assert "recording — 2 frames" in dbg._mov_state.text()
+        assert not dbg._mov_play.isEnabled(), "no replaying while recording"
+
+        play.movie_stop_recording()
+        play.movie_play_back(mv.Movie({}, b"", bytearray([0] * 4)))
+        play._movie_byte()
+        dbg.refresh()
+        assert "frame 1 of 4" in dbg._mov_state.text()
+        assert not dbg._mov_rec.isEnabled(), "no recording while replaying"
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Console tab — a Python prompt with the machine in scope.
+# --------------------------------------------------------------------------
+class _FakeCartMem:
+    """A sparse bus that reaches the cartridge window — `_FakeRegMem` is only
+    64 KiB, and the console's helpers default to 0x200000."""
+
+    def __init__(self, values=None):
+        self._v = dict(values or {})
+
+    def read(self, addr, n=1):
+        return bytes(self._v.get(addr + i, 0) & 0xFF for i in range(n))
+
+    def write(self, addr, data):
+        for i, b in enumerate(bytes(data)):
+            self._v[addr + i] = b
+
+    def cpu(self):
+        return _FakeCpu()
+def test_console_tab_runs_a_line_and_shows_the_result(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeCartMem({0x200000: 0x42}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        dbg.refresh()
+        dbg._con_in.setPlainText("hex(u8(0x200000))")
+        dbg._con_submit()
+        out = dbg._con_out.toPlainText()
+        assert ">>> hex(u8(0x200000))" in out
+        assert "'0x42'" in out
+        assert dbg._con_in.toPlainText() == "", "the input clears after it runs"
+    finally:
+        dbg.close()
+
+
+def test_console_tab_shows_an_error_without_taking_the_window_with_it(app):
+    """This runs inside a Qt slot: an exception reaching PyQt calls qFatal and the
+    process dies with no message. The test surviving IS the assertion."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        dbg._con_in.setPlainText("1 / 0")
+        dbg._con_submit()
+        assert "ZeroDivisionError" in dbg._con_out.toPlainText()
+        dbg.refresh()
+    finally:
+        dbg.close()
+
+
+def test_console_tab_waits_for_the_rest_of_a_block(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        before = dbg._con_out.toPlainText()
+        dbg._con_in.setPlainText("for i in range(2):")
+        dbg._con_submit()
+        assert dbg._con_out.toPlainText() == before, "nothing ran, nothing echoed"
+        assert dbg._con_in.toPlainText() == "for i in range(2):", "the text is kept"
+
+        dbg._con_in.setPlainText("for i in range(2):\n    print('tick', i)\n")
+        dbg._con_submit()
+        assert "tick 1" in dbg._con_out.toPlainText()
+    finally:
+        dbg.close()
+
+
+def test_console_namespace_follows_the_running_game_but_keeps_your_helpers(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeCartMem({0x200000: 1}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        dbg.refresh()
+        dbg._con_in.setPlainText("def mine(): return 7")
+        dbg._con_submit()
+
+        dbg._play = _FakeRegPlay(_FakeCartMem({0x200000: 2}))    # a different game
+        dbg.refresh()
+        dbg._con_in.setPlainText("(mine(), u8(0x200000))")
+        dbg._con_submit()
+        assert "(7, 2)" in dbg._con_out.toPlainText(), \
+            "the helper survived and the machine is the new one"
+    finally:
+        dbg.close()
+
+
+def test_console_refresh_never_executes_anything_on_a_timer(app):
+    """A console that re-ran something every refresh would be a machine for
+    surprises. Only Enter executes."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeRegPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        dbg._con_in.setPlainText("print('should not run')")
+        for _ in range(5):
+            dbg.refresh()
+        assert "should not run" not in dbg._con_out.toPlainText()
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Two-row tabs — 27 panels do not fit on one row.
+# --------------------------------------------------------------------------
+def test_the_debug_window_groups_its_panels_on_two_rows(app):
+    """A single row stopped working around twenty panels: Qt shrinks the labels
+    past reading or hides half of them behind scroll arrows, and a tool whose tabs
+    you cannot see is a tool you stop opening."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        bar = dbg._tabs._cat_bar
+        cats = [bar.tabText(i) for i in range(bar.count())]
+        assert cats == ["CPU", "Memory", "Video", "Audio", "Analysis", "ROM", "Link"]
+        # Every panel belongs to exactly one category, and none is orphaned.
+        assert len(dbg._tabs._categories) == dbg._tabs.count()
+        assert set(dbg._tabs._categories) == set(cats)
+        # Neither row is longer than it needs to be for a glance.
+        for cat in cats:
+            assert sum(1 for c in dbg._tabs._categories if c == cat) <= 6
+    finally:
+        dbg.close()
+
+
+def test_selecting_a_panel_by_name_pulls_its_category_into_view(app):
+    """Nothing outside the tab widget knows panels are grouped — `Ctrl+G` jumps to
+    Disassembly from wherever you are, and the double-click handlers in Coverage
+    and Profiler do the same. That only works if a flat index still resolves."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        names = [dbg._tabs.tabText(i) for i in range(dbg._tabs.count())]
+        dbg._tabs.setCurrentIndex(names.index("Link"))
+        assert dbg._tabs._cat_bar.tabText(dbg._tabs._cat_bar.currentIndex()) == "Link"
+
+        dbg._tabs.setCurrentIndex(names.index("Disassembly"))
+        assert dbg._tabs.currentIndex() == names.index("Disassembly")
+        assert dbg._tabs._cat_bar.tabText(dbg._tabs._cat_bar.currentIndex()) == "CPU"
+        assert dbg._tabs._stack.currentIndex() == names.index("Disassembly")
+    finally:
+        dbg.close()
+
+
+def test_picking_a_category_opens_its_first_panel_and_reports_it(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        seen: list = []
+        dbg._tabs.currentChanged.connect(seen.append)
+        cats = [dbg._tabs._cat_bar.tabText(i)
+                for i in range(dbg._tabs._cat_bar.count())]
+        dbg._tabs._cat_bar.setCurrentIndex(cats.index("Video"))
+        assert dbg._tabs.tabText(dbg._tabs.currentIndex()) == "Palette"
+        assert seen and seen[-1] == dbg._tabs.currentIndex()
+    finally:
+        dbg.close()
+
+
+def test_a_category_with_one_panel_does_not_show_a_second_row(app):
+    """The Link category would otherwise render a row saying its own name back."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        names = [dbg._tabs.tabText(i) for i in range(dbg._tabs.count())]
+        dbg._tabs.setCurrentIndex(names.index("Link"))
+        assert not dbg._tabs._tab_bar.isVisibleTo(dbg._tabs)
+        dbg._tabs.setCurrentIndex(names.index("Tilemap"))
+        assert dbg._tabs._tab_bar.isVisibleTo(dbg._tabs)
+    finally:
+        dbg.close()
+
+
+def test_every_panel_is_reachable_and_refreshes(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        assert dbg._tabs.count() == len(dbg._tab_refresh) == 27
+        for i in range(dbg._tabs.count()):
+            dbg._tabs.setCurrentIndex(i)
+            assert dbg._tabs.currentIndex() == i, dbg._tabs.tabText(i)
+            dbg.refresh()
+    finally:
+        dbg.close()
+
+
+def test_no_panel_was_lost_when_the_tabs_were_regrouped(app):
+    """The 19 panels the debugger had before the two-row rework, named one by one.
+
+    Regrouping tabs is exactly the kind of change that quietly drops one: the list
+    still looks full, and the missing panel is only noticed by the person who
+    needed it. Each name is spelled out here so removing one is a decision someone
+    has to make on purpose."""
+    import ngpc_debug as dbg_mod
+
+    before = ["CPU", "Disassembly", "Call Stack", "Events", "Memory", "Watch",
+              "Breakpoints", "RAM Search", "Audio", "Palette", "Tiles", "Sprites",
+              "Layers", "Load", "Text", "Crack", "Pointers", "Compare", "Link"]
+    added = ["HW Regs", "Tilemap", "Sound CPU", "Coverage", "Profiler", "Movie",
+             "Console", "Cheats"]
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        names = [dbg._tabs.tabText(i) for i in range(dbg._tabs.count())]
+        assert not set(before) - set(names), "a panel that existed before is gone"
+        assert set(names) == set(before) | set(added)
+        assert len(names) == len(set(names)), "a panel is registered twice"
+        # A panel with no widget, or two sharing a refresher, is a panel that shows
+        # someone else's contents.
+        assert len(set(dbg._tab_refresh)) == len(names)
+        assert dbg._tabs._stack.count() == len(names)
+        assert all(dbg._tabs._stack.widget(i) is not None for i in range(len(names)))
+    finally:
+        dbg.close()
+
+
+# --------------------------------------------------------------------------
+# Cheats tab — named groups of addresses held at a value.
+# --------------------------------------------------------------------------
+class _FakeCheatPlay(_FakeRegPlay):
+    def __init__(self, mem):
+        super().__init__(mem)
+        from core.cheats import CheatSet
+        self.cheats = CheatSet()
+        self.saved = 0
+
+    def save_cheats(self):
+        self.saved += 1
+
+
+def test_cheats_tab_loads_pasted_codes_and_lists_them(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        play = _FakeCheatPlay(_FakeRegMem({}))
+        dbg._play = play
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Cheats"))
+        dbg._ch_text.setPlainText("# Infinite health\n4812:1 = 63\n481A:2 = 03E7\n")
+        dbg._ch_apply_text()
+
+        assert dbg._ch_table.rowCount() == 1
+        assert dbg._ch_table.item(0, 1).text() == "Infinite health"
+        assert "004812:1 = 63" in dbg._ch_table.item(0, 2).text()
+        assert play.saved >= 1, "cheats are kept per ROM, like the watches"
+    finally:
+        dbg.close()
+
+
+def test_a_bad_line_is_reported_rather_than_silently_dropped(app):
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeCheatPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Cheats"))
+        dbg._ch_text.setPlainText("# x\n4000=01\ngarbage\n")
+        dbg._ch_apply_text()
+        assert "line 3" in dbg._ch_warn.text()
+        assert dbg._ch_table.rowCount() == 1, "the readable line still loaded"
+    finally:
+        dbg.close()
+
+
+def test_re_applying_the_text_does_not_switch_your_cheats_off(app):
+    """Re-reading your own list should not silently turn everything off."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        play = _FakeCheatPlay(_FakeRegMem({}))
+        dbg._play = play
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Cheats"))
+        dbg._ch_text.setPlainText("# hp\n4812:1 = 63\n")
+        dbg._ch_apply_text()
+        play.cheats.cheats[0].enabled = True
+        dbg._ch_apply_text()
+        assert play.cheats.cheats[0].enabled
+    finally:
+        dbg.close()
+
+
+def test_ticking_a_row_arms_the_cheat_in_the_running_game(app):
+    import ngpc_debug as dbg_mod
+    from PyQt6.QtCore import Qt as _Qt
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        play = _FakeCheatPlay(_FakeRegMem({}))
+        dbg._play = play
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Cheats"))
+        dbg._ch_text.setPlainText("# hp\n4812:1 = 63\n")
+        dbg._ch_apply_text()
+        assert not play.cheats.enabled()
+
+        dbg._ch_table.item(0, 0).setCheckState(_Qt.CheckState.Checked)
+        assert [c.name for c in play.cheats.enabled()] == ["hp"]
+    finally:
+        dbg.close()
+
+
+def test_a_cartridge_address_is_warned_about_when_selected(app):
+    """The cart is FLASH: a write there does not change memory, it goes to the
+    chip's command latch. Warned, never refused."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        dbg._play = _FakeCheatPlay(_FakeRegMem({}))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Cheats"))
+        dbg._ch_text.setPlainText("# into the cart\n201234:1 = FF\n")
+        dbg._ch_apply_text()
+        dbg._ch_table.selectRow(0)
+        assert "FLASH" in dbg._ch_warn.text()
+        assert dbg._ch_table.rowCount() == 1, "still loaded, just flagged"
+    finally:
+        dbg.close()
+
+
+def test_the_frame_loop_writes_cheats_where_it_writes_locked_watches():
+    """One mechanism, one point in the frame. Two things that both hold a value
+    would race, and which won would depend on where in the frame each ran."""
+    import inspect
+
+    from ngpc_shell import PlayPage
+
+    src = inspect.getsource(PlayPage._tick)
+    lock_at = src.index("w.lock_bytes()")
+    cheat_at = src.index("self.cheats.apply(self.machine)")
+    assert 0 < cheat_at - lock_at < 400, \
+        "the cheat write must sit with the lock write, not somewhere else in the frame"
+
+
+# --------------------------------------------------------------------------
+# Rewind strip — in the main window, while you are rewinding, and nowhere else.
+# --------------------------------------------------------------------------
+def test_the_rewind_strip_reports_time_left_not_a_frame_count(app):
+    """`⏪ 137` is a unit nobody thinks in, printed over the picture you are
+    looking at, and it never said the thing that matters while you hold the key:
+    how much history is LEFT."""
+    import ngpc_shell as shell_mod
+
+    bar = shell_mod._RewindBar()
+    try:
+        bar.set_range(total=300, pos=299)
+        assert bar.frames_back == 0, "at the present"
+        bar.set_range(total=300, pos=200)
+        assert bar.frames_back == 99
+        bar.resize(200, 26)
+        bar.grab()                     # it paints without a live theme or a game
+    finally:
+        bar.deleteLater()
+
+
+def test_the_strip_clamps_instead_of_reporting_a_position_that_does_not_exist(app):
+    import ngpc_shell as shell_mod
+
+    bar = shell_mod._RewindBar()
+    try:
+        bar.set_range(total=10, pos=999)
+        assert bar.frames_back == 0
+        bar.set_range(total=10, pos=-5)
+        assert bar.frames_back == 9
+        bar.set_range(total=0, pos=0)
+        assert bar.frames_back == 0, "an empty ring has nothing behind it"
+    finally:
+        bar.deleteLater()
+
+
+def test_dragging_the_strip_asks_for_a_position_in_the_ring(app):
+    """Dragging is why a strip beats a counter: you go back to A MOMENT instead of
+    feeling your way there one key-press at a time."""
+    import ngpc_shell as shell_mod
+
+    bar = shell_mod._RewindBar()
+    try:
+        bar.resize(600, 26)
+        bar.set_range(total=101, pos=100)
+        # ⚠️ Against the TRACK, not the widget: the track stops before the label,
+        # so mapping a click against the full width lands you a few seconds off --
+        # and consistently in one direction, which is the kind of wrongness you
+        # blame on yourself rather than on the tool.
+        track = bar._track_width()
+        assert 0 < track < bar.width()
+        # The track starts after the plate's left padding -- the strip floats over
+        # the picture now, so it draws its own rounded backing and the clickable
+        # area is inset from the widget's edge.
+        left = bar.INSET // 2
+        assert bar._index_at(left) == 0
+        assert bar._index_at(left + track // 2) == 50
+        assert bar._index_at(left + track) == 100
+        assert bar._index_at(bar.width() * 2) == 100, "past the end is the present"
+    finally:
+        bar.deleteLater()
+
+
+class _FakeRewindPage(QWidget):
+    """The slice of PlayPage the strip touches, with the real methods bound on.
+
+    A QWidget, because that is what it stands in for: the strip is placed against
+    the page's own geometry, and a stand-in without a width cannot be placed."""
+
+    def __init__(self, frames=10):
+        from collections import deque
+
+        import ngpc_shell as shell_mod
+
+        super().__init__()
+        self.resize(640, 480)
+        # Class-level settings the borrowed methods read off `self`.
+        self.LINGER_MS = shell_mod.PlayPage.LINGER_MS
+        self.machine = object()
+        self._rewind = deque(bytes([i]) for i in range(frames))
+        self._rw_pos = None
+        self._rewinding = False
+        self.paused = False
+        self.applied: list = []
+        self.rewind_bar = shell_mod._RewindBar(self)
+        self._rw_bar_timer = None
+        self._rw_resume_after_drag = False
+        self.overlay = QLabel()
+        self.lcd = QWidget(self); self.lcd.resize(600, 400)
+        for name in ("_show_rewind_bar", "_scrub_to", "_place_rewind_bar",
+                     "_hold_rewind_bar", "_linger_rewind_bar", "_hide_rewind_bar",
+                     "_begin_scrub", "_end_scrub"):
+            setattr(self, name, getattr(shell_mod.PlayPage, name).__get__(self))
+        # ...and only THEN wire the strip, the way the page does -- a signal
+        # connected to a method that is not bound yet is an AttributeError at
+        # construction, not at the click.
+        self.rewind_bar.grabbed.connect(self._begin_scrub)
+        self.rewind_bar.scrubbed.connect(self._scrub_to)
+        self.rewind_bar.dropped.connect(self._end_scrub)
+
+    def _apply_state(self, body, aux=True):
+        self.applied.append(body)
+
+    def _drain_audio_silently(self):
+        pass
+
+    def _blit(self):
+        pass
+
+
+def test_the_strip_appears_only_when_there_is_history(app):
+    page = _FakeRewindPage(frames=1)
+    page._show_rewind_bar()
+    assert not page.rewind_bar.isVisible(), "one frame is not a timeline"
+    page = _FakeRewindPage(frames=10)
+    page._show_rewind_bar()
+    assert page.rewind_bar.isVisibleTo(page), "with history, it shows"
+
+
+def test_the_strip_follows_the_held_key_and_the_step_cursor(app):
+    """Two different truths: holding rewind POPS the ring so the present is its
+    last frame, while stepping leaves the ring intact and moves a cursor. The
+    strip has to ask which applies rather than assume one."""
+    page = _FakeRewindPage(frames=10)
+    page._show_rewind_bar()
+    assert page.rewind_bar.frames_back == 0, "held: the tip is the present"
+    page._rw_pos = 3
+    page._show_rewind_bar()
+    assert page.rewind_bar.frames_back == 6, "stepping: the cursor is the present"
+
+
+def test_scrubbing_applies_that_frame_and_pauses(app):
+    page = _FakeRewindPage(frames=10)
+    page._rewinding = True
+    page._scrub_to(4)
+    assert page.applied == [bytes([4])]
+    assert page._rw_pos == 4
+    assert page.paused, "a deliberate look at the past pauses, like stepping back"
+    assert not page._rewinding, "and it is no longer a held rewind"
+
+
+def test_scrubbing_past_the_ends_lands_inside_the_ring(app):
+    page = _FakeRewindPage(frames=10)
+    page._scrub_to(-3)
+    assert page.applied[-1] == bytes([0])
+    page._scrub_to(99)
+    assert page.applied[-1] == bytes([9])
+
+
+def test_scrubbing_an_empty_ring_does_nothing_rather_than_raising(app):
+    page = _FakeRewindPage(frames=1)
+    page._scrub_to(5)
+    assert page.applied == []
+
+
+# --------------------------------------------------------------------------
+# Rewind, second pass: it was slow to go far, and the scrubber was unreachable.
+# --------------------------------------------------------------------------
+def test_a_held_rewind_speeds_up_the_longer_it_is_held():
+    """At one frame per step this ran backwards in REAL TIME: reaching the far end
+    of a 30-second buffer took thirty seconds of holding a key, which is not
+    rewinding, it is waiting."""
+    import ngpc_shell as shell_mod
+
+    assert shell_mod.rewind_speed(0) == 1, "a short tap stays frame-accurate"
+    assert shell_mod.rewind_speed(29) == 1
+    assert shell_mod.rewind_speed(30) == 2
+    assert shell_mod.rewind_speed(60) == 4
+    assert shell_mod.rewind_speed(10_000) == shell_mod.REWIND_MAX_SPEED
+
+
+def test_the_ramp_crosses_a_thirty_second_buffer_in_a_few_seconds():
+    """The point of the ramp, stated as the number it has to hit. A step is about
+    1/60 s, so this is 'how long must the key be held to reach the far end'."""
+    import ngpc_shell as shell_mod
+
+    frames, steps = 30 * 60, 0
+    while frames > 0 and steps < 10_000:
+        frames -= shell_mod.rewind_speed(steps)
+        steps += 1
+    assert steps / 60.0 < 5.0, f"{steps / 60.0:.1f} s to cross the buffer"
+
+
+def test_the_first_half_second_of_holding_is_still_frame_accurate():
+    """A tap must land on the frame you meant. An immediate ramp would overshoot
+    every short correction, which is what rewind is mostly used for."""
+    import ngpc_shell as shell_mod
+
+    assert all(shell_mod.rewind_speed(n) == 1 for n in range(30))
+
+
+def test_the_strip_says_when_it_is_running_fast(app):
+    """A picture that suddenly runs eight times faster with nothing on screen to
+    say so reads as a glitch."""
+    import ngpc_shell as shell_mod
+
+    bar = shell_mod._RewindBar()
+    try:
+        bar.set_range(600, 300, speed=1)
+        assert "×" not in bar._label()
+        bar.set_range(600, 300, speed=8)
+        assert "×8" in bar._label()
+    finally:
+        bar.deleteLater()
+
+
+def test_the_strip_is_reachable_while_paused_not_only_while_rewinding():
+    """⛔ THE BUG IN THE FIRST VERSION. The strip appeared only while rewinding —
+    so to see it you had to hold the key, and while holding the key you cannot
+    drag it. A scrubber you can never grab is a decoration."""
+    import inspect
+
+    from ngpc_shell import PlayPage
+
+    src = inspect.getsource(PlayPage._tick)
+    paused = src.index("if self.paused:")
+    shown = src.index("self._show_rewind_bar()", paused)
+    # The show must be INSIDE the paused branch, before it returns.
+    assert 0 < shown - paused < 600
+    assert "return" in src[shown:shown + 200]
+
+
+# --------------------------------------------------------------------------
+# Lifecycle: what the debug window must let go of when the game changes.
+# --------------------------------------------------------------------------
+def test_swapping_games_re_arms_coverage_so_the_tick_box_never_lies(app):
+    """A new game is a NEW CORE, and a new core starts with coverage off. The tick
+    box survives the swap, so without re-arming it claims to be recording over a
+    core that is not."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        first = _FakeCovMem(armed=False)
+        dbg.attach(_FakeCovPlay(first))
+        dbg._cov_on.setChecked(True)
+        assert first.calls[-1] is True
+
+        second = _FakeCovMem(armed=False)
+        dbg.attach(_FakeCovPlay(second))
+        assert second.calls and second.calls[-1] is True, \
+            "the new core was never told, so the box was lying"
+    finally:
+        dbg.close()
+
+
+def test_the_console_lets_go_of_a_machine_that_is_being_torn_down(app):
+    """Its namespace holds `m`. A namespace nobody has looked at in ten minutes was
+    keeping a dead core — and the DLL behind it — alive until its tab happened to
+    refresh."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        mem = _FakeCartMem({0x200000: 1})
+        dbg.attach(_FakeRegPlay(mem))
+        dbg._tabs.setCurrentIndex(_tab_index(dbg, "Console"))
+        dbg.refresh()
+        assert dbg._con.namespace["m"] is mem
+
+        dbg.attach(None)
+        assert dbg._con.namespace["m"] is None, "released at detach, not eventually"
+    finally:
+        dbg.close()
+
+
+def test_closing_the_window_leaves_no_sampler_running_in_the_game_loop(app):
+    """A debug tool that keeps sampling after its window is gone is a permanent
+    tax on a game nobody is debugging any more."""
+    import ngpc_debug as dbg_mod
+
+    dbg = dbg_mod.DebugWindow(None, cfg.make_settings())
+    try:
+        play = _FakeRegPlay(_FakeCartMem({}))
+        play.frame_hooks = []
+        play.access_probe = None
+        play.apply_debug = lambda: None
+        dbg.attach(play)
+        dbg._rs_track.setChecked(True)
+        dbg.hideEvent(None)
+        assert play.frame_hooks == []
+    finally:
+        dbg.close()
+
+
+def test_the_strip_does_not_repaint_when_nothing_moved(app):
+    """The paused loop asks it to update on every tick — about 250 times a second
+    for a strip that has not moved."""
+    import ngpc_shell as shell_mod
+
+    bar = shell_mod._RewindBar()
+    try:
+        painted: list = []
+        bar.update = lambda *a: painted.append(1)      # count repaint requests
+        bar.set_range(300, 200)
+        assert len(painted) == 1
+        for _ in range(50):
+            bar.set_range(300, 200)
+        assert len(painted) == 1, "same numbers, no repaint"
+        bar.set_range(300, 199)
+        assert len(painted) == 2, "it moved, so it repaints"
+    finally:
+        bar.deleteLater()
+
+
+def test_holding_rewind_at_the_end_of_the_buffer_stops_doing_work(app):
+    """With one frame left there is nothing to pop, and re-applying that same state
+    (plus draining audio, plus repainting) sixty times a second is pure waste.
+
+    This drives the REAL `_tick`, not a copy of its body: a test that re-implements
+    the loop it is checking passes forever after the loop changes."""
+    from collections import deque
+
+    import ngpc_shell as shell_mod
+
+    class _Page(QWidget):
+        def __init__(self, frames):
+            super().__init__()
+            self.resize(640, 480)
+            self.machine = object()
+            self._rewind = deque(bytes([i]) for i in range(frames))
+            self._rw_pos = None
+            self._rewinding = True
+            self._rw_accum = 3          # the next tick crosses the 4-tick gate
+            self._rw_hold = 0
+            self.paused = False
+            self.applied: list = []
+            self.drains = 0
+            self.blits = 0
+            self.rewind_bar = shell_mod._RewindBar()
+            self._rw_bar_timer = None
+            self.lcd = QWidget(self); self.lcd.resize(600, 400)
+            for name in ("_tick", "_show_rewind_bar", "_place_rewind_bar"):
+                setattr(self, name, getattr(shell_mod.PlayPage, name).__get__(self))
+
+        def _poll_pad(self): pass
+        def _apply_state(self, body, aux=True): self.applied.append(body)
+        def _drain_audio_silently(self): self.drains += 1
+        def _blit(self): self.blits += 1
+
+    # With history, one tick rewinds one frame.
+    page = _Page(frames=5)
+    page._tick()
+    assert page.applied == [bytes([3])] and page.drains == 1
+
+    # At the end of the history, the same tick does nothing at all.
+    spent = _Page(frames=1)
+    for _ in range(8):
+        spent._rw_accum = 3
+        spent._tick()
+    assert spent.applied == [] and spent.drains == 0
+
+
+def test_the_strip_floats_over_the_picture_instead_of_shrinking_it(app):
+    """⛔ THE SECOND BUG FROM REAL USE. In the layout it TOOK SPACE, so the image
+    shrank the moment you touched rewind and grew back when you let go. A picture
+    that jumps about is worse than the information is worth."""
+    import ngpc_shell as shell_mod
+
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.show()
+        app.processEvents()
+        before = (page.lcd.width(), page.lcd.height())
+        page._show_rewind_bar()
+        app.processEvents()
+        assert page.rewind_bar.isVisible()
+        assert (page.lcd.width(), page.lcd.height()) == before, \
+            "showing the strip must not resize the canvas"
+        # ...and it really is on top of it, not beside it.
+        assert page.rewind_bar.parent() is page
+        assert page.rewind_bar.y() + page.rewind_bar.height() <= page.height()
+    finally:
+        page.close()
+
+
+def test_the_strip_stays_up_after_the_key_is_released(app):
+    """⛔ THE FIRST BUG FROM REAL USE. It vanished the instant the key came up — so
+    the only moment it existed was the moment your hand was busy holding a key, and
+    the draggable cursor could never be grabbed. Two ways to use rewind means each
+    has to be reachable from the other."""
+    import ngpc_shell as shell_mod
+
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.show()
+        app.processEvents()
+        page._rewinding = True
+        page._show_rewind_bar()
+        assert page.rewind_bar.isVisibleTo(page)
+
+        page._linger_rewind_bar()          # what releasing the key does
+        page._rewinding = False
+        assert page.rewind_bar.isVisibleTo(page), "still grabbable"
+        assert page._rw_bar_timer is not None and page._rw_bar_timer.isActive()
+        assert page._rw_bar_timer.parent() is page, (
+            "a timer that belongs to nobody outlives the page and fires into a "
+            "torn-down widget -- which kills the process with no traceback")
+
+        page._hide_rewind_bar()            # what the timer does when it expires
+        assert not page.rewind_bar.isVisibleTo(page)
+    finally:
+        page.close()
+
+
+def test_grabbing_the_strip_stops_it_disappearing_under_the_cursor(app):
+    import ngpc_shell as shell_mod
+
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.show()
+        app.processEvents()
+        page._show_rewind_bar()
+        page._linger_rewind_bar()
+        assert page._rw_bar_timer.isActive()
+        page._hold_rewind_bar()
+        assert not page._rw_bar_timer.isActive()
+    finally:
+        page.close()
+
+
+def test_the_linger_gives_way_to_the_strip_being_in_use(app):
+    """The timer can fire while you are already scrubbing again. It must lose."""
+    page = _FakeRewindPage(frames=100)
+    try:
+        page._show_rewind_bar()
+        page._rw_pos = 5
+        page._hide_rewind_bar()
+        assert page.rewind_bar.isVisibleTo(page), "still scrubbing: the timer lost"
+        page._rw_pos = None
+        page._rewinding = True
+        page._hide_rewind_bar()
+        assert page.rewind_bar.isVisibleTo(page), "still rewinding: same"
+    finally:
+        page.close()
+
+
+def _drag(app, bar, *positions):
+    """Press, move, release on the strip -- the gesture, through real Qt events."""
+    from PyQt6.QtCore import QEvent, QPointF, Qt as _Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    types = ([QEvent.Type.MouseButtonPress]
+             + [QEvent.Type.MouseMove] * (len(positions) - 2)
+             + [QEvent.Type.MouseButtonRelease])
+    for typ, x in zip(types, positions):
+        app.sendEvent(bar, QMouseEvent(typ, QPointF(x, bar.height() / 2),
+                                       _Qt.MouseButton.LeftButton,
+                                       _Qt.MouseButton.LeftButton,
+                                       _Qt.KeyboardModifier.NoModifier))
+        app.processEvents()
+
+
+def test_letting_go_of_the_strip_carries_on_playing(app):
+    """⛔ THE TRAP THIS CLOSES. Dragging has to pause — otherwise the game runs out
+    from under the position you are choosing — but leaving it paused STRANDS you:
+    this toolbar has no play button. `⏭` steps one frame (and pauses again) and `⏩`
+    does nothing at all while paused, because the loop returns before it."""
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.show()
+        app.processEvents()
+        page._show_rewind_bar()
+        page.paused = False
+
+        bar = page.rewind_bar
+        _drag(app, bar, bar.width() * 0.6, bar.width() * 0.4, bar.width() * 0.3)
+        assert page._rw_pos is not None, "it scrubbed"
+        assert not page.paused, "and it carries on playing when you let go"
+    finally:
+        page.close()
+
+
+def test_a_game_that_was_already_paused_stays_paused(app):
+    """Then pausing is the thing you asked for, and a drag must not undo it."""
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.show()
+        app.processEvents()
+        page._show_rewind_bar()
+        page.paused = True
+
+        bar = page.rewind_bar
+        _drag(app, bar, bar.width() * 0.6, bar.width() * 0.3)
+        assert page.paused
+    finally:
+        page.close()
+
+
+def test_the_was_it_running_question_is_asked_before_scrubbing_pauses(app):
+    """⚠️ The bug inside the fix. Asking it from `_scrub_to` reads the pause that
+    scrubbing itself just set, so the answer is always 'it was paused' and the game
+    never resumes — the exact trap the change exists to close, reintroduced."""
+    page = _FakeRewindPage(frames=100)
+    try:
+        page.paused = False
+        page._begin_scrub()
+        assert page._rw_resume_after_drag is True
+        page._scrub_to(10)               # this pauses...
+        assert page.paused
+        assert page._rw_resume_after_drag is True, \
+            "...and must not have overwritten the answer"
+        page._end_scrub()
+        assert not page.paused
+    finally:
+        page.close()

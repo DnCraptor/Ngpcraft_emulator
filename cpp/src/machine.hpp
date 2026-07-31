@@ -734,6 +734,12 @@ struct Machine {
     std::deque<uint8_t> serial_tx;
     std::deque<uint8_t> serial_rx;
     bool     serial_tx_busy = false;
+    /* ...and whether that byte has actually STARTED going out. CTS0 gates the START
+     * of a byte only: once the shift register is loaded the byte always completes,
+     * however the peer waves its RTS about (datasheet fig 3.11(16) Note 1). Without
+     * this a mid-byte CTS pulse froze a transmission hardware would have finished --
+     * see serial_tick in memory.cpp for the game that proved it. */
+    bool     serial_tx_shifting = false;
     uint8_t  serial_tx_byte = 0;
     int32_t  serial_tx_cycles = 0;
     /* CTS0 handshake input (TMP95C061 datasheet 3.11): when SC0MOD<CTSE> (bit6) is

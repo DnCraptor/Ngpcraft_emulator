@@ -139,6 +139,67 @@ def test_link_cable_bidirectional_hardware_path():
 
 
 @requires_rom
+def test_cts_going_high_mid_byte_does_not_swallow_that_byte():
+    """⚡ CTS0 gates the START of a byte. It cannot pause one already going out.
+
+    TMP95C061 datasheet 3.11: "when the CTS0 pin goes high, AFTER COMPLETION OF THE
+    CURRENT DATA SEND, data send is halted", and Note 1 of fig 3.11(16) again: "if
+    the CTS signal rises during transmission, the NEXT data is not sent after the
+    completion of the current transmission". A shift register that has begun cannot
+    be stopped.
+
+    The core used to re-test CTS every tick and freeze the in-flight byte's
+    countdown, so a peer pulsing its RTS high for a fraction of a frame stalled a
+    byte hardware would have finished -- measured at 6001 held ticks inside one frame
+    of a Card Fighters' Clash VS exchange, dragging a 26-byte packet across three
+    frames instead of two.
+
+    So: start a byte, raise CTS while it is on the wire, and it must still arrive.
+    The byte AFTER it is the one that waits.
+    """
+    from core.native_session import NativeSession
+
+    # The probe ROM's own traffic is the source of bytes: a host poke of SC0BUF is
+    # storage, not the CPU action that loads the shift register.
+    s = NativeSession(ROM, bios_path=BIOS, autosave=False)
+    m = s.machine
+    m.serial_set_enabled(True)
+    m.serial_set_cts(False)                 # peer ready
+    m.write(0x00B0, bytes([0x11]))          # something for the probe to send
+    for _ in range(90):                     # let it boot and start talking
+        m.run_frames(1)
+        m.serial_read_tx()
+    assert m.serial_state().ctse == 1, "COMINIT should have enabled the handshake"
+
+    # Catch a byte in mid-flight...
+    for _ in range(20000):
+        m.run(20, record=False)
+        if m.serial_state().tx_busy == 1:
+            break
+    assert m.serial_state().tx_busy == 1, "the probe never put a byte on the wire"
+
+    # ...raise CTS on it, and it must still land. A byte-time is 3200 cycles, so
+    # ~1200 instructions is comfortably more than one.
+    sent = m.serial_state().wire_count
+    m.serial_set_cts(True)
+    m.run(1200, record=False)
+    assert m.serial_state().wire_count == sent + 1, (
+        "a byte already shifting must complete -- CTS gates the NEXT one")
+
+    # CONTROL: with CTS still high, the wire now goes quiet. Without this the test
+    # would pass just as well against a core with no handshake at all.
+    sent = m.serial_state().wire_count
+    for _ in range(4):
+        m.run_frames(1)
+    assert m.serial_state().wire_count == sent, "CTS high must hold bytes not yet started"
+
+    m.serial_set_cts(False)
+    for _ in range(4):
+        m.run_frames(1)
+    assert m.serial_state().wire_count > sent, "...and release them once the peer is ready"
+
+
+@requires_rom
 def test_tcp_link_relays_over_socket():
     """The online path: two consoles wired by core.link.TcpLink over a real socket
     pair each receive the other's transmitted controller byte."""

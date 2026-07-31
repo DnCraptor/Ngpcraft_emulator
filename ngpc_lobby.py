@@ -136,7 +136,10 @@ class HostInfoDialog(QDialog):
 
 
 class LobbyDialog(QDialog):
-    linked = pyqtSignal(object)        # the connected LobbyClient, once paired
+    # The client, plus the room's `joined` record -- which carries WHICH LINK the
+    # room is for (cable or mirror) and, for a mirror, the host's input delay. The
+    # relay is the same pipe either way; only the meaning of the bytes differs.
+    linked = pyqtSignal(object, dict)  # the connected LobbyClient, once paired
 
     def __init__(self, settings, game_name: str, parent=None):
         super().__init__(parent)
@@ -251,8 +254,10 @@ class LobbyDialog(QDialog):
         self._list.clear()
         for g in games:
             lock = " 🔒" if g.get("private") else ""
+            # A room made by an older client advertises no mode, and that means cable.
+            badge = "🪞" if g.get("mode") == "mirror" else "🔗"
             item = QListWidgetItem(
-                f"{g.get('name','?')}{lock}   —   {g.get('game','?')}   "
+                f"{badge} {g.get('name','?')}{lock}   —   {g.get('game','?')}   "
                 f"(by {g.get('creator','?')})")
             item.setData(Qt.ItemDataRole.UserRole, g)
             self._list.addItem(item)
@@ -265,7 +270,7 @@ class LobbyDialog(QDialog):
 
     def _on_joined(self, info: dict) -> None:
         # paired: hand the live client to the shell and close
-        self.linked.emit(self._client)
+        self.linked.emit(self._client, dict(info))
         self._client = None          # ownership moves to the shell
         self.accept()
 
@@ -290,8 +295,15 @@ class LobbyDialog(QDialog):
                 QLineEdit.EchoMode.Password)
             if not ok:
                 return
+        # WHICH LINK this room is for. Kept as a question rather than a setting: it
+        # is a property of the game being hosted, not of the player.
+        mirror = QMessageBox.question(
+            self, self._t("lobby_mode_title"),
+            self._t("lobby_mode_ask")) == QMessageBox.StandardButton.Yes
         self._client.create(name.strip(), self._game_name,
-                            public=not private, password=password)
+                            public=not private, password=password,
+                            mode="mirror" if mirror else "cable",
+                            delay=cfg.mirror_delay(self._settings))
 
     def _join(self) -> None:
         if self._client is None:
