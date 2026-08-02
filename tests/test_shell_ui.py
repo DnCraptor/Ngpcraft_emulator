@@ -902,16 +902,27 @@ def test_the_library_bars_wrap_instead_of_running_off_the_page(app):
     controls. In a QHBoxLayout that is a hard minimum width: a 1366x768 laptop (less
     the nav, less 125% scaling) pushed "Open ROM", the search box and the sort controls
     off the right edge, with no scrollbar to reach them. Wrapped, they stay reachable --
-    the page's minimum width is now its widest single control, not their sum."""
+    the page's minimum width is now its widest single control, not their sum.
+
+    Every number here is DERIVED from the controls' own hints, never written down: a
+    literal like "under 500px" is a bet on the font, and the CI runners do not have
+    ours (see test_the_settings_panels_scroll)."""
     w = shell.Shell()
     try:
         w.show()
         page = w.library
-        assert page.minimumSizeHint().width() < 500, \
-            f"library still demands {page.minimumSizeHint().width()}px of width"
+        bar = [page._bios_btn, page._folder_btn, page._regen_btn, page._open_btn,
+               page._search, page._filterbox, page._sortbox, page._revbtn]
+        widest = max(b.sizeHint().width() for b in bar)
+        in_a_row = sum(b.sizeHint().width() for b in bar)      # the QHBoxLayout floor
+        assert page.minimumSizeHint().width() < in_a_row // 2, (
+            f"library demands {page.minimumSizeHint().width()}px where its widest single "
+            f"control is {widest}px -- the bars are still one unbreakable row")
 
-        # Every control lands inside the page once it has been laid out narrow.
-        page.resize(520, 700)
+        # Every control lands inside the page once it has been laid out narrow. Narrow
+        # is "a bit more than the widest control", so the layout always has a legal
+        # answer -- nothing can wrap its way out of a control wider than the page.
+        page.resize(widest + 80, 700)
         QApplication.processEvents()
         for name, wid in (("open", page._open_btn), ("search", page._search),
                           ("sort", page._sortbox), ("reverse", page._revbtn)):
@@ -924,7 +935,16 @@ def test_the_library_bars_wrap_instead_of_running_off_the_page(app):
 def test_the_settings_panels_scroll(app):
     """The tallest settings panel wants ~1000px. A 1366x768 laptop has ~614px of usable
     height at 125% scaling, and a page with no scroll area simply has no way to reach
-    the rows past the fold."""
+    the rows past the fold.
+
+    ⛔ WHAT THIS TEST MUST NOT DO. Its first version asserted that a 700x420 window
+    scrolls in BOTH directions -- true on Windows, false on the macOS runner, whose
+    narrower font let a settings row fit the viewport. That is a font measurement
+    dressed up as a feature: it failed CI while nothing was broken. So the window is
+    squeezed to the smallest the shell allows, and the premise (widget bigger than
+    viewport) is ASSERTED before the conclusion -- on any font, at that size, the
+    panels overflow, and if a platform ever proves otherwise the failure says which
+    premise died instead of blaming the scroll area."""
     from PyQt6.QtWidgets import QScrollArea
 
     w = shell.Shell()
@@ -932,15 +952,22 @@ def test_the_settings_panels_scroll(app):
         area = w.settings._panel_scroll
         assert isinstance(area, QScrollArea) and area.widgetResizable()
         assert area.widget() is w.settings._stack, "the panels are what scrolls"
-        w.show(); w.resize(700, 420); QApplication.processEvents()
+        w.show()
+        w.resize(w.minimumWidth(), w.minimumHeight())     # 360x320, the shell's floor
+        w._go(1)
         w.settings.show_category("controls")
         QApplication.processEvents()
-        assert area.widget().height() > area.viewport().height(), \
-            "premise: this panel is taller than the room it has (else nothing is proved)"
-        assert area.verticalScrollBar().maximum() > 0, \
-            "...so every row past the fold must be reachable by scrolling"
-        # Narrow as well as short: the rows are ~660px wide and this viewport is not.
-        assert area.horizontalScrollBar().maximum() > 0
+
+        for axis, bar, widget_px, viewport_px in (
+                ("vertically", area.verticalScrollBar(),
+                 area.widget().height(), area.viewport().height()),
+                ("horizontally", area.horizontalScrollBar(),
+                 area.widget().width(), area.viewport().width())):
+            assert widget_px > viewport_px, (
+                f"premise: the panel must be bigger {axis} than the {viewport_px}px it "
+                f"has (it is {widget_px}px) -- else this proves nothing")
+            assert bar.maximum() > 0, \
+                f"a panel bigger {axis} than its viewport must scroll {axis}"
     finally:
         w.close()
 
