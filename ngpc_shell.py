@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QComboBox, QCheckBox, QSlider, QSpinBox, QLineEdit,
     QFileDialog, QSizePolicy, QFrame, QMessageBox, QMenu, QDialog,
     QPlainTextEdit, QDialogButtonBox, QInputDialog, QRadioButton, QButtonGroup,
+    QLayout, QSpacerItem,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -101,6 +102,11 @@ BIOS_INTRO_FRAMES = 400
 RAIL_MIN_W, RAIL_MAX_W, RAIL_COLLAPSED_W = 190, 320, 44
 RAIL_TEXT_PAD = 2 * 16 + 2 * 8 + 10   # QPushButton#rail padding + rail margins + slack
 RAIL_INDENT = "   "                   # the nav entries' hanging indent, on every line
+# Below this window width the rail folds itself to the thin strip: on a 1366x768
+# laptop (and worse at 125% scaling) 254 px of nav is a quarter of the page. It is
+# AUTOMATIC and reversible -- widening the window brings it back -- and it never
+# overwrites the user's own collapse preference, see `Shell._auto_rail`.
+RAIL_AUTO_COLLAPSE_W = 760
 DEFAULT_ROM_DIR = REPO / "roms"          # drop your .ngc/.ngp files here (or pick a folder)
 DEFAULT_BIOS = REPO / "bios.bin"         # optional: a real NGPC BIOS enables "Boot BIOS"
 HLE_BIOS = REPO / "hle_bios" / "bios_hle.bin"  # clean-room fallback: runs games with no bios.bin
@@ -111,6 +117,138 @@ DEFAULT_BIOS_MONO = [REPO / n for n in
 THUMB_DIR = REPO / "thumbnails"          # auto-rendered covers -- a CACHE, prunable
 COVER_DIR = REPO / "covers"              # covers the USER chose -- only ever READ
 LIBRARY_DB = REPO / "library.json"       # play counts / last played / favourites
+
+
+# ---------------------------------------------------------------------------
+# Fitting the window to the screen it is actually on
+#
+# ⛔ THE BUG THIS FIXES. "sur mon lenovo x240 je ne vois pas le menu a gauche,
+# l'emulateur se met full screen sans moyen de le fermer autrement que alt f4"
+# -- user report 2026-08-02. A window row saved on a big screen (or a settings
+# file carried over with the portable build) comes back VERBATIM: Qt's
+# `restoreGeometry` only rescues a window that is ENTIRELY off-screen, so one
+# that is merely BIGGER than the laptop's panel is restored oversized, with its
+# right and bottom edges past the desktop.
+# ---------------------------------------------------------------------------
+def clamp_geometry(frame: QRect, avail: QRect) -> QRect:
+    """The largest part of `frame` that fits inside `avail`, kept where it was.
+
+    Pure so the rule is testable without a second monitor: shrink first (a window
+    taller than the screen is the case that hides the title bar), then slide back
+    inside. Never grows a window that already fits."""
+    w = min(frame.width(), avail.width())
+    h = min(frame.height(), avail.height())
+    x = min(max(frame.x(), avail.x()), avail.x() + avail.width() - w)
+    y = min(max(frame.y(), avail.y()), avail.y() + avail.height() - h)
+    return QRect(x, y, w, h)
+
+
+class _Stretch(QSpacerItem):
+    """Marker: a FlowLayout gap that eats the leftover width of ITS row."""
+
+
+class FlowLayout(QLayout):
+    """A horizontal row that WRAPS onto another line instead of overflowing.
+
+    A `QHBoxLayout` has a minimum width equal to the sum of its children, and a
+    window narrower than that does not shrink it -- it clips it, silently pushing
+    the rightmost controls off the page. That is why the library's buttons and its
+    search/sort row disappeared on a 1366x768 laptop.
+
+    `addStretch()` is honoured per ROW, so as long as everything fits on one line
+    the layout is pixel-identical to the QHBoxLayout it replaces (title left,
+    buttons right); narrower, the row simply becomes two."""
+
+    def __init__(self, parent=None, hspace: int = 6, vspace: int = 6) -> None:
+        super().__init__(parent)
+        self._items: list = []
+        self._h, self._v = hspace, vspace
+        self.setContentsMargins(0, 0, 0, 0)
+
+    # -- QLayout plumbing
+    def addItem(self, item) -> None:      # noqa: N802  (Qt name)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i: int):             # noqa: N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int):             # noqa: N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):        # noqa: N802
+        return Qt.Orientation(0)
+
+    def addStretch(self) -> None:         # noqa: N802
+        self.addItem(_Stretch(0, 0, QSizePolicy.Policy.Minimum,
+                              QSizePolicy.Policy.Minimum))
+
+    def addSpacing(self, px: int) -> None:  # noqa: N802
+        self.addItem(QSpacerItem(px, 0, QSizePolicy.Policy.Fixed,
+                                 QSizePolicy.Policy.Minimum))
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:   # noqa: N802
+        return self._lay(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:    # noqa: N802
+        super().setGeometry(rect)
+        self._lay(rect, apply=True)
+
+    def minimumSize(self) -> QSize:       # noqa: N802
+        # The WIDEST single item, not their sum: everything else can wrap under it.
+        size = QSize(0, 0)
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def sizeHint(self) -> QSize:          # noqa: N802
+        return self.minimumSize()
+
+    def _lay(self, rect: QRect, apply: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        rows: list[list] = []
+        cur: list = []
+        used = 0
+        for it in self._items:
+            w = it.sizeHint().width()
+            need = w + (self._h if cur else 0)
+            if cur and used + need > eff.width():
+                rows.append(cur)
+                cur, used, need = [], 0, w
+            cur.append(it)
+            used += need
+        if cur:
+            rows.append(cur)
+
+        y = eff.y()
+        stretched = False        # a row at/after the stretch keeps hugging the right
+        for row in rows:
+            row_w = sum(it.sizeHint().width() for it in row) + self._h * (len(row) - 1)
+            row_h = max((it.sizeHint().height() for it in row), default=0)
+            stretches = [it for it in row if isinstance(it, _Stretch)]
+            leftover = max(0, eff.width() - row_w)
+            share = leftover // len(stretches) if stretches else 0
+            # What wraps out of a right-aligned group stays right-aligned: the buttons
+            # that were flush right on one line must not jump to the left on two.
+            x = eff.x() + (leftover if stretched and not stretches else 0)
+            stretched = stretched or bool(stretches)
+            for it in row:
+                hint = it.sizeHint()
+                w = hint.width() + (share if isinstance(it, _Stretch) else 0)
+                if apply:
+                    it.setGeometry(QRect(x, y + (row_h - hint.height()) // 2,
+                                         w, hint.height()))
+                x += w + self._h
+            y += row_h + self._v
+        height = (y - self._v - eff.y()) if rows else 0
+        return height + m.top() + m.bottom()
 
 
 def _resolve_bios(configured: str) -> "Path | None":
@@ -857,7 +995,10 @@ class LibraryPage(QWidget):
         root.setContentsMargins(28, 22, 28, 16)
         root.setSpacing(14)
 
-        header = QHBoxLayout()
+        # Both bars WRAP (FlowLayout) instead of overflowing: on a small laptop a
+        # QHBoxLayout pushed "Ouvrir une ROM", the search box and the sort controls
+        # clean off the right edge, with no scrollbar to reach them.
+        header = FlowLayout(hspace=6, vspace=6)
         self._title = QLabel()
         self._title.setObjectName("pageTitle")
         header.addWidget(self._title)
@@ -881,8 +1022,7 @@ class LibraryPage(QWidget):
         root.addLayout(header)
 
         # view controls: mode (grid/list/compact) + cover size
-        controls = QHBoxLayout()
-        controls.setSpacing(8)
+        controls = FlowLayout(hspace=8, vspace=6)
         self._view_btns: dict[str, QPushButton] = {}
         for mode in (cfg.VIEW_GRID, cfg.VIEW_LIST, cfg.VIEW_COMPACT):
             b = QPushButton(); b.setObjectName("ghost"); b.setCheckable(True)
@@ -1447,7 +1587,16 @@ class SettingsPage(QWidget):
         self._stack.addWidget(self._audio_panel())
         self._stack.addWidget(self._controls_panel())
         self._stack.addWidget(self._hotkeys_panel())
-        root.addWidget(self._stack, 1)
+        # SCROLLED, both ways. The tallest panel wants ~1000 px and the widest ~660;
+        # a 1366x768 laptop (614 px of usable height at 125% scaling) has neither, and
+        # without a scroll area the rows past the fold are simply unreachable -- there
+        # is no way to click a button you cannot bring on screen.
+        self._panel_scroll = QScrollArea()
+        self._panel_scroll.setObjectName("page")
+        self._panel_scroll.setWidgetResizable(True)
+        self._panel_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._panel_scroll.setWidget(self._stack)
+        root.addWidget(self._panel_scroll, 1)
 
         self._cats.setCurrentRow(0)
         self.retranslate()
@@ -3424,6 +3573,12 @@ class PlayPage(QWidget):
         dw = max(0, win.width() - self.lcd.width())     # window - canvas = chrome/margins
         dh = max(0, win.height() - self.lcd.height())
         win.resize(SCREEN_W * k + dw, SCREEN_H * k + dh)
+        # A preset bigger than the screen is a window whose title bar you cannot reach.
+        # Ask for it anyway (above) so the canvas is as large as it can be, then let the
+        # window fold back onto the panel it is on.
+        fit = getattr(win, "fit_to_screen", None)
+        if callable(fit):
+            fit()
         if self.machine is not None:
             self._blit()
             self._reblit_soon()   # the resize lays out next turn -- fit to the real box then
@@ -5275,6 +5430,14 @@ class Shell(QMainWindow):
             self.restoreGeometry(geo)
         else:
             self.resize(980, 660)
+        # ⛔ NEVER come back FULLSCREEN. `saveGeometry` records the fullscreen bit, so
+        # quitting from a fullscreen game used to reopen the whole shell fullscreen --
+        # on the LIBRARY page, where nothing handled Escape and the sidebar was hidden
+        # with it: no menu, no title bar, no way out but Alt+F4 (user report, 2026-08-02).
+        # The game's own `gfx/fullscreen` preference is untouched and still applies when
+        # a cartridge starts, which is the only place fullscreen has an exit.
+        if self.isFullScreen():
+            self.showNormal()
         self._apply_theme()
 
         central = QWidget(); central.setObjectName("page")
@@ -5380,12 +5543,78 @@ class Shell(QMainWindow):
                 lbl.setWordWrap(True)
         self.setMinimumSize(360, 320)
         self._go(0)
+        self._auto_collapsed = False
         self._toggle_rail(not bool(self._settings.value("win/rail_collapsed", False, type=bool)))
+        self.fit_to_screen()
+        self._auto_rail()
         if rom:
             self._launch(rom)
 
+    # ---- adapting to the screen we are actually on -----------------------
+    def fit_to_screen(self) -> None:
+        """Shrink/slide the window back inside the current screen's work area.
+
+        Idempotent, and a no-op for a window that already fits -- so it can run on
+        every show without ever fighting a size the user chose."""
+        if self.isFullScreen() or self.isMaximized():
+            return
+        scr = self.screen() or QApplication.primaryScreen()
+        if scr is None:
+            return
+        frame = self.frameGeometry()
+        fitted = clamp_geometry(frame, scr.availableGeometry())
+        if fitted == frame:
+            return
+        # The frame is what must fit (title bar + borders), the client area is what we
+        # can resize -- before the window is shown the two are the same, after it they
+        # differ by the decorations, so measure the difference instead of guessing it.
+        inner = self.geometry()
+        dw = frame.width() - inner.width()
+        dh = frame.height() - inner.height()
+        self.resize(max(self.minimumWidth(), fitted.width() - dw),
+                    max(self.minimumHeight(), fitted.height() - dh))
+        self.move(fitted.x() + (inner.x() - frame.x()),
+                  fitted.y() + (inner.y() - frame.y()))
+
+    def _auto_rail(self) -> None:
+        """Fold the rail on a narrow window, unfold it when there is room again.
+
+        Only ever undoes ITSELF: the saved `win/rail_collapsed` preference is neither
+        read as permission nor overwritten here, so a user who collapsed the rail on
+        purpose keeps it collapsed after a resize."""
+        if not hasattr(self, "_rail"):
+            return
+        narrow = self.width() < RAIL_AUTO_COLLAPSE_W
+        expanded = self._rail.width() >= 100
+        if narrow and expanded:
+            self._auto_collapsed = True
+            self._toggle_rail(False, remember=False)
+        elif not narrow and self._auto_collapsed:
+            self._auto_collapsed = False
+            if not bool(self._settings.value("win/rail_collapsed", False, type=bool)):
+                self._toggle_rail(True, remember=False)
+
+    def resizeEvent(self, e) -> None:  # type: ignore[override]
+        super().resizeEvent(e)
+        self._auto_rail()
+
+    def keyPressEvent(self, e: QKeyEvent) -> None:  # noqa: N802
+        # The last-resort way out of fullscreen. The game view has its own Escape
+        # handler; everywhere ELSE nothing did, which is what turned a fullscreen
+        # library into an Alt+F4 trap. F11 works from any page for the same reason.
+        if self.isFullScreen() and (e.key() == int(Qt.Key.Key_F11)
+                                    or (e.key() == int(Qt.Key.Key_Escape)
+                                        and self._stack.currentWidget() is not self.play)):
+            self._settings.setValue("gfx/fullscreen", False)
+            self.showNormal()
+            self.fit_to_screen()
+            return
+        super().keyPressEvent(e)
+
     def showEvent(self, e) -> None:  # type: ignore[override]
         super().showEvent(e)
+        # Now that the window has real decorations, re-check it fits the screen.
+        self.fit_to_screen()
         # Say it ONCE, and only when settings really came back. Restoring somebody's
         # preferences behind their back is nearly as confusing as losing them: they
         # would have no idea why the app knows their BIOS path again.
@@ -5456,14 +5685,18 @@ class Shell(QMainWindow):
         if self._rail.width() >= 100:     # a collapsed rail stays collapsed
             self._rail.setFixedWidth(self._rail_w)
 
-    def _toggle_rail(self, show: bool | None = None) -> None:
+    def _toggle_rail(self, show: bool | None = None, remember: bool = True) -> None:
         # Collapse to a thin strip that still holds the toggle (no overlap of content).
+        # `remember=False` is the automatic narrow-window fold: it must not rewrite the
+        # preference, or resizing would silently answer a question only the user asks.
         show = (self._rail.width() < 100) if show is None else show
         self._rail.setFixedWidth(self._rail_w if show else RAIL_COLLAPSED_W)
         for wdg in self._rail_hideable:
             wdg.setVisible(show)
         self._rail_toggle.setText("‹" if show else "☰")
-        self._settings.setValue("win/rail_collapsed", not show)
+        if remember:
+            self._auto_collapsed = False    # an explicit choice outranks the auto-fold
+            self._settings.setValue("win/rail_collapsed", not show)
 
     def _apply_theme(self) -> None:
         """Resolve the chosen theme and hand it to every painter.
@@ -5525,6 +5758,10 @@ class Shell(QMainWindow):
         self._nav_lib.setChecked(idx == 0)
         self._nav_set.setChecked(idx == 1)
         self.settings.set_resume_visible(playing and idx == 1)
+        # Every route between pages passes here (the rail, a launch, a failed launch,
+        # the in-game options), and the page is one of the inputs to "is the nav hidden
+        # for the game?" -- so re-decide it in the one place they all reach.
+        self._sync_fullscreen_chrome()
 
     def _go(self, idx: int) -> None:
         # Leaving the game for a menu SUSPENDS it (paused, still loaded) so the
@@ -6113,7 +6350,12 @@ class Shell(QMainWindow):
         # before the rail and the play page exist -- ignore it until the UI is built.
         if not hasattr(self, "_rail") or not hasattr(self, "play"):
             return
-        hide = self.isFullScreen() and cfg.fs_hide_ui(self._settings)
+        # ...and only over the GAME. Hiding the nav on the library or the settings page
+        # leaves a fullscreen window with no menu and no title bar -- the "je ne vois pas
+        # le menu a gauche" half of the 2026-08-02 report. There is nothing to give the
+        # screen to on those pages anyway.
+        playing = self._stack.currentWidget() is self.play
+        hide = self.isFullScreen() and cfg.fs_hide_ui(self._settings) and playing
         self._rail.setVisible(not hide)
         # On the EDGE into hidden-chrome fullscreen, start the toolbar hidden (a mouse move
         # reveals it, like a media player); on the way back out, show it again. Edge-only,

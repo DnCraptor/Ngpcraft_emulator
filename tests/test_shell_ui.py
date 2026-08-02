@@ -130,6 +130,11 @@ def test_the_rail_fits_every_language_it_ships(app):
     w = shell.Shell()
     try:
         w.show()
+        # Wide on purpose: below RAIL_AUTO_COLLAPSE_W the rail folds itself, and the
+        # offscreen QPA's screen size (which decides how big `fit_to_screen` leaves the
+        # window) is not the same on every platform. This test is about the MEASURED
+        # width, so put it in the state where a width is measured.
+        w.resize(shell.RAIL_AUTO_COLLAPSE_W + 200, 700)
         s = cfg.make_settings()
         assert set(cfg.STRINGS) >= {"en", "fr"}, "at least the two original languages"
         for lang in sorted(cfg.STRINGS):
@@ -730,11 +735,16 @@ def test_fullscreen_hides_and_restores_sidebar_and_toolbar(app, monkeypatch):
     saved preference, never forced on. Driven by `_sync_fullscreen_chrome`; the window
     state is mocked so no real (and offscreen-crashy) fullscreen transition is needed.
     `isHidden()` is checked rather than `isVisible()` because the test window is not
-    shown, which would make everything report not-visible regardless."""
+    shown, which would make everything report not-visible regardless.
+
+    On the GAME page throughout: hiding the nav is for the game only, and doing it on
+    the library/settings pages is what left a fullscreen window with no menu and no
+    title bar (see test_fullscreen_keeps_the_nav_outside_the_game)."""
     w = shell.Shell()
     try:
         state = {"fs": False}
         monkeypatch.setattr(w, "isFullScreen", lambda: state["fs"])
+        w._go(2)                                       # the game page
         w._settings.setValue("gfx/fs_hide_ui", True)
         w._settings.setValue("gfx/toolbar", True)      # user keeps the toolbar normally
 
@@ -769,6 +779,168 @@ def test_fullscreen_hides_and_restores_sidebar_and_toolbar(app, monkeypatch):
         assert w._rail.isHidden()
         state["fs"] = False; w._sync_fullscreen_chrome()
         assert not w._rail.isHidden() and w.play.toolbar.isHidden(), "toolbar stays as the user left it"
+    finally:
+        w.close()
+
+
+def test_fullscreen_keeps_the_nav_outside_the_game(app, monkeypatch):
+    """⛔ THE TRAP THIS CLOSES. "je ne vois pas le menu a gauche, l'emulateur se met
+    full screen sans moyen de le fermer autrement que alt f4" (2026-08-02).
+
+    A fullscreen window has NO title bar. Hide the nav on top of that and the library
+    page has no menu, no window controls and nothing that answers a key -- the only way
+    out is killing the app. The nav is hidden for the GAME, which has its own Escape;
+    everywhere else it stays, whatever the fullscreen preference says."""
+    w = shell.Shell()
+    try:
+        state = {"fs": True}
+        monkeypatch.setattr(w, "isFullScreen", lambda: state["fs"])
+        w._settings.setValue("gfx/fs_hide_ui", True)
+
+        w._go(0); assert not w._rail.isHidden(), "library: the nav is the only way out"
+        w._go(1); assert not w._rail.isHidden(), "settings: same"
+        w._go(2); assert w._rail.isHidden(), "the game still gets the whole screen"
+        # ...and coming BACK from the game restores it, without leaving fullscreen.
+        w._go(0); assert not w._rail.isHidden()
+    finally:
+        w.close()
+
+
+def test_escape_and_f11_leave_fullscreen_from_any_page(app, monkeypatch):
+    """The other half of the same trap: a key that gets you out. The game view had one,
+    the rest of the shell had none -- so a window restored fullscreen on the library
+    page answered nothing. Escape (off the game page, which owns its own Escape) and
+    F11 (anywhere) both leave, and the preference follows so it does not come back."""
+    from PyQt6.QtGui import QKeyEvent
+    from PyQt6.QtCore import QEvent
+
+    w = shell.Shell()
+    try:
+        state = {"fs": True}
+        calls = []
+        monkeypatch.setattr(w, "isFullScreen", lambda: state["fs"])
+        monkeypatch.setattr(w, "showNormal", lambda: (calls.append("normal"),
+                                                      state.update(fs=False)))
+
+        def press(key):
+            w.keyPressEvent(QKeyEvent(QEvent.Type.KeyPress, key,
+                                      Qt.KeyboardModifier.NoModifier))
+
+        w._go(0)
+        w._settings.setValue("gfx/fullscreen", True)
+        press(int(Qt.Key.Key_Escape))
+        assert calls == ["normal"], "Escape must leave fullscreen on the library page"
+        assert not cfg.fullscreen(w._settings), "and the preference must follow"
+
+        state["fs"] = True; calls.clear()
+        w._go(2)
+        press(int(Qt.Key.Key_Escape))
+        assert calls == [], "on the game page Escape belongs to the player, not here"
+        press(int(Qt.Key.Key_F11))
+        assert calls == ["normal"], "F11 leaves from anywhere"
+    finally:
+        w.close()
+
+
+def test_the_window_never_reopens_bigger_than_the_screen(app):
+    """`clamp_geometry` is the rule the startup/`fit_to_screen` path applies. Qt's own
+    `restoreGeometry` only rescues a window that is ENTIRELY off-screen, so a row saved
+    on a 1920x1080 desktop and reopened on a 1366x768 laptop came back oversized, with
+    its bottom edge (and on a taller save, its title bar) past the panel."""
+    from PyQt6.QtCore import QRect
+
+    laptop = QRect(0, 0, 1366, 728)          # X240, minus the taskbar
+
+    # too big both ways -> shrunk to the work area, not merely moved
+    assert shell.clamp_geometry(QRect(100, 80, 1900, 1000), laptop) == QRect(0, 0, 1366, 728)
+    # fits, but hangs off the right/bottom -> slid back, size untouched
+    assert shell.clamp_geometry(QRect(1200, 700, 400, 300), laptop) == QRect(966, 428, 400, 300)
+    # off the TOP-LEFT (a negative save from a second monitor) -> back on screen
+    assert shell.clamp_geometry(QRect(-500, -400, 400, 300), laptop) == QRect(0, 0, 400, 300)
+    # already inside -> byte-identical, never "helpfully" resized
+    fits = QRect(40, 30, 900, 600)
+    assert shell.clamp_geometry(fits, laptop) == fits
+    # a screen whose origin is not (0,0) -- the second monitor case
+    right = QRect(1366, 0, 1920, 1080)
+    assert shell.clamp_geometry(QRect(1400, 40, 3000, 900), right) == QRect(1366, 40, 1920, 900)
+
+
+def test_a_narrow_window_folds_the_rail_without_rewriting_the_preference(app):
+    """On a small laptop the 254px nav is a quarter of the page, so it folds itself --
+    and unfolds when there is room again. It must not answer FOR the user: the saved
+    `win/rail_collapsed` is the user's own toggle, and an automatic fold that wrote to
+    it would leave the rail collapsed forever once the window had been narrow once."""
+    w = shell.Shell()
+    try:
+        w.show()
+        w.resize(1100, 700)
+        assert w._rail.width() > shell.RAIL_COLLAPSED_W, "wide: the nav is spelled out"
+        assert not cfg.make_settings().value("win/rail_collapsed", False, type=bool)
+
+        w.resize(shell.RAIL_AUTO_COLLAPSE_W - 60, 600)
+        QApplication.processEvents()
+        assert w._rail.width() == shell.RAIL_COLLAPSED_W, "narrow: folded to the strip"
+        assert not cfg.make_settings().value("win/rail_collapsed", False, type=bool), \
+            "the automatic fold is NOT the user's preference"
+
+        w.resize(1100, 700)
+        QApplication.processEvents()
+        assert w._rail.width() > shell.RAIL_COLLAPSED_W, "room again -> unfolded"
+
+        # ...but an explicit collapse survives a resize round-trip.
+        w._toggle_rail(False)
+        assert cfg.make_settings().value("win/rail_collapsed", False, type=bool)
+        w.resize(shell.RAIL_AUTO_COLLAPSE_W - 60, 600); QApplication.processEvents()
+        w.resize(1100, 700); QApplication.processEvents()
+        assert w._rail.width() == shell.RAIL_COLLAPSED_W, "the user's choice is kept"
+    finally:
+        w.close()
+
+
+def test_the_library_bars_wrap_instead_of_running_off_the_page(app):
+    """The header (title + 4 buttons) and the view/search/sort row are ~1300px of
+    controls. In a QHBoxLayout that is a hard minimum width: a 1366x768 laptop (less
+    the nav, less 125% scaling) pushed "Open ROM", the search box and the sort controls
+    off the right edge, with no scrollbar to reach them. Wrapped, they stay reachable --
+    the page's minimum width is now its widest single control, not their sum."""
+    w = shell.Shell()
+    try:
+        w.show()
+        page = w.library
+        assert page.minimumSizeHint().width() < 500, \
+            f"library still demands {page.minimumSizeHint().width()}px of width"
+
+        # Every control lands inside the page once it has been laid out narrow.
+        page.resize(520, 700)
+        QApplication.processEvents()
+        for name, wid in (("open", page._open_btn), ("search", page._search),
+                          ("sort", page._sortbox), ("reverse", page._revbtn)):
+            right = wid.mapTo(page, wid.rect().topRight()).x()
+            assert right <= page.width(), f"{name} runs {right - page.width()}px off the page"
+    finally:
+        w.close()
+
+
+def test_the_settings_panels_scroll(app):
+    """The tallest settings panel wants ~1000px. A 1366x768 laptop has ~614px of usable
+    height at 125% scaling, and a page with no scroll area simply has no way to reach
+    the rows past the fold."""
+    from PyQt6.QtWidgets import QScrollArea
+
+    w = shell.Shell()
+    try:
+        area = w.settings._panel_scroll
+        assert isinstance(area, QScrollArea) and area.widgetResizable()
+        assert area.widget() is w.settings._stack, "the panels are what scrolls"
+        w.show(); w.resize(700, 420); QApplication.processEvents()
+        w.settings.show_category("controls")
+        QApplication.processEvents()
+        assert area.widget().height() > area.viewport().height(), \
+            "premise: this panel is taller than the room it has (else nothing is proved)"
+        assert area.verticalScrollBar().maximum() > 0, \
+            "...so every row past the fold must be reachable by scrolling"
+        # Narrow as well as short: the rows are ~660px wide and this viewport is not.
+        assert area.horizontalScrollBar().maximum() > 0
     finally:
         w.close()
 
