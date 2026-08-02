@@ -2029,7 +2029,7 @@ class SettingsPage(QWidget):
         lang = cfg.language(self._settings)
         path, _ = QFileDialog.getOpenFileName(
             self, cfg.tr(lang, "bios_mono"), cur,
-            "BIOS (*.bin *.rom *.ngp);;All (*)")
+            "BIOS (*.bin *.rom *.ngp *.ngc);;All (*)")
         if not path:
             return
         self._bios_mono_edit.setText(path)

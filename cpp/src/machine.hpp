@@ -1034,12 +1034,32 @@ struct Machine {
          * write happened to leave in the I/O page. 0x98-0x9A are the alarm's
          * day/hour/minute -- part of the same chip, so they answer from it too. */
         if (a >= 0x90 && a <= 0x9A) return rtc_read(a);
-        /* SC0BUF (0x50): when the link is presenting a received byte, reading it
-         * IS the RX handler consuming it -- return it and clear the pending flag
-         * (the overrun guard). Otherwise it is a plain I/O byte. */
-        if (a == 0x000050 && serial_rx_pending) {
-            serial_rx_pending = false;
-            ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+        /* SC0BUF (0x50) READS THE RECEIVE BUFFER. ALWAYS.
+         *
+         * ⚡ The address is shared by two SEPARATE registers: a write loads the
+         * TRANSMIT buffer, a read returns the RECEIVE buffer. The CPU cannot read
+         * back what it transmitted. The pending flag is the "new data" indicator
+         * (and our overrun guard): the FIRST read consumes it, but the buffer keeps
+         * holding its byte until the next one is shifted in.
+         *
+         * ⛔ THE BUG THIS ENDS, and it took a two-console link to see it. This used
+         * to fall through to `mem[0x50]` once the flag was clear -- and `mem[0x50]`
+         * is where a TRANSMITTED byte was left. So a receive handler that touches
+         * SC0BUF more than once for one byte (the retail BIOS's COM ISR, running
+         * from RAM at 0x6D65, does) put THE LAST BYTE WE SENT into its ring instead
+         * of the byte that arrived. MEASURED on Card Fighters' Clash, two consoles,
+         * player 1 -> player 2: 532 bytes queued, 532 read, 532 appended to the BIOS
+         * ring -- nothing lost, nothing duplicated, and byte 508 arrived as 0xA5
+         * where 0x00 was sent. One byte, one wrong value: the packet's checksum then
+         * failed (`cp H,A` at 0x24260B -> 0x242741), player 2 dropped the packet in
+         * silence and never answered, and both consoles waited for each other for
+         * ever on CHOOSE FIRST PLAYER. It was phase-dependent, which is why the same
+         * game linked on one attempt and hung on the next. */
+        if (a == 0x000050 && serial_link_enabled) {
+            if (serial_rx_pending) {
+                serial_rx_pending = false;
+                ++serial_rx_read_count;    /* debugger: the CPU really consumed it */
+            }
             return serial_rx_byte;
         }
         /* Port 0xB1: bit1 = the CR2032 SUB-BATTERY, bit2 = a must-be-1 line (drop it and

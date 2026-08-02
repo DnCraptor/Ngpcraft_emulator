@@ -243,7 +243,7 @@
   "archive_pick_title": "Choose a game",
   "archive_pick_label": "{archive} holds several games — which one?",
   "filter_text_files": "Text (*.txt)",
-  "filter_bios_files": "BIOS (*.bin *.rom *.ngp);;All files (*)",
+  "filter_bios_files": "BIOS (*.bin *.rom *.ngp *.ngc);;All files (*)",
   "filter_rom_files": "NGPC ROM or archive (*.ngc *.ngp *.zip *.7z);;NGPC ROM (*.ngc *.ngp);;Archive (*.zip *.7z);;All files (*)",
   "link_waiting": "⏳ waiting for player 2 on port {port}",
   "link_connecting": "⏳ connecting to {addr}",

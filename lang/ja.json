@@ -244,7 +244,7 @@
   "archive_pick_title": "ゲームを選択",
   "archive_pick_label": "{archive} には複数のゲームがあります — どれを?",
   "filter_text_files": "テキスト (*.txt)",
-  "filter_bios_files": "BIOS (*.bin *.rom *.ngp);;すべてのファイル (*)",
+  "filter_bios_files": "BIOS (*.bin *.rom *.ngp *.ngc);;すべてのファイル (*)",
   "filter_rom_files": "NGPC の ROM または書庫 (*.ngc *.ngp *.zip *.7z);;NGPC の ROM (*.ngc *.ngp);;書庫 (*.zip *.7z);;すべてのファイル (*)",
   "link_waiting": "⏳ ポート {port} でプレイヤー 2 を待っています",
   "link_connecting": "⏳ {addr} に接続中",

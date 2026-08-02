@@ -404,15 +404,30 @@ class NativeSession:
         # which for a cart already padded to its chip size is the padded length -- so the
         # identity is read off the FILE, and a file grown by an earlier save keeps claiming
         # the bigger card forever. That is why an explicit setting must be able to shrink it.
+        #
+        # ⚡ AND THE CAPACITY IS ONE DIE'S, NOT THE WHOLE CARTRIDGE'S. The caller sizes the
+        # chip from the ROM FILE, and a 4 MiB file is TWO 2 MiB dies -- so handing that
+        # number to chip 0 tells the core a single die is 4 MiB long. Every consumer of
+        # `flash_capacity(0)` then believes it: `_cart_windows` returns a 4 MiB window at
+        # 0x200000, which runs 2 MiB past the end of the cart window. MEASURED on SvC The
+        # Match of the Millennium (and it is the same for Metal Slug 2nd Mission and Densha
+        # de Go! 2): `reboot()` raised `flash_restore: 0x200000+4194304 is not in the cart
+        # window` -- and a reboot is what ATTACHING PLAYER 2 does, so two-player play on a
+        # 4 MiB cart died on the spot; in the GUI that exception lands in a Qt slot, which
+        # PyQt answers with qFatal, i.e. the whole emulator vanishes with no message.
+        # `_read_cart_image` was reading 6 MiB for a 4 MiB cart too (chip 0's 2 MiB of
+        # nothing included), so it never matched the file and an in-game save would have
+        # written that 6 MiB back over the .ngc.
+        die = min(flash_size, CART_CHIP_SIZE) if flash_size else 0
         self._flash_presented = min(len(self._rom), CART_CHIP_SIZE)
-        if flash_size and flash_size != self._flash_presented:
-            self.machine.set_flash_size(flash_size)
+        if die and die != self._flash_presented:
+            self.machine.set_flash_size(die)
             # The BIOS reads the card type BEFORE it touches the chip, and `reset` wrote it
             # from the pre-resize map -- so it has to be restated, or the byte and the block
             # map disagree about which card this is.
-            self.machine.write(BIOS_FLASH_CARD_TYPE, bytes([flash_size_code(flash_size)]))
-        if flash_size and flash_size > len(self._rom):
-            self._rom = self._orig_rom = bytes(self.machine.read(flash_file.CART_BASE, flash_size))
+            self.machine.write(BIOS_FLASH_CARD_TYPE, bytes([flash_size_code(die)]))
+        if die and die > len(self._rom):
+            self._rom = self._orig_rom = bytes(self.machine.read(flash_file.CART_BASE, die))
 
         # THE SAVE. The cartridge is the save -- a game erases a block of its own ROM
         # and programs its slot back in -- so restoring one means putting those bytes

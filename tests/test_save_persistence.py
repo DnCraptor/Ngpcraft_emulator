@@ -136,5 +136,66 @@ class SaveSurvivesPowerCycles(unittest.TestCase):
         self.assertEqual(path.read_bytes()[0x200000 + 0x1FA000:0x200000 + 0x1FA100], payload)
 
 
+@unittest.skipUnless(HLE_IMAGE.exists(), "hle_bios/bios_hle.bin not built")
+@unittest.skipUnless(native.available(), "native core not built")
+class TwoDieCartAtTheSizeTheShellAsksFor(unittest.TestCase):
+    """⛔ WHAT THIS CATCHES, and why the 4 MiB test above did not.
+
+    `cfg.flash_capacity_bytes` hands the session THE WHOLE CARTRIDGE's size, because
+    that is what the player's ROM file is -- and a 4 MiB file is TWO 2 MiB dies. The
+    tests above all pass `flash_size=0x200000` by hand, so none of them ever told chip 0
+    it was 4 MiB long. The shell does, on every launch of Metal Slug 2nd Mission, Densha
+    de Go! 2 and SvC The Match of the Millennium.
+
+    MEASURED with the real files, before the fix: `_cart_windows()` returned a 4 MiB
+    window at 0x200000 (2 MiB past the end of the cart window), `_read_cart_image()`
+    handed back 6 MiB for a 4 MiB cart, and `reboot()` raised
+    `flash_restore: 0x200000+4194304 is not in the cart window`. Attaching player 2
+    power-cycles player 1, so two-player play on those three carts died there -- and an
+    exception raised in a Qt slot is answered by qFatal, i.e. the window disappears with
+    no message. Reported by a player: "when you try to enable two-player mode by loading
+    the second player's ROM, the emulator crashes... this didn't happen with other games".
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.path = self.dir / "twodie.ngc"
+        self.path.write_bytes(_rom(0x400000))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _session(self):
+        from core.native_session import NativeSession
+        # 0x400000 = exactly what ngpc_settings.flash_capacity_bytes returns for this file.
+        return NativeSession(self.path, bios_path=HLE_IMAGE, flash_size=0x400000,
+                             autosave=False, sidecar=False,
+                             save_path=self.dir / "s.flash")
+
+    def test_each_die_is_presented_as_one_die(self):
+        s = self._session()
+        try:
+            self.assertEqual(s._cart_windows(), [(0x200000, 0x200000), (0x800000, 0x200000)])
+            image = s._read_cart_image()
+            self.assertEqual(len(image), 0x400000, "the cart image is not the cartridge")
+            self.assertEqual(image, self.path.read_bytes())
+        finally:
+            s.close()
+
+    def test_rebooting_a_two_die_cart_does_not_raise(self):
+        """A power cycle -- the reset button, and what attaching player 2 does to
+        player 1 so a game that probes the cable at boot can find its peer."""
+        s = self._session()
+        try:
+            s.run_frames(2)
+            s.reboot()                     # raised ValueError before the fix
+            self.assertEqual(s._read_cart_image(), self.path.read_bytes(),
+                             "the cartridge did not come back intact")
+        finally:
+            s.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -311,3 +311,53 @@ def test_link_cable_disabled_is_unplugged():
         a.run_frames(1)
 
     assert rd16(a.machine, G_RX_TOTAL) == 0    # received nothing — no loopback
+
+
+def _bare_rom(size: int = 0x10000) -> bytes:
+    """A cartridge that is only a valid header -- enough to build a machine."""
+    rom = bytearray(b"\xFF" * size)
+    rom[0:28] = b" LICENSED BY SNK CORPORATION"
+    rom[0x1C:0x20] = (0x200040).to_bytes(4, "little")
+    rom[0x23] = 0x10
+    rom[0x40:0x44] = bytes(4)
+    return bytes(rom)
+
+
+def test_sc0buf_reads_the_receive_buffer_not_the_byte_we_transmitted():
+    """⚡ SC0BUF is TWO registers on one address: a write loads the TRANSMIT buffer,
+    a read returns the RECEIVE buffer. The CPU cannot read back what it sent.
+
+    ⛔ THE BUG THIS ENDS. The core returned the received byte only while the
+    "new data" flag was set, and fell back to the I/O page afterwards -- where a
+    TRANSMITTED byte was sitting. A receive handler that touches SC0BUF more than
+    once for one byte (the retail BIOS's COM ISR does) therefore stored THE LAST
+    BYTE WE SENT in place of the byte that arrived.
+
+    MEASURED end to end on Card Fighters' Clash, two consoles, NORMAL MATCH: 532
+    bytes queued, 532 read, 532 appended to player 2's BIOS ring -- nothing lost,
+    nothing duplicated -- and byte 508 arrived as 0xA5 where 0x00 was sent. That one
+    wrong byte failed the packet's checksum (`cp H,A` at 0x24260B), player 2 dropped
+    the packet in silence and never answered, and both consoles waited for each other
+    for ever on CHOOSE FIRST PLAYER. Phase-dependent, hence "it hangs on the first
+    try and works on the second".
+    """
+    from core import native
+
+    m = native.NativeMachine(_bare_rom())
+    m.serial_set_enabled(True)
+    m.write(0x0000B2, bytes([0x00]))      # our RTS low: ready to receive
+    m.write(0x000050, bytes([0xA5]))      # a byte we transmitted, left in the I/O page
+    m.serial_write_rx(bytes([0x00]))      # ...and a DIFFERENT byte arrives
+    for _ in range(200):
+        m.run(64, record=False)
+        if m.serial_state().rx_pending:
+            break
+    assert m.serial_state().rx_pending == 1, "the core never presented the byte"
+
+    assert m.read(0x50, 1)[0] == 0x00, "the first read must return what arrived"
+    assert m.read(0x50, 1)[0] == 0x00, (
+        "the receive buffer holds its byte -- a second read must not hand back "
+        "the byte we transmitted")
+    # CONTROL: the flag is still the 'new data' indicator, consumed exactly once.
+    assert m.serial_state().rx_pending == 0
+    assert m.serial_state().rx_read_count == 1

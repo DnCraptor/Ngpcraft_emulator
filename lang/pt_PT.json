@@ -234,7 +234,7 @@
   "archive_pick_title": "Escolher um jogo",
   "archive_pick_label": "{archive} contém vários jogos — qual?",
   "filter_text_files": "Texto (*.txt)",
-  "filter_bios_files": "Sistema básico de entrada e saída (Sistema básico de entrada e saída) (*.bin *.rom *.ngp);;Todos os ficheiros (*)",
+  "filter_bios_files": "Sistema básico de entrada e saída (Sistema básico de entrada e saída) (*.bin *.rom *.ngp *.ngc);;Todos os ficheiros (*)",
   "filter_rom_files": "Memória de leitura exclusiva (ROM) ou arquivo da consola a cores (NGPC) (*.ngc *.ngp *.zip *.7z);;ROM da consola a cores (NGPC) (*.ngc *.ngp);;Arquivo (*.zip *.7z);;Todos os ficheiros (*)",
   "link_waiting": "⏳ À espera do jogador 2 na porta {port}",
   "link_connecting": "⏳ A ligar a {addr}",
