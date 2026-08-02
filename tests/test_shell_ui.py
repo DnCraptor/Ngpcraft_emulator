@@ -937,14 +937,17 @@ def test_the_settings_panels_scroll(app):
     height at 125% scaling, and a page with no scroll area simply has no way to reach
     the rows past the fold.
 
-    ⛔ WHAT THIS TEST MUST NOT DO. Its first version asserted that a 700x420 window
-    scrolls in BOTH directions -- true on Windows, false on the macOS runner, whose
-    narrower font let a settings row fit the viewport. That is a font measurement
-    dressed up as a feature: it failed CI while nothing was broken. So the window is
-    squeezed to the smallest the shell allows, and the premise (widget bigger than
-    viewport) is ASSERTED before the conclusion -- on any font, at that size, the
-    panels overflow, and if a platform ever proves otherwise the failure says which
-    premise died instead of blaming the scroll area."""
+    ⛔ WHAT THIS TEST MUST NOT DO -- it did it, twice, and broke CI both times. Its
+    first version asserted that a 700x420 window scrolls in BOTH directions. True with
+    the Windows font; false on the macOS and Linux runners, whose narrower fonts let a
+    settings row fit the viewport, so the horizontal bar had nothing to scroll. That is
+    a FONT MEASUREMENT dressed up as a feature: red CI, nothing broken.
+
+    ⚖️ The rule this now follows: an assertion may only name what the CODE decides.
+    The scroll POLICY is ours (asserted unconditionally). Whether a given axis
+    overflows at a given size belongs to the font, so each axis is checked only where
+    it is measured to overflow -- and the test refuses to pass vacuously by requiring
+    that at least one axis did."""
     from PyQt6.QtWidgets import QScrollArea
 
     w = shell.Shell()
@@ -952,22 +955,31 @@ def test_the_settings_panels_scroll(app):
         area = w.settings._panel_scroll
         assert isinstance(area, QScrollArea) and area.widgetResizable()
         assert area.widget() is w.settings._stack, "the panels are what scrolls"
+        # Ours, not the font's: bars appear when needed, on both axes.
+        assert area.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        assert area.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+
         w.show()
         w.resize(w.minimumWidth(), w.minimumHeight())     # 360x320, the shell's floor
         w._go(1)
         w.settings.show_category("controls")
         QApplication.processEvents()
 
+        overflowed = []
         for axis, bar, widget_px, viewport_px in (
                 ("vertically", area.verticalScrollBar(),
                  area.widget().height(), area.viewport().height()),
                 ("horizontally", area.horizontalScrollBar(),
                  area.widget().width(), area.viewport().width())):
-            assert widget_px > viewport_px, (
-                f"premise: the panel must be bigger {axis} than the {viewport_px}px it "
-                f"has (it is {widget_px}px) -- else this proves nothing")
-            assert bar.maximum() > 0, \
-                f"a panel bigger {axis} than its viewport must scroll {axis}"
+            if widget_px <= viewport_px:
+                continue                  # fits on this font -- nothing to reach
+            overflowed.append(axis)
+            assert bar.maximum() > 0, (
+                f"the panel is {widget_px}px {axis} in a {viewport_px}px viewport and "
+                f"cannot be scrolled {axis} -- those rows are unreachable")
+        assert overflowed, (
+            "premise: at the shell's minimum size SOMETHING must overflow, or this test "
+            "proves nothing about scrolling")
     finally:
         w.close()
 
