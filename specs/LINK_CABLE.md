@@ -474,9 +474,9 @@ The reasoning is recorded in full at the end of `tests/test_link_cable.py` so it
 re-attempted the same three ways. A proper test wants a purpose-built probe ROM that programs
 `BR0CR` and reports its own timing — the same ROM that would validate the constant on silicon.
 
-## 2.4 ⚠️ These fixes live in TWO core trees — keep them in step
+## 2.4 These fixes live in TWO core trees — reconciled 2026-08-03
 
-Everything in §2.2/§2.3 was done in `cpp/src/`, the tree the desktop shell compiles into
+Everything in §2.2/§2.3 was written in `cpp/src/`, the tree the desktop shell compiles into
 its DLL. **There is a second tree**, and it is the one Android and RetroArch build:
 
 | tree | path | consumers |
@@ -484,29 +484,27 @@ its DLL. **There is a second tree**, and it is the one Android and RetroArch bui
 | desktop | `cpp/src/` | the Python shell (ctypes DLL) |
 | libretro | `NGPC_RAG/04_MY_PROJECTS/Ngpcraft_emulator_lirbreto/core/src/` | **Android** (`ngpcraft.coreDir`) and RetroArch |
 
-Measured 2026-08-03, they have drifted **in both directions**: `machine.hpp` 78 lines,
-`memory.cpp` 45, `apu.cpp` 10, `z80.cpp` 9, `core.cpp` 4, `execute.cpp` 4, `render.cpp` 0.
+They had drifted **in both directions**, silently. Both were wrong about something:
 
-🚨 **The libretro tree does not have the SC0BUF fix** — its `read8` is still
-`if (a == 0x000050 && serial_rx_pending)`, so once the flag clears it falls through to
-`mem[0x50]`, where the last **transmitted** byte sits. That is the exact defect that kept
-Card Fighters' Clash stuck on CHOOSE FIRST PLAYER, so **CFC's link is broken on Android and
-on RetroArch today.** It also lacks `serial_byte_cycles()`.
+- the libretro tree lacked the **SC0BUF fix**, so `read8` fell through to `mem[0x50]` — where
+  the last *transmitted* byte sits — once the pending flag cleared. **Card Fighters' Clash's
+  link was broken on Android and RetroArch**; it no longer is. It also lacked
+  `serial_byte_cycles()`;
+- the desktop tree computed `chip * 44100` in **32 bits** in `apu.cpp`, overflowing past
+  `chip > 97 392` — under two frames of audio. Widened to 64, as libretro already had it.
 
-And the desktop tree is behind: `apu.cpp` computes `chip * 44100` in **32 bits** where the
-libretro tree uses 64. That overflows once `chip > 97 392` — under two frames of audio.
+**All 11 files of the two trees are now identical.** Verified: libretro builds (MSVC) and its
+smoke test runs a real cartridge (482 frames, `state_hash=F89DFE73`, 642 fps); the desktop
+builds warning-free, the suite is **2028 passed / 48 skipped**, and the 12-case link sweep is
+**byte-for-byte identical** to the runs before the change.
 
-The full diff has since been taken: **eight points**, most of the raw line count being comments.
-Three favour the desktop (the SC0BUF fix, the derived byte time, one cosmetic), four favour
-libretro (the 64-bit audio accumulator, plus hygiene), and one is a latent limitation present in
-both (`ngpc_raise_irq` refuses index ≥ 32, yet INTTC3 *is* index 32). The table, the running
-order, the anti-drift policy options and the merge validation criteria are in item **0** of the
-Android DEVLOG.
+🎯 **This was the prerequisite for PC ↔ Android play.** Mirror netplay requires both machines
+to simulate *identically* — only pad bytes cross the wire — so two different cores cannot play
+together: the CRC32 exchanged every 60 frames cuts the session.
 
-🎯 **This blocks the PC ↔ Android goal, not just maintenance.** Mirror netplay requires both
-machines to simulate *identically* — only pad bytes cross the wire. Two different cores cannot
-play together: the CRC32 exchanged every 60 frames will cut the session. Reconciling the trees is
-a prerequisite for that feature, not tidying.
+⚠️ **The structural problem is not solved.** They agree *today*; nothing detects it if they
+drift again, which is exactly how this happened. The options — one tree, a failing drift test,
+or a written procedure — are laid out in item **0** of the Android DEVLOG.
 
 ## 3. Observation: `ngpc_serial_state` (read-only)
 

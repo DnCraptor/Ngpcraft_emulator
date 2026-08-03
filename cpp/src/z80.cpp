@@ -147,6 +147,7 @@ static inline void z80_out(Machine& m, uint8_t port, uint8_t value) {
     m.log_apu_write(port, value, NGPC_APU_WRITE_PORT);
 }
 static inline uint8_t z80_in(Machine& m, uint8_t port) {
+    (void)m;
     (void)port;
     return 0xFF;   /* open bus */
 }

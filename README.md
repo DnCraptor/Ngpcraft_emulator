@@ -7,7 +7,9 @@ A **Neo Geo Pocket / Neo Geo Pocket Color** emulator: a fast native C++ core
 Its timing is **calibrated against real hardware** — instruction-fetch wait-states on
 the cartridge flash, silicon-measured MUL/DIV and LDIR costs — so self-timed games
 (Cool Boarders Pocket, Densha de Go) run at their true 30 fps instead of the ~2× too
-fast that most emulators show.
+fast that most emulators show. The measured values, and the one default that trips up
+code driving the core as a library, are in
+[**Timing — wait states**](#timing--wait-states-and-the-default-that-catches-embedders).
 
 Instruction coverage is checked the same way: a sweep of a 90-cartridge corpus, each
 driven for 400 frames, currently finds **no ROM stopped by a missing opcode**. That sweep
@@ -629,6 +631,64 @@ mirror room and the question does not arise: that cable is local.
 If a game refuses to see the other console, the debugger's [**Link** tab](#link--watch-the-cable-poke-it-break-it)
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the
 serial path with **one** console, so you can test without a partner.
+
+## Timing — wait states, and the default that catches embedders
+
+The cartridge flash is **slow**, and on this console that is not a detail: every instruction
+is fetched across that bus, so the fetch cost dominates. A cartridge-resident loop runs about
+**2.9–3.4× faster** with free fetches than it does on silicon. Games that lock to VBlank
+(*Fatal Fury*) never show it; games that **self-time** (*Cool Boarders Pocket*, *Densha de Go*)
+show it as double speed — 60 fps where a real console gives 30, and an in-game timer counting
+twice too fast.
+
+The values below are measured, not tuned by ear. The measuring ROMs and their raw silicon
+numbers are in [`hw_calibration/`](hw_calibration/README.md).
+
+| Knob | Ships as | Where it comes from |
+|---|---|---|
+| `cart_wait` — cycles per **instruction-fetch** byte off the cart | **3** | `cpu_calib_v1` on hardware: fetch-bound classes came back ~3.4× slower than this core, execution-bound ones ~2.5×, raster exact — the signature of a per-fetch-byte cost |
+| `cart_data_wait` — cycles per **data** byte read off the cart | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). Only fetch is wait-stated. An earlier guess of **5** was curve-fit to a frame rate and this ROM **refuted** it |
+| `ldir_cost` — cycles per byte of `LDIR`/`LDDR` | **14** | The datasheet says 7, but its MUL/DIV figures already proved to be floors. 14 puts Cool Boarders at its hardware 30 fps and leaves Fatal Fury at 60 — one fix, both games. Strongly evidenced, not yet pinned by a clean ROM |
+| `vram_wait` — cycles per byte written to display RAM | **0 (off)** | The K2GE throttle is **real**: `cpu_calib_v3` on silicon gave VWR 452 < MEM 471. The cost per byte is not pinned, so nothing ships a number rather than shipping a guess |
+
+### ⚠️ The application and the library do not start the same way
+
+- **The application** turns wait states **on** by default, on every ROM it loads
+  (`cart_wait_states()` in `ngpc_settings.py`). Playing a game here is silicon-timed. The
+  toggle exists so you can compare against the old free-fetch timing on purpose.
+- **A bare `Machine`** — anything that imports `core.native` and builds one itself: a bench
+  harness, a test, the NgpCraft MCP server — starts at
+  `cart_wait = 0`, **free fetch**. That zero is historical: when the feature landed, the field
+  was left off so existing timing stayed bit-for-bit identical and the hot path cost nothing
+  when disabled. It is *not* a claim about hardware.
+
+So anything measuring performance must ask for hardware timing explicitly:
+
+```python
+m.set_cart_wait(cfg.CART_FETCH_WAIT)      # 3
+m.set_cart_data_wait(cfg.CART_DATA_WAIT)  # 0
+m.set_ldir_cost(cfg.CART_LDIR_COST)       # 14
+```
+
+(`core/romcheck.py` does exactly this; copy it rather than re-deriving the numbers.)
+
+### Why this matters more than "everything is ~3× slower"
+
+A uniform slowdown would be easy to live with. This one is **not uniform**, and it changes
+which optimisations are real:
+
+- **Instruction count is a cost, not just cycle count.** Every byte of encoding is a byte
+  fetched across the slow bus — three extra ticks. Shorter code is *directly* faster.
+- **With fetch unbilled, every size-based saving measures as exactly zero.** If a change makes
+  the code smaller and the profile does not move at all, suspect the timing model before you
+  conclude the optimisation was worthless.
+- **Padding a struct to a power of two can backfire.** Grow it and field offsets fall out of
+  the 8-bit displacement form; the longer encoding then costs three ticks per extra byte,
+  every access.
+
+The [Profiler](#profiler--where-the-frame-goes) reports **cycles**, which is why: on this
+machine instruction cost varies by a factor of ten, so ranking by instruction count puts a
+tight `djnz` loop above the routine actually eating the frame.
 
 ## Debugging (F1)
 

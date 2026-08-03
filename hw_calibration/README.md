@@ -16,10 +16,29 @@ FETCH wait-states**. What silicon settled:
   `cart_data_wait=5`, curve-fit to Cool Boarders, was **refuted** by this ROM.)
 - ✅ **MUL/DIV were under-costed** (silicon 444/265 vs 481/301) — **fixed** in the core.
 
-With the CPU model now silicon-exact on every class, Cool Boarders STILL runs ~51 fps
-(vs 30 on silicon) → the residual is **not the CPU**. The one unmeasured thing is
-**VRAM writes** (the per-frame char-RAM ldir); **v3** adds a test for it. See
-`../DEVLOG.md` and memory `project_ngpc_emulator_fps_waitstates`.
+With the CPU model now silicon-exact on every class, Cool Boarders STILL ran ~51 fps
+(vs 30 on silicon) → the residual was **not the CPU**. **v3** then measured VRAM writes and
+found the K2GE throttle is real (VWR 452 < MEM 471) — but *not* Cool Boarders' cause, since
+that game writes VRAM in vblank. The residual is its per-frame **LDIR** block copy, which is
+what **v6** measures (`ldir_cost`, shipped at 14 pending that ROM). See `../DEVLOG.md` and
+memory `project_ngpc_emulator_fps_waitstates`.
+
+## What the emulator actually ships today
+
+| Knob | Field default (`Machine`) | Shipped by the shell | Status |
+|---|---|---|---|
+| `cart_wait` (fetch) | `0` — free fetch, the pre-feature behaviour | **3** (`cfg.CART_FETCH_WAIT`) | ✅ silicon (v1) |
+| `cart_data_wait` | `0` | **0** (`cfg.CART_DATA_WAIT`) | ✅ silicon (v2): 0 is the answer, not "unset" |
+| `ldir_cost` | `7` (datasheet) | **14** (`cfg.CART_LDIR_COST`) | ⚠️ strongly evidenced, ROM measurement still open (v6) |
+| `vram_wait` | `0` | *not set* | ⚠️ effect confirmed (v3: VWR 452 < MEM 471), cost/byte not pinned — no guess shipped |
+
+⚠️ **The two defaults differ on purpose, and it catches people.** The field default of `0` is
+backward compatibility, not a hardware claim; the shell applies the silicon set on every ROM
+load (`cart_wait_states()` → True). **Anything that builds a `Machine` itself — a bench script,
+a test, the MCP server — runs free-fetch until it calls the setters**, and will measure a
+machine ~2.9× too fast. Worse, any optimisation whose gain is *fewer instruction bytes* then
+measures as exactly zero, because fetch is the one cost not being billed. Copy the three calls
+from `core/romcheck.py`. Full write-up: README → "Timing — wait states".
 
 ## Files
 - `a_cpu_calib_v6.ngc` — **current ROM.** LDRR/LDVR = ONE big 2000-byte LDIR per batch

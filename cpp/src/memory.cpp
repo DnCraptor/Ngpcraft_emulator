@@ -592,7 +592,7 @@ void Machine::timer_tick(uint32_t cycles) {
             uint32_t unserviced = matches;
             while (unserviced && micro_dma_service(kIrqVectorIndexIntT0 + i))
                 --unserviced;
-            if (unserviced) irq_pending |= 1u << (kIrqVectorIndexIntT0 + i);
+            if (unserviced) irq_pending |= uint64_t(1) << (kIrqVectorIndexIntT0 + i);
             /* "T03 is used as an interrupt to the Z80 CPU" -- SNK, 8Bit.txt. Timer 3
              * is the sound driver's heartbeat. It is not an option: without it the
              * driver boots, idles forever, and the game waits on a handshake that
@@ -917,8 +917,8 @@ void Machine::flash_adopt_capacity_from_block(int chip, uint32_t block) {
 
     uint32_t derived = 0;
     for (uint32_t cap : kCardCapacities) {
-        const uint32_t n = card_block_count(cap);
-        if (block != n - 3 && block != n - 2) continue;
+        const uint32_t candidate_blocks = card_block_count(cap);
+        if (block != candidate_blocks - 3 && block != candidate_blocks - 2) continue;
         if (derived) return;                              /* two readings: no answer */
         derived = cap;
     }

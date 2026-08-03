@@ -663,19 +663,35 @@ class NativeMachine:
         return int(self._lib.ngpc_apu_write_count(self._h))
 
     def set_cart_wait(self, cycles_per_byte: int) -> None:
-        """Wait-states per byte fetched from cartridge flash (0 = free/old behaviour).
+        """Wait-states per byte of instruction FETCH from cartridge flash. Silicon = 3.
 
-        The cart flash is slow; every instruction is fetched from it, so cart code ran
-        ~3.4x too fast with free fetches. Calibrated by hw_calibration/cpu_calib_v1.ngc.
+        ⚠️ A FRESH MACHINE STARTS AT 0 -- free fetch, the pre-wait-state behaviour, NOT
+        hardware. The desktop shell turns the silicon set on for every ROM it loads
+        (ngpc_settings.cart_wait_states() is True); code that builds a Machine itself gets
+        the free-fetch machine and must ask for hardware timing explicitly:
+
+            m.set_cart_wait(3)        # cfg.CART_FETCH_WAIT -- instruction fetch
+            m.set_cart_data_wait(0)   # cfg.CART_DATA_WAIT  -- cart data reads are free
+            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies
+
+        Without them cart code runs ~2.9-3.4x too fast, self-timed games (Cool Boarders,
+        Densha de Go) show 60fps where hardware shows 30 -- and, the subtler one, any
+        optimisation whose gain is FEWER INSTRUCTION BYTES measures as exactly zero,
+        because instruction fetch is the thing not being billed. Every byte of encoding
+        costs 3 ticks on silicon, so code size is speed.
+
+        Calibrated by hw_calibration/cpu_calib_v1.ngc. See Machine::cart_wait.
         """
         self._lib.ngpc_set_cart_wait(self._h, int(cycles_per_byte))
 
     def set_cart_data_wait(self, cycles_per_byte: int) -> None:
-        """Wait-states per byte of a RANDOM data read from cart flash (0 = same as fetch).
+        """Wait-states per byte of a DATA read from cart flash. Silicon = 0 (free).
 
-        Sequential fetch is cheap (flash page-mode); an arbitrary LD from a cart table
-        eats the full random-access latency. Calibrated so Cool Boarders' silicon-confirmed
-        30fps reproduces on top of the fetch cost. See Machine::cart_data_wait.
+        cpu_calib_v2 on real hardware read a random cart byte and a RAM byte at the same
+        cost (CRND 252 == RRND 252): only instruction fetch is wait-stated. 0 here means
+        free, NOT "unset" -- there is no fallback to the fetch cost. An earlier value of 5,
+        curve-fit to Cool Boarders' frame rate, was refuted by that ROM; don't restore it
+        without a measurement. See Machine::cart_data_wait.
         """
         self._lib.ngpc_set_cart_data_wait(self._h, int(cycles_per_byte))
 
@@ -700,18 +716,23 @@ class NativeMachine:
         return getattr(self, "_k1ge_console", False)
 
     def set_vram_wait(self, cycles_per_byte: int) -> None:
-        """EXPERIMENTAL wait-states per byte written to display RAM (0x8000-0xBFFF).
+        """Wait-states per byte written to display RAM (0x8000-0xBFFF). Default 0 = off.
 
-        Tests whether the K2GE active-display access throttle explains the residual
-        speed of self-timed games after the (silicon-confirmed) CPU model is exact.
-        Needs a v3 calibration ROM to confirm. See Machine::vram_wait.
+        The K2GE throttle is REAL -- cpu_calib_v3 on silicon returned VWR 452 < MEM 471,
+        a VRAM write costing more than a RAM write. What is not pinned is the cost per
+        byte, so nothing ships a value and this stays off rather than guessing an integer.
+        It is not the cause of Cool Boarders' residual either (that game writes VRAM in
+        vblank; the answer was LDIR). If you measure the cost, say so in
+        hw_calibration/README.md rather than only here. See Machine::vram_wait.
         """
         self._lib.ngpc_set_vram_wait(self._h, int(cycles_per_byte))
 
     def set_ldir_cost(self, cycles_per_byte: int) -> None:
-        """Cycles/byte for LDIR/LDDR block copies (default 7 = datasheet). 14 reproduces
-        Cool Boarders' silicon 30fps; the datasheet figure is likely a floor (as MUL/DIV
-        were). See Machine::ldir_cost."""
+        """Cycles/byte for LDIR/LDDR block copies. A fresh Machine starts at 7 (datasheet);
+        the shell and romcheck ship 14 (cfg.CART_LDIR_COST), which reproduces Cool Boarders'
+        silicon 30fps and leaves Fatal Fury at 60. The datasheet figure is likely a floor,
+        as MUL/DIV proved to be. Pass 14 if you want the shipping timing.
+        See Machine::ldir_cost."""
         self._lib.ngpc_set_ldir_cost(self._h, int(cycles_per_byte))
 
     def set_flash_size(self, size_bytes: int, *, chip: int = 0) -> None:

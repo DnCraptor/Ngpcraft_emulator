@@ -906,23 +906,43 @@ struct Machine {
      * why the SELF-TIMED games (Cool Boarders, Densha de Go) fit their frame's work in one
      * VBlank here and run at 60 fps where silicon spills to two VBlanks and 30 fps.
      *
-     * Cycles added per BYTE accessed on the cart bus -- instruction fetch AND data
-     * reads, since both cross the slow flash bus. 0 = the old free-fetch behaviour.
-     * Calibrated by cpu_calib_v1.ngc. `ngpc_set_cart_wait` is the knob; do not re-tune
-     * it by feel. `access_wait` accumulates the penalty over one instruction's reads and
-     * the run loop folds it into that instruction's cycle count. */
+     * Cycles added per BYTE of instruction FETCH off the cart bus. Calibrated by
+     * cpu_calib_v1.ngc -> 3. `ngpc_set_cart_wait` is the knob; do not re-tune it by feel.
+     * `access_wait` accumulates the penalty over one instruction's reads and the run loop
+     * folds it into that instruction's cycle count.
+     *
+     * ⚠️ THE DEFAULT HERE IS 0, AND 0 IS NOT THE SILICON VALUE. It means "the old
+     * free-fetch behaviour": when wait-states were added the field was left off so the
+     * pre-existing timing stayed bit-for-bit unchanged, so an A/B against it stayed
+     * possible, and so read8()'s hot path costs nothing when it is off. The SHIPPING
+     * default is ON and lives one layer up, in the shell -- `cart_wait_states()` in
+     * ngpc_settings.py returns True and ngpc_shell.py calls the setters on every ROM
+     * load. So the APP is silicon-timed; a bare Machine is NOT. Anything that
+     * instantiates this class directly (a bench harness, the MCP server, a test) gets
+     * free fetch and measures a machine ~2.9x too fast unless it applies the set itself:
+     *
+     *     set_cart_wait(3)  set_cart_data_wait(0)  set_ldir_cost(14)   [vram_wait: below]
+     *
+     * The trap that creates is real and has cost people weeks: with fetch free, every
+     * saving that comes from SHORTER CODE measures as exactly zero, because the thing it
+     * saves is the one thing not being billed. See README "Timing -- wait states". */
     uint32_t cart_wait = 0;
-    /* Random data reads off the cart pay MORE than sequential fetch: flash page-mode
-     * makes consecutive fetch bytes cheap, but an arbitrary LD from a cart table eats the
-     * full random-access latency. `cart_wait` is the per-fetch-byte cost (calibrated by
-     * the register-loop ROM); `cart_data_wait` the per-data-byte cost (calibrated so the
-     * silicon-confirmed 30fps of Cool Boarders reproduces). 0 => fall back to cart_wait. */
+    /* Wait-states per byte of a DATA read off the cart. SILICON SAYS ZERO: cpu_calib_v2
+     * measured a random cart read (CRND=252) and a RAM read (RRND=252) as identical, so
+     * only instruction FETCH is wait-stated. An earlier `cart_data_wait=5` was a curve-fit
+     * to Cool Boarders' frame rate and that ROM REFUTED it -- do not bring it back without
+     * a measurement. There is deliberately NO fallback to cart_wait when this is 0: here 0
+     * is the answer, not "unset". (Flash page-mode was the theory behind a fetch-vs-data
+     * asymmetry; the numbers did not support it.) */
     uint32_t cart_data_wait = 0;
-    /* EXPERIMENTAL: wait-states per byte written to the display RAM (0x8000-0xBFFF).
-     * Hypothesis under test (not yet silicon-confirmed): the K2GE "adjustment circuitry"
-     * throttles CPU VRAM access during the active drawing period, so a game doing a big
-     * per-frame ldir into char RAM (Cool Boarders -> 0xBC00) is slower on silicon than a
-     * CPU model alone predicts. 0 = off. Needs a v3 calibration ROM to confirm. */
+    /* Wait-states per byte written to display RAM (0x8000-0xBFFF): the K2GE "adjustment
+     * circuitry" throttling CPU access to VRAM during the active drawing period.
+     * THE EFFECT IS REAL AND SILICON-MEASURED -- cpu_calib_v3 came back VWR 452 < MEM 471,
+     * a VRAM write costing more than a RAM write. What is NOT settled is the cost per byte,
+     * so nothing in the shell sets this and it stays 0 (off) rather than shipping a guessed
+     * integer. It is also NOT the explanation for Cool Boarders: that game writes VRAM
+     * during vblank, and its residual turned out to be LDIR (see ldir_cost). If you pin the
+     * cost, update hw_calibration/README.md, the shell and the README table together. */
     uint32_t vram_wait = 0;
 
     /* WHICH CONSOLE WE ARE PRETENDING TO BE, for a monochrome cartridge.
@@ -936,9 +956,12 @@ struct Machine {
      * A setting, exactly like the clock: on a console the setup wizard writes it and
      * the coin cell keeps it. Handed to the cart at the hand-off. Set BEFORE reset. */
     uint8_t language_code = kLanguageEnglish;
-    /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1 (default 7); may be a floor
-     * like MUL/DIV were. 14 reproduces Cool Boarders' silicon 30fps without touching Fatal
-     * Fury. `ngpc_set_ldir_cost` is the knob; pending a clean silicon measurement. */
+    /* Cycles per byte for LDIR/LDDR block copies. Datasheet 7n+1, so the field defaults to
+     * 7 -- but the datasheet MUL/DIV figures already turned out to be FLOORS. 14 reproduces
+     * Cool Boarders' silicon 30fps without touching Fatal Fury (one instruction-cost fix
+     * explaining both games), so the shell ships 14 via cfg.CART_LDIR_COST while the raw
+     * field keeps the datasheet number. Strongly evidenced, still pending a clean silicon
+     * measurement (hw_calibration a_cpu_calib_v6.ngc, LDRR/LDVR). `ngpc_set_ldir_cost`. */
     uint16_t ldir_cost = 7;
     mutable uint32_t access_wait = 0;
     /* Set by the run loop to the PC of the instruction being executed, so read8() can
@@ -1090,7 +1113,11 @@ struct Machine {
          * failed (`cp H,A` at 0x24260B -> 0x242741), player 2 dropped the packet in
          * silence and never answered, and both consoles waited for each other for
          * ever on CHOOSE FIRST PLAYER. It was phase-dependent, which is why the same
-         * game linked on one attempt and hung on the next. */
+         * game linked on one attempt and hung on the next.
+         *
+         * Fixed in the desktop tree 2026-08-02; carried into the libretro tree
+         * 2026-08-03 when the two were reconciled. Condemning test:
+         * `test_sc0buf_reads_the_receive_buffer_not_the_byte_we_transmitted`. */
         if (a == 0x000050 && serial_link_enabled) {
             if (serial_rx_pending) {
                 serial_rx_pending = false;

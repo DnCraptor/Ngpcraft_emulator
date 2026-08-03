@@ -1124,7 +1124,7 @@ NGPC_API uint32_t ngpc_flash_capacity(ngpc_t* h, uint32_t chip) {
 
 NGPC_API void ngpc_raise_irq(ngpc_t* h, uint32_t vector_index) {
     if (!h || vector_index >= 32) return;
-    reinterpret_cast<Machine*>(h)->irq_pending |= (1u << vector_index);
+    reinterpret_cast<Machine*>(h)->irq_pending |= (uint64_t(1) << vector_index);
 }
 
 /* --- link cable (serial channel 0) ----------------------------------------
