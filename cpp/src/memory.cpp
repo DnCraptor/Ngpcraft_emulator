@@ -375,6 +375,41 @@ void Machine::adc_tick(uint32_t cycles) {
  * A byte pipe between two machines. Disabled -> no-op (cable unplugged), which
  * is the pre-link behaviour every existing ROM and test still gets. See
  * machine.hpp for the model. */
+/* TMP95C061 datasheet section 3.11, figures 3.11(6) SC0MOD, 3.11(8) BR0CR and
+ * 3.11(12) the channel-0 block diagram. Cycles per BIT are the product of the baud
+ * generator's input-clock divider, its own divider, and UART's 16x oversampling; a
+ * byte is that times the frame length in bits. */
+int32_t Machine::serial_byte_cycles() const {
+    const uint8_t sc0mod = mem[0x000052];
+    const uint8_t br0cr  = mem[0x000053];
+
+    /* SC0MOD<SM1,SM0>: 00 = I/O interface mode (not a UART frame at all), 01/10/11 =
+     * UART with 7 / 8 / 9 data bits. A frame is start + data + stop. */
+    const unsigned sm = (sc0mod >> 2) & 0x3;
+    if (sm == 0) return kSerialByteCycles;      /* I/O interface mode: not modelled */
+    const int32_t bits = int32_t(sm + 8);       /* 01->9, 10->10, 11->11 */
+
+    /* SC0MOD<SC1,SC0> picks what clocks the shift register. */
+    const unsigned sc = sc0mod & 0x3;
+    int32_t cycles_per_bit;
+    if (sc == 1) {
+        /* Baud rate generator. BR0CR<BR0CK1,0> selects phi-T0 (fc/4), phi-T2 (fc/16),
+         * phi-T8 (fc/64) or phi-T32 (fc/256); BR0CR<BR0S3:0> divides by 2..15, with
+         * 0000 meaning 16 (and 0001 documented as "don't set"). */
+        const int32_t tap = int32_t(4u << (2u * ((br0cr >> 4) & 0x3)));
+        const unsigned s = br0cr & 0x0F;
+        const int32_t div = (s == 0) ? 16 : int32_t(s);
+        cycles_per_bit = tap * div * 16;
+    } else if (sc == 2) {
+        cycles_per_bit = 2 * 16;                /* internal clock phi1 = fc/2, then /16 */
+    } else {
+        /* 00 = timer 2 match output, 11 = don't care. Nothing programs these on this
+         * console; keep the previous behaviour rather than invent a rate. */
+        return kSerialByteCycles;
+    }
+    return bits * cycles_per_bit;
+}
+
 void Machine::serial_tick(uint32_t cycles) {
     if (!serial_link_enabled) return;
 
@@ -440,7 +475,7 @@ void Machine::serial_tick(uint32_t cycles) {
             serial_rx_byte = serial_rx.front();
             serial_rx.pop_front();
             serial_rx_pending = true;
-            serial_rx_cycles = kSerialByteCycles;
+            serial_rx_cycles = serial_byte_cycles();
             irq_pending |= 1u << kIrqVectorSerialReceive;
             ++serial_irq_rx_count;
         }

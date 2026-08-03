@@ -361,3 +361,31 @@ def test_sc0buf_reads_the_receive_buffer_not_the_byte_we_transmitted():
     # CONTROL: the flag is still the 'new data' indicator, consumed exactly once.
     assert m.serial_state().rx_pending == 0
     assert m.serial_state().rx_read_count == 1
+
+
+# ------------------------------------------------------------------------------
+# ⚠️ WHY THERE IS NO RUNTIME TEST FOR THE BYTE TIME (and please do not re-attempt
+# it the same three ways).
+#
+# `Machine::serial_byte_cycles()` computes one byte-time from SC0MOD and BR0CR
+# instead of returning the old constant (TMP95C061 datasheet 3.11; the derivation is
+# written above `kSerialByteCycles` in machine.hpp, and in specs/LINK_CABLE.md 2.2).
+# A condemning test would show BR0CR = 0x15 pacing four times slower than 0x05.
+# Three environments were tried and none can time it:
+#
+#   * host-driven transmit -- `machine.write(0x50, ...)` does NOT arm a send; it
+#     bypasses io_action_write. Only a real ROM can transmit.
+#   * receive pacing on a synthetic cartridge -- with 0xFF filler the CPU decodes
+#     junk that READS SC0BUF (eating the queued byte) and then wedges; with NOP
+#     filler it wedges anyway after ~280 cycles, which is less than ONE byte-time.
+#     No cycles run, so serial_tick is never called.
+#   * receive pacing on the real BIOS + probe ROM -- works, but the probe ROM drives
+#     the link itself and consumes the queued bytes, so the gaps are contaminated and
+#     the slow (0x15) case starves before a second byte is presented.
+#
+# What IS verified: the arithmetic yields exactly 3200 for SC0MOD=0x69 / BR0CR=0x05
+# (the values the BIOS writes for every cartridge, measured on ten), and the whole
+# link sweep is byte-for-byte identical before and after the change. A real test
+# wants a purpose-built probe ROM that programs BR0CR and reports its own timing --
+# the same ROM that would finally validate the constant on silicon.
+# ------------------------------------------------------------------------------

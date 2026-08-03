@@ -136,10 +136,34 @@ constexpr uint8_t  kIrqLevelIntAd       = 4;
  * the RX ring -- a self-loopback (measured: the console received its own pad). */
 constexpr unsigned kIrqVectorSerialReceive  = 0x18;  /* handler FILLS the RX ring   */
 constexpr unsigned kIrqVectorSerialTransmit = 0x19;  /* handler DRAINS the TX ring   */
-/* One byte at 19200 bps, 8N1 (10 bit-times) with the CPU at 6.144 MHz
- * (515 * 199 * 60): 6_144_000 / 1920 ~= 3200 cycles. APPROXIMATE -- flow control
- * (RTS) and the 64-byte BIOS rings absorb any drift, so exact baud is not load-
- * bearing for correctness; see PERF_TIMING_POLICY.md. */
+/* One byte on the link cable, in CPU cycles. DERIVED, not assumed -- see below.
+ *
+ * ⚡ THE DERIVATION, forward, from manufacturer documents and our own measurements
+ * only. (An earlier comment reasoned BACKWARDS -- "the cable's *documented* 19200 bps
+ * implies phi-T0 = fc/4, therefore fc = 6.144 MHz" -- which cannot then be used to
+ * justify the baud. This does it in the honest direction.)
+ *
+ *  1. fc ~= 6.144 MHz, from the VIDEO timing, independently of anything serial:
+ *     515 cycles/line * 199 lines * 60 Hz = 6 149 100 (K2GETechRef).
+ *  2. What the machine actually programs, measured across TEN cartridges
+ *     (scratchpad/baud.py): every one converges on SC0MOD = 0x69, BR0CR = 0x05 --
+ *     and the writes come from the BIOS (PC 0xFF2BC9/0xFF2BCF), never from the
+ *     cartridge. There is no per-game serial configuration to look up.
+ *  3. What those bits mean, TMP95C061 datasheet section 3.11:
+ *       SC0MOD = 0x69 -> SM = 10   : UART, 8-bit length
+ *                        SC = 01   : clocked by the baud rate generator
+ *                        RXE = 1, CTSE = 1 (bit 6; channel 0 only, fig 3.11(12))
+ *       BR0CR  = 0x05 -> BR0CK = 00: input clock phi-T0 = fc/4
+ *                        BR0S  = 5 : divide by 5
+ *       UART mode divides by a further 16 -- the transmission and receive counters
+ *       are labelled "UART only /16" in the channel-0 block diagram, fig 3.11(12).
+ *  4. Therefore baud = fc / 4 / 5 / 16 = fc / 320 = 19 200 bps,
+ *     and 8N1 is 10 bit-times, so one byte = 10 / 19 200 s = 520.83 us
+ *     = 0.00052083 * 6 144 000 = 3200 CPU cycles, exactly the value below.
+ *
+ * Flow control (RTS) and the 64-byte BIOS rings still absorb drift, so this is not
+ * knife-edge for correctness -- but it is no longer a guess either.
+ * See PERF_TIMING_POLICY.md and specs/LINK_CABLE.md §2.2. */
 constexpr int32_t kSerialByteCycles = 3200;
 /* 10-bit full scale. An emulator has no cell, so we model a healthy one; a flat
  * reading would make the BIOS power the console off (see above). */
@@ -771,6 +795,18 @@ struct Machine {
     uint32_t serial_irq_rx_count = 0;    /* INTRX0 raised (vector 0x18)        */
     uint32_t serial_cts_hold_ticks = 0;  /* ticks a byte was held by CTS0 high */
     uint32_t serial_rts_hold_ticks = 0;  /* ticks RX was held by our own RTS   */
+    /* One byte on the wire, in CPU cycles, COMPUTED from what the machine actually
+     * programmed -- see the derivation above kSerialByteCycles and specs/LINK_CABLE.md
+     * §2.2/§2.3. This used to be the constant itself, which was right only because
+     * every cartridge happens to use the same setup: the BIOS writes SC0MOD = 0x69 and
+     * BR0CR = 0x05 for all of them (measured on ten). A cartridge that programmed
+     * BR0CR = 0x15 would pick phi-T2 instead of phi-T0 -- 4800 bps, four times slower --
+     * and the old code would still have shifted a byte every 3200 cycles.
+     *
+     * For the values every game does use this returns exactly kSerialByteCycles, so the
+     * whole library is bit-identical; only configurations nobody selects change. */
+    int32_t serial_byte_cycles() const;
+
     void serial_tick(uint32_t cycles);
 
     /* --- the on-board calendar IC (RTC), I/O 0x90..0x97 --------------------

@@ -372,6 +372,46 @@ Lower priority, but potentially useful for compatibility experiments and TLCS-90
 5. `../Doc de dev/Final/Doc final uniformise eng/GAME_LOOP.md`
 6. `../Doc de dev/Final/Doc final uniformise eng/DMA.md`
 
+## 11.1 ⚠️ Third-party source used — ATTRIBUTION PENDING (Wilfried to complete)
+
+| What we used | Where it is used | Licence | Status |
+|---|---|---|---|
+| **One figure**: the link exchange (and the idle `F0` heartbeat) runs at **33.39 ms ≈ 2 frames**, measured with a logic analyser on two real consoles | `specs/LINK_CABLE.md` §2.1, DEVLOG 2026-08-03 | **CC-BY-4.0** | 🔓 **no longer required — now derived in-house** (see below); crediting anyway is Wilfried's call |
+
+🔓 **Update, same day: we can now state that figure without them.** `specs/LINK_CABLE.md` §2.1
+derives it from Samurai Shodown! 2 itself — the link tick hangs off the **vertical blank**
+vector (`0x6FCC`, SNK SDK `SysPro.txt`), and its state machine writes its variables on **every
+other** VBlank (20 send frames / 0 quiet frames across 20 link variables). Exchange = 2 ticks =
+2 frames, and the 16.7 ms frame period was already ours from `K2GETechRef.txt`. Corroborated on
+The Last Blade.
+
+**🛑 Update 2, same day — the dependency is gone because the figure is not a platform
+constant at all.** Widening the bench past Samurai Shodown! 2 shows Fatal Fury driving the
+cable on **40 frames out of 40**, against 20/40 for Samurai Shodown! 2 and The Last Blade at
+idle. So "one exchange every 2 frames" describes *a given game's link library in a given
+state*, not the console. This project therefore documents **per-cartridge cadences it measures
+itself** (`specs/LINK_CABLE.md` §2.1) and no longer relies on any single figure.
+
+**So the obligation is discharged on the facts, twice over**: the figure was re-derived
+in-house, and then found not to be general enough to be a target at all. What remains is a
+courtesy call and it is Wilfried's alone: their number *was* read first and used as an early
+comparison. Crediting a source that pointed the way — while owing it nothing legally — is a
+judgement about how one wants to behave, not a licence requirement.
+
+Scope, so the obligation stays small and exact:
+
+- **Only that number is used.** No source file, no data file, no capture was copied into
+  this repository.
+- The same project's emulator core is **GPL-2.0** and is deliberately **not** used — that
+  would contaminate this codebase and breaks the "no third-party emulator" rule.
+- Two claims in its protocol documentation were **checked against Wilfried's own cartridge
+  dumps and found to over-generalise**, so they are not relied on: identity byte 1 is not
+  always `01` (The Last Blade sends `02`), and a catalog mismatch does **not** prevent
+  linking (Card Fighters SNK `0x0067` and Capcom `0x0068` link fine).
+
+⚠️ No upstream repository URL ships with the archive — finding it is part of writing the
+credit properly.
+
 ## 12. Ignore For Now
 
 These are not a priority for the emulator roadmap right now:
