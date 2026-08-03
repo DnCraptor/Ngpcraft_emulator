@@ -244,6 +244,14 @@ why. `Shell._one_link_at_a_time()` keeps the two online modes (and the local cab
 mutually exclusive: both at once is two relays over one FIFO and two writers of one
 controller port.
 
+**The reason a match ended stays on screen for `PlayPage.MIRROR_ERROR_MS` = 15 s**, and
+goes through `_flash`, not a bare `overlay.setText`. It is the only account the player
+has, and a session can die in under a second — faster than a short flash can be read.
+⚠️ `_flash` keeps **one** owned timer and restarts it. It used to build a new one per
+message and leave the old one running, so an *older* countdown erased a *newer*
+message: `attach_mirror` flashes "mirror ready" for 2.5 s, which is exactly the window
+in which a session that fails at once dies. The player was told, and then untold.
+
 The debugger's Link tab tap is handed to the mirror's in-process cable
 (`set_link_monitor`), or it would read zero bytes on a busy cable.
 
@@ -273,8 +281,12 @@ hands the pipe straight to the session passes `close=False`.
 
 ## 8. Limits, stated plainly
 
-Same BIOS and same build on both sides (the cartridges may differ, and each player's
-save rides along inside their image) · the session starts
+Same BIOS and same build on both sides (the cartridges may differ, each player's save
+rides along inside their image, and the per-player console settings of §4.2b are copied
+rather than required to match) · **the same build means the same EXECUTABLE, and the
+fingerprint cannot check that**: `core_fingerprint()` hashes the native core, so two
+builds whose Python differs but whose DLL does not accept each other and then fail
+anyway. Compare the .exe's date, not a number in a dialog · the session starts
 from power-on, nobody joins a match in progress · an input that has not arrived stalls
 BOTH sides for that frame (this is what a rollback layer would remove) · the local
 2-player mode gains nothing, it is already at full speed · the **console schedule is in
@@ -284,7 +296,7 @@ needs the **server redeployed**; without it every room reads as a cable room.
 
 ## 9. Validation
 
-`tests/test_netplay_mirror.py` — 22 test functions, 24 cases with parametrisation: the
+`tests/test_netplay_mirror.py` — 34 test functions, 36 cases with parametrisation: the
 session logic against a list-based pipe (no ROM needed), **four real consoles** (two
 PCs' worth of session, the probe ROM, a delayed wire) proving both PCs stay
 byte-identical while every frame still runs, the **real `Shell`** in mirror mode over a
@@ -293,3 +305,21 @@ test doubles as the control group), and a lobby room starting the link it advert
 (with a room that advertises none as the control). The room protocol itself is proved
 against the **real server** in `tests/test_lobby.py`. Every behavioural fix in this
 spec was checked by removing it and watching its test fail.
+
+⚠️ **A loopback socketpair is not a wire.** It is symmetric and drains as fast as it
+fills, so it cannot show a full send buffer — which is where §3c's deadlock lived,
+invisible to a green suite. The trade tests use `_Trickle`, a socket double that
+accepts `cap` bytes per call, and one of them runs the real `Shell._pump_mirror_bringup`
+over it. A second trap in the same tests: an "image" of repeating bytes compresses to a
+few hundred bytes and fits in any buffer, proving nothing — they use
+`random.Random(n).randbytes()`.
+
+🧪 **Two real `Shell`s, one socket** (`scratchpad/two_shells_mirror.py`, outside the
+repo): nothing in the suite does this — the far end there is always a bare
+`CartExchange`, so `_start_mirror` had only ever run on ONE side of a trade. Card
+Fighters' Clash SNK + Capcom: trade plus 600 frames, no desync, no exception. Worth
+rebuilding when the bring-up changes.
+
+✅ **Played on two real PCs over a LAN, 2026-08-04** — the first mirror session outside
+a bench. Still unproven by hand: the open internet, the lobby transport, and a long
+match (a desync has time to appear).

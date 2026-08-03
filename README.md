@@ -580,14 +580,22 @@ player toolbar's **🔗** button:
 - **🪞 Mirror play — host / join** — the *other* online mode, for when your ping is the
   problem (also reachable from the lobby above, as a 🪞 room). Instead of sending the cable's bytes, each PC runs **both** consoles and only
   the **controller bytes** cross the network, so the cable is local and the delay is spent
-  on slightly late controls rather than on the speed of the game. Both players type the
-  **same input delay** (roughly ping-in-ms / 17, plus one). The two consoles swap their
+  on slightly late controls rather than on the speed of the game. **Only the host picks the
+  input delay** (roughly ping-in-ms / 17, plus one); whoever joins takes the host's, so
+  there is no number for two people to get wrong. Hosting shows you your own address, the
+  same panel as the direct cable mode. The two consoles swap their
   cartridges when the session opens — a few MiB, once, with progress on screen — so you
   may hold **different games and different saves**, exactly like two people with two
-  cartridges. What must match is the **BIOS and the emulator build**, because those
+  cartridges. Your own settings travel with your console too (cartridge language, NGP or
+  NGPC, flash size), so the other PC mirrors *your* machine rather than rebuilding it from
+  theirs. What must match is the **BIOS and the emulator build**, because those
   decide how the code runs; it refuses to start otherwise, since a mismatch does not
   fail loudly, it drifts. Savestates, rewind and reset are refused during a mirror match
   for the same reason.
+
+  ⚠️ **"Same build" means the same .exe on both PCs** — compare the file's date, not a
+  version shown anywhere. The check behind it inspects the emulation core, and two builds
+  can share a core while differing elsewhere: they will accept each other and fail anyway.
 
 Both players must run a **compatible game** (same title), exactly like real hardware.
 
