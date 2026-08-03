@@ -253,6 +253,53 @@ def test_queuing_a_frame_wakes_the_socket_thread():
     c.close()
 
 
+def test_the_relay_says_how_far_behind_it_is(app):
+    """⚡ BACKPRESSURE, FOR THE MODE THAT ACTUALLY NEEDS IT.
+
+    The cable puts a byte or two a frame through this client and can never outrun the
+    wire. Mirror play trades a whole CARTRIDGE through the same relay, at eight 32 KiB
+    chunks per 16 ms tick -- 16 MB a second offered to a link that will not take it.
+    With no way to ask how far behind the relay is, the surplus piles up in this
+    client's queue (a whole compressed cartridge, on top of the two copies the trade
+    already holds) and the trade's progress counts bytes that never left the PC.
+    `core.netplay.CartExchange` reads `LobbyPipe.pending` and stops cutting chunks.
+    """
+    from core.lobby import LobbyPipe
+
+    # Nothing is draining this one, so what it owes is unambiguous.
+    idle = LobbyClient("127.0.0.1", 1, "nobody")
+    idle_pipe = LobbyPipe(idle)
+    assert idle_pipe.pending == 0
+    idle_pipe.send(b"x" * 5000)
+    assert idle_pipe.pending >= 5000, "a queued cartridge chunk is not counted as owed"
+    idle.close()
+
+    # And through the real relay, what it owes comes back to zero once the bytes have
+    # actually crossed -- otherwise the trade would never call itself finished.
+    port = _start_server()
+    box = {"room": None, "host_joined": None, "guest_joined": None}
+    host = LobbyClient("127.0.0.1", port, "P1")
+    host.created.connect(lambda r: box.__setitem__("room", r))
+    host.joined.connect(lambda o: box.__setitem__("host_joined", o))
+    host.start()
+    assert _wait(app, lambda: host._sock is not None)
+    host.create("room", "probe", public=True)
+    assert _wait(app, lambda: box["room"])
+    guest = LobbyClient("127.0.0.1", port, "P2")
+    guest.joined.connect(lambda o: box.__setitem__("guest_joined", o))
+    guest.start()
+    assert _wait(app, lambda: guest._sock is not None)
+    guest.join(box["room"])
+    assert _wait(app, lambda: box["host_joined"] and box["guest_joined"])
+
+    payload = bytes(range(256)) * 128                 # 32 KiB: one cartridge chunk
+    LobbyPipe(host).send(payload)
+    assert _wait(app, lambda: len(guest._rx_serial) >= len(payload), timeout=10)
+    assert _wait(app, lambda: LobbyPipe(host).pending == 0), (
+        f"still {LobbyPipe(host).pending} bytes owed after they all arrived")
+    host.close(); guest.close()
+
+
 def test_a_full_kernel_buffer_neither_drops_bytes_nor_kills_the_link(app):
     """`sendall()` on a NON-blocking socket raises BlockingIOError as soon as the
     kernel buffer is full -- and BlockingIOError is an OSError, so the loop read a

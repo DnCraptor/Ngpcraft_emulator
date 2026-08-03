@@ -58,6 +58,13 @@ class LobbyClient(QObject):
         self._pseudo = pseudo[:24]
         self._sock: socket.socket | None = None
         self._out: queue.Queue[bytes] = queue.Queue()
+        # Bytes handed to us that the socket has not taken yet -- queued here or held
+        # in the pump's own buffer. The cable mode never needs this (one byte a frame),
+        # but the MIRROR trades a whole cartridge through the same relay, and a sender
+        # with no idea how far behind it is queues megabytes a second into a link that
+        # cannot take them. Read through LobbyPipe.pending.
+        self._owed = 0
+        self._owed_lock = threading.Lock()
         self._rx_serial: deque[int] = deque()      # received serial bytes
         self._running = False
         self._thread: threading.Thread | None = None
@@ -99,9 +106,20 @@ class LobbyClient(QObject):
             pass                           # full (thread is behind) or closed: harmless
 
     # ---- control API (called from the Qt thread) ---------------------------
-    def _send_control(self, obj: dict) -> None:
-        self._out.put(_frame(FRAME_CONTROL, json.dumps(obj).encode("utf-8")))
+    @property
+    def owed(self) -> int:
+        """Bytes queued for the peer that have not reached the socket yet."""
+        with self._owed_lock:
+            return self._owed
+
+    def _enqueue(self, frame: bytes) -> None:
+        with self._owed_lock:
+            self._owed += len(frame)
+        self._out.put(frame)
         self._wake()
+
+    def _send_control(self, obj: dict) -> None:
+        self._enqueue(_frame(FRAME_CONTROL, json.dumps(obj).encode("utf-8")))
 
     def create(self, name: str, game: str, public: bool, password: str = "",
                mode: str = "cable", delay: int = 0) -> None:
@@ -128,8 +146,7 @@ class LobbyClient(QObject):
     # ---- serial relay (called from the Qt tick via LobbyLink) --------------
     def send_serial(self, data: bytes) -> None:
         if data:
-            self._out.put(_frame(FRAME_RELAY, data))
-            self._wake()
+            self._enqueue(_frame(FRAME_RELAY, data))
 
     def read_serial(self) -> bytes:
         n = len(self._rx_serial)
@@ -188,6 +205,8 @@ class LobbyClient(QObject):
                     # reports what it took; the rest waits here for the next pass.
                     sent = self._sock.send(pending)
                     del pending[:sent]
+                    with self._owed_lock:
+                        self._owed = max(0, self._owed - sent)
                 except (BlockingIOError, InterruptedError):
                     pass
                 except OSError as e:
@@ -279,6 +298,20 @@ class LobbyPipe:
     def _lose(self, why: str) -> None:
         if self.lost is None:
             self.lost = why or "disconnected"
+
+    @property
+    def pending(self) -> int:
+        """How far behind the relay is, in bytes still owed to the peer.
+
+        ⚡ WHY A LOBBY PIPE NEEDS THIS AT ALL. The cable mode puts a byte or two a
+        frame through here and can never get ahead of the wire. The cartridge trade
+        offers megabytes a second, and without a way to ask "how far behind are you?"
+        it just queues them all: the client's queue grows to hold a whole compressed
+        cartridge on top of the two copies the trade already has, and the progress on
+        screen counts bytes that have not left the PC. `core.netplay` reads this and
+        stops cutting chunks until the relay catches up.
+        """
+        return self.client.owed
 
     def send(self, data: bytes) -> None:
         if data and self.lost is None:

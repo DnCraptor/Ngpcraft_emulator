@@ -14,6 +14,7 @@ does not depend on the network delay**, and the two PCs stay bit-identical.
 from __future__ import annotations
 
 import os
+import random
 import socket
 from pathlib import Path
 
@@ -80,7 +81,8 @@ def _between_tests(request):
 
 
 
-def _bring_up(sh, far_sock, far_image: bytes, cap: int = 4000, announce=None):
+def _bring_up(sh, far_sock, far_image: bytes, cap: int = 4000, announce=None,
+              console=None):
     """Complete the cartridge trade so the shell ends up with a live session.
 
     `Shell._begin_mirror` no longer hands one over on the spot: the two PCs trade
@@ -101,6 +103,10 @@ def _bring_up(sh, far_sock, far_image: bytes, cap: int = 4000, announce=None):
     # ones possible. `announce` overrides it to fake a transfer that arrives different
     # from what was promised.
     far_hs.rom_hash = announce or _image_hash(far_image)
+    if console is not None:
+        # The far player's own console settings, which THIS side must build its mirror
+        # of them from -- they are announced, not agreed on.
+        far_hs.console = dict(console)
     far = CartExchange(SocketPipe(far_sock), far_image, far_hs)
     for _ in range(cap):
         if sh.play._mirror is not None or sh._mirror_boot is None:
@@ -109,6 +115,234 @@ def _bring_up(sh, far_sock, far_image: bytes, cap: int = 4000, announce=None):
         far.pump()
     return far
 
+
+
+class _Trickle:
+    """A socket that only ever accepts `cap` bytes per send.
+
+    Not a caricature: that is exactly what a real non-blocking socket does once its
+    send buffer is full, and `SocketPipe` is built around it -- it keeps the remainder
+    and promises to try again. The bug this doubles for is that nobody ever asked it
+    to try again. A socketpair on loopback hides the whole thing, because the reader
+    drains it as fast as the writer fills it and the buffer is never full.
+    """
+
+    def __init__(self, cap: int = 4096) -> None:
+        self.inbox = bytearray()
+        self.peer: "_Trickle | None" = None
+        self.cap = cap
+
+    @staticmethod
+    def pair(cap: int = 4096) -> tuple["_Trickle", "_Trickle"]:
+        a, b = _Trickle(cap), _Trickle(cap)
+        a.peer, b.peer = b, a
+        return a, b
+
+    def setblocking(self, flag) -> None:
+        pass
+
+    def send(self, data) -> int:
+        n = min(self.cap, len(data))
+        if n:
+            self.peer.inbox += bytes(data[:n])
+        return n
+
+    def recv(self, n: int) -> bytes:
+        if not self.inbox:
+            raise BlockingIOError
+        out = bytes(self.inbox[:n])
+        del self.inbox[:n]
+        return out
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_cartridge_trade_finishes_over_a_wire_that_takes_its_time():
+    """⛔ THE HANG THE PLAYER HIT ON A LAN: "trading cartridge" that never ends.
+
+    The trade cut its image into chunks and handed each one to the pipe, then stopped
+    talking to the pipe altogether once the last chunk was queued. But a socket does
+    not take a 32 KiB chunk whole when its buffer is full -- it takes what fits and
+    KEEPS the rest until it is called again, and it was never called again. Measured
+    with 2 MiB images on a real socketpair with a slow reader: one side reported
+    `done`, progress 100 %, with **1 934 258 bytes still sitting in its own buffer**,
+    while the other stayed frozen at 7.8 % for ever. And it could not recover later:
+    the session that follows only writes when it schedules a new input, and a session
+    waiting for the peer schedules none.
+
+    Both directions must complete on a wire that accepts a few kilobytes at a time.
+    """
+    a_sock, b_sock = _Trickle.pair(cap=4096)
+    # ⚠️ Incompressible on purpose: the trade sends the image through zlib, and a
+    # cartridge-shaped repeating pattern collapses to a few hundred bytes that fit in
+    # any buffer -- a test that proves nothing at all.
+    image_a = random.Random(1).randbytes(96 * 1024)
+    image_b = random.Random(2).randbytes(96 * 1024)
+    kw = dict(bios_hash="B", core_version="C", delay=3)
+    a = netplay.CartExchange(SocketPipe(a_sock), image_a,
+                             Handshake(rom_hash=netplay._image_hash(image_a),
+                                       host=True, **kw))
+    b = netplay.CartExchange(SocketPipe(b_sock), image_b,
+                             Handshake(rom_hash=netplay._image_hash(image_b),
+                                       host=False, **kw))
+    for _ in range(4000):
+        for x in (a, b):
+            if not (x.done or x.failed):
+                x.pump()
+        if a.done and b.done:
+            break
+    assert (a.failed, b.failed) == (None, None)
+    assert a.done and b.done, (
+        f"the trade never finished: {a.progress} / {b.progress}, "
+        f"stranded {a.pipe.pending} / {b.pipe.pending} bytes")
+    assert a.peer_image == image_b and b.peer_image == image_a
+    # And "sent" on screen meant sent: nothing was left holding.
+    assert a.pipe.pending == 0 and b.pipe.pending == 0
+
+
+def test_a_side_is_not_finished_while_it_still_owes_the_peer_bytes():
+    """⛔ WHAT "DONE" MUST MEAN ON AN ASYMMETRIC LINK -- an upload slower than the
+    download, which is most home connections.
+
+    This side can have the peer's whole cartridge in hand long before its own has
+    left. Finishing on "I queued everything" makes the shell stop pumping the trade
+    and hand the transport to the session -- and the peer, still missing the tail,
+    sits at a percentage that never moves. The trade is only over when both
+    directions are.
+    """
+    a_sock, b_sock = _Trickle.pair()
+    a_sock.cap = 64                # our uplink: a trickle
+    b_sock.cap = 1 << 20           # their uplink: everything at once
+    image_a = random.Random(4).randbytes(48 * 1024)
+    image_b = random.Random(5).randbytes(48 * 1024)
+    kw = dict(bios_hash="B", core_version="C", delay=3)
+    a = netplay.CartExchange(SocketPipe(a_sock), image_a,
+                             Handshake(rom_hash=netplay._image_hash(image_a),
+                                       host=True, **kw))
+    b = netplay.CartExchange(SocketPipe(b_sock), image_b,
+                             Handshake(rom_hash=netplay._image_hash(image_b),
+                                       host=False, **kw))
+    for _ in range(30):
+        a.pump(); b.pump()
+    assert a.peer_image is not None, "the fast direction did not even arrive"
+    assert a.pipe.pending > 0, "the slow direction is not behind: nothing is pinned"
+    assert not a.done, "it called the trade over with the peer's tail still here"
+
+    # ...and, pumped like the shell pumps it (a side that says done is let go of), it
+    # still completes in both directions.
+    for _ in range(20000):
+        for x in (a, b):
+            if not (x.done or x.failed):
+                x.pump()
+        if a.done and b.done:
+            break
+    assert a.done and b.done and (a.failed, b.failed) == (None, None)
+    assert b.peer_image == image_a
+
+
+def _trade(delay_a: int, delay_b: int, *, announce_a=None):
+    """Two cartridge trades, cross-wired, run to a standstill. Returns both."""
+    pa, pb = ListPipe.pair()
+    image_a, image_b = b"CART-A" * 500, b"CART-B" * 500
+    kw = dict(bios_hash="B", core_version="C")
+    a = netplay.CartExchange(pa, image_a, Handshake(
+        rom_hash=announce_a or netplay._image_hash(image_a), host=True,
+        delay=delay_a, **kw))
+    b = netplay.CartExchange(pb, image_b, Handshake(
+        rom_hash=netplay._image_hash(image_b), host=False, delay=delay_b, **kw))
+    for _ in range(200):
+        for x in (a, b):
+            if not (x.done or x.failed):
+                x.pump()
+    return a, b
+
+
+def test_the_joiner_adopts_the_host_input_delay_instead_of_being_refused():
+    """⛔ THE REFUSAL THAT LOOKED LIKE A NETWORK FAULT.
+
+    Direct-IP hosting asked BOTH players to type an input delay, and the two numbers
+    had to match exactly or the session was refused -- two people typing the same
+    number is not something to build a mode on. Worse, a refusal is a hang-up, and a
+    TCP socket hung up with unread data sends a RESET, so the player whose settings
+    were fine saw `[WinError 10054]` and nothing else. The lobby already had the
+    joiner follow the host; the trade is where BOTH transports can.
+
+    Nothing has been simulated yet at this point, so there is nothing to be wrong
+    about -- see the session-level test below for where it stops being reconcilable.
+    """
+    a, b = _trade(delay_a=7, delay_b=2)
+    assert (a.failed, b.failed) == (None, None), "a mismatch was still refused"
+    assert a.done and b.done
+    assert b.hs.delay == 7, "the joiner did not take the host's delay"
+    assert a.hs.delay == 7, "the host moved off its own number"
+
+
+def test_a_running_session_refuses_a_delay_it_cannot_adopt_any_more():
+    """The other half of the rule. Once a session exists the delay is baked into
+    frames already played: adopting one would silently make the two PCs play two
+    different matches, which is the exact failure this mode is built to avoid. So the
+    trade reconciles and the session refuses -- and a joiner that somehow failed to
+    adopt is caught here, loudly, by the session's own hello."""
+    a, b = _trade(delay_a=7, delay_b=2)
+    assert b.hs.delay == 7
+    b.hs.delay = 2                          # a joiner that did not really adopt
+    sa = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), a.pipe, a.hs)
+    sb = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), b.pipe, b.hs)
+    sb.step(0)
+    assert sa.step(0) == "rejected"
+    assert sa.rejected == "input_delay"
+
+
+def test_a_refusal_reaches_the_other_player_instead_of_a_bare_reset():
+    """⛔ WHERE THE REASON LIVES AND WHERE THE PLAYER IS LOOKING FOR IT.
+
+    Only ONE side can notice some refusals. Here A announces a hash its own cartridge
+    does not have, so it is B -- the RECEIVER -- that catches it, and it catches it at
+    the END of the transfer, by which time A has everything it needs and has already
+    moved on to its session. Without a word from B, A waits for a player who has
+    gone, and then reports B's hang-up as `[WinError 10054]`: a true statement about a
+    socket that explains nothing.
+
+    So the goodbye has to survive the handover: it lands in what the trade read past
+    its own end (`leftover`), which is exactly what is handed to the session as
+    `prime` -- the same path the opening inputs of a match take.
+    """
+    a, b = _trade(delay_a=3, delay_b=3, announce_a="0123456789abcdef")
+    assert b.failed == "cartridge_transfer_mismatch", "the guard did not fire"
+    assert a.done and a.failed is None, "A had no way to know yet -- that is the point"
+
+    session = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), a.pipe, a.hs,
+                            a.leftover)
+    assert session.step(0) == "rejected"
+    assert session.rejected == "peer_refused: cartridge_transfer_mismatch", (
+        f"the other player was left with {session.rejected!r}")
+
+
+def test_a_socket_error_number_is_translated_before_a_player_sees_it():
+    """10054 is true and useless. Keep it -- it is what a search engine takes -- but
+    lead with what happened."""
+    assert netplay.plain_network_error(
+        "[WinError 10054] Une connexion existante a du etre fermee"
+    ).startswith("peer_closed")
+    assert "10054" in netplay.plain_network_error("[WinError 10054] whatever")
+    assert netplay.plain_network_error("something else") == "something else"
+
+
+def test_a_progress_bar_does_not_reach_100_percent_before_the_bytes_leave():
+    """The bar used to count bytes handed to the socket, not bytes the socket took, so
+    the side that hung showed a confident 100 % -- the reading that sent the player
+    looking at their network instead of at this."""
+    sock, peer = _Trickle.pair(cap=1024)
+    image = random.Random(3).randbytes(64 * 1024)      # incompressible: see above
+    x = netplay.CartExchange(
+        SocketPipe(sock), image,
+        Handshake(rom_hash=netplay._image_hash(image), bios_hash="B",
+                  core_version="C", delay=3, host=True))
+    for _ in range(20):
+        x.pump()
+    assert x.pipe.pending > 0, "the double is not holding anything back"
+    assert x.progress[0] < 1.0
 
 
 class FakeMachine:
@@ -180,6 +414,33 @@ def test_a_frame_whose_input_has_not_arrived_stalls_instead_of_guessing():
     assert outcomes == {"waiting"}, "it made a button up rather than wait"
     assert a.local.frames == frames, "it ran a frame on an input it did not have"
     assert a.stalls >= 5                     # the ping, visible as a number
+
+
+def test_a_waiting_session_keeps_pushing_the_wire():
+    """⛔ THE DEADLOCK BETWEEN TWO POLITE SIDES.
+
+    A session writes to the wire only when it schedules a NEW input, and a session
+    that is waiting for the peer schedules none -- its frame number is not moving. So
+    a byte the socket had refused stayed here for exactly as long as the peer was
+    waiting for it, and if both sides were waiting, neither ever spoke again. It is
+    the same fault as the cartridge trade's, one layer up, and it is why that trade
+    could not fix itself by starting the session anyway.
+
+    Here the wire refuses everything, the session stalls, and then the wire opens: the
+    bytes must leave WITHOUT a new input being scheduled to carry them.
+    """
+    sock, far = _Trickle.pair(cap=0)            # a wire that takes nothing at all
+    pipe = SocketPipe(sock)
+    s = MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), pipe,
+                      Handshake(rom_hash="R", bios_hash="B", core_version="C",
+                                delay=0, host=True))
+    assert s.step(0x11) == "waiting"            # delay 0: frame 0 needs the peer's input
+    assert pipe.pending > 0 and far.inbox == bytearray()
+    sock.cap = 4096                             # the buffer drains, the wire is open
+    for _ in range(5):
+        assert s.step(0x11) == "waiting"        # still nothing new to schedule
+    assert far.inbox, "the session sat on its bytes for as long as it was waiting"
+    assert pipe.pending == 0
 
 
 def test_a_slow_wire_costs_frames_of_delay_but_not_speed():
@@ -782,6 +1043,147 @@ def test_the_two_players_may_hold_DIFFERENT_cartridges(sh, app):
             try: s.close()
             except OSError: pass
         sh.play.detach_mirror()
+        sh.play.stop()
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_the_shell_finishes_the_trade_on_a_wire_that_takes_a_little_at_a_time(sh, app):
+    """The player's report, at the level they hit it: "trading cartridge" on a LAN,
+    stuck, never finishing. Everything below this is unit-tested; this is the same
+    wire under the real `Shell._pump_mirror_bringup`, which is what actually has to
+    come out the other side with a live session.
+    """
+    near, far = _Trickle.pair(cap=256)          # a wire with a very small mouth
+    try:
+        sh.play.start(ROM)
+        sh._begin_mirror(SocketPipe(near), host=True)
+        _bring_up(sh, far, sh.play.session._rom, cap=40000)
+        assert sh.play._mirror is not None, "the trade never finished"
+        assert sh.play._mirror.pipe.pending == 0
+    finally:
+        if sh._net_status is not None:
+            sh._net_status.stop(); sh._net_status = None
+        sh.play.detach_mirror()
+        sh.play.stop()
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_the_peer_console_is_built_from_the_peer_settings(sh, app, monkeypatch):
+    """⛔ THE SILENT DESYNC BEHIND "it connects, both consoles reboot, and it drops".
+
+    Same cartridge, same BIOS, same build -- and still two different machines, because
+    the mirror of the OTHER player's console was built from OUR settings. The cartridge
+    language byte (0x6F87) is per player and a bilingual cart branches on it; the flash
+    capacity went through this PC's setting even though the image already arrives padded
+    to the sender's. Nothing in the fingerprint could see either, so nothing was
+    refused: the two copies drifted, and the checksum ended the match about a second in
+    with the single word "desync".
+    """
+    import ngpc_settings as cfg
+
+    built = {}
+    real_session = shell.NativeSession
+
+    def spy(*a, **kw):
+        built.update(kw)
+        return real_session(*a, **kw)
+
+    s1, s2 = socket.socketpair()
+    try:
+        sh._settings.setValue("general/cart_language", cfg.CART_LANG_EN)
+        # Explicit, and bigger than what the peer will send -- so re-applying it to the
+        # peer's image (the old behaviour) visibly resizes their console.
+        sh._settings.setValue("general/flash_size", cfg.FLASH_16M)
+        sh.play.start(ROM)
+        theirs = sh.play.session._rom[:0x100000]      # their cart is an 8 Mbit one
+        monkeypatch.setattr(shell, "NativeSession", spy)
+        sh._begin_mirror(SocketPipe(s1), host=True)
+        assert sh.play._mono_console() is False, "this test needs a COLOUR local console"
+        _bring_up(sh, s2, theirs,
+                  console={"lang": cfg.CART_LANG_JA, "mono": True})
+        assert sh.play._mirror is not None, "the trade did not finish"
+        assert built.get("language") == cfg.CART_LANG_JA, (
+            "the peer's console was built with OUR cartridge language")
+        assert built.get("flash_size") == len(theirs), (
+            "the peer's console was resized by OUR flash setting")
+        # Two BIOS-less consoles both fingerprint as "hle", so nothing refuses an NGP
+        # playing an NGPC -- the mirror has to be told which one the peer is.
+        assert built.get("k1ge_console") is True, (
+            "the peer's console was built as OUR machine type")
+    finally:
+        sh._settings.remove("general/flash_size")
+        if sh._net_status is not None:
+            sh._net_status.stop(); sh._net_status = None
+        for s in (s1, s2):
+            try: s.close()
+            except OSError: pass
+        sh.play.detach_mirror()
+        sh.play.stop()
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_a_newer_message_is_not_wiped_by_an_older_flash(sh, app):
+    """⛔ WHY THE PLAYER COULD NOT READ THE ERROR.
+
+    Every `_flash` used to build ITS OWN timer, parented to the page and left running.
+    A later message therefore inherited an earlier message's countdown: `attach_mirror`
+    flashes "mirror ready" for 2.5 s, so a session that died inside those 2.5 s had its
+    reason wiped about a second later. The one thing the player needed in order to say
+    what had happened.
+    """
+    import time
+
+    sh.play.start(ROM)
+    try:
+        sh.play._flash("first", 60)              # a short one, still counting
+        sh.play._flash("second", 30_000)         # ...and the real message after it
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        assert sh.play.overlay.text() == "second", (
+            "an older flash's timer erased a newer message")
+    finally:
+        sh.play.stop()
+
+
+@pytest.mark.skipif(not (BIOS.exists() and ROM.exists()),
+                    reason="needs the retail bios.bin (gitignored) and the probe ROM")
+def test_hosting_a_mirror_game_shows_the_host_its_own_address(sh, app, monkeypatch):
+    """"Listening on port 7789" is not an address, and the other player has no other
+    way to reach this PC. The cable mode has shown this panel -- LAN address, detected
+    public one, a line to paste -- since it existed; the mirror was never wired to it,
+    so hosting one meant going and finding your own IP by hand.
+    """
+    import ngpc_lobby
+
+    built = []
+
+    class FakeHostInfo:
+        def __init__(self, game, port, lang, parent=None):
+            built.append((game, port))
+
+        def show(self):
+            pass
+
+    monkeypatch.setattr(ngpc_lobby, "HostInfoDialog", FakeHostInfo)
+    monkeypatch.setattr(shell.QInputDialog, "getInt",
+                        staticmethod(lambda *a, **k: (7999, True)))
+    monkeypatch.setattr(shell.Shell, "_ask_mirror_delay", lambda self: True)
+    # ⚠️ No real listener: a QThread left blocked in accept() and torn down with the
+    # test is a Qt-level abort, not a test failure -- and it lands on whoever runs
+    # next. What this test is about is one wire: hosting must build the panel.
+    monkeypatch.setattr(shell.Shell, "_start_net", lambda *a, **k: None)
+    try:
+        sh.play.start(ROM)
+        sh._host_mirror()
+        assert built == [(ROM.stem, 7999)], (
+            "hosting a mirror game never told the host its address")
+    finally:
+        sh._mirror_pending = None
         sh.play.stop()
 
 

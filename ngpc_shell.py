@@ -3817,11 +3817,21 @@ class PlayPage(QWidget):
         it looked exactly like a bug in somebody else's tests. A QTimer PARENTED to the
         page is destroyed with the page, so the call cannot outlive its target; the
         callback still guards, because a page can be deleted while the timer is queued.
+
+        ⛔ ...AND ONE TIMER, RESTARTED -- not a new one per message. A second `_flash`
+        used to leave the FIRST one running (parented to the page, so alive and still
+        connected), and when it expired it wiped a message that was newer than itself.
+        That is not cosmetic: `attach_mirror` flashes "mirror ready" for 2.5 s, so a
+        mirror session that ended inside those 2.5 s had its reason erased about a
+        second later -- "the connection drops and I have no time to read the error".
+        The one thing the player needed in order to say what went wrong.
         """
         self.overlay.setText(msg)
-        self._overlay_timer = QTimer(self)
-        self._overlay_timer.setSingleShot(True)
-        self._overlay_timer.timeout.connect(self._clear_overlay)
+        if getattr(self, "_overlay_timer", None) is None:
+            self._overlay_timer = QTimer(self)
+            self._overlay_timer.setSingleShot(True)
+            self._overlay_timer.timeout.connect(self._clear_overlay)
+        self._overlay_timer.stop()
         self._overlay_timer.start(ms)
 
     def _clear_overlay(self) -> None:
@@ -4612,6 +4622,11 @@ class PlayPage(QWidget):
     # than on speed. Both modes stay: this one is faster, the other one is the one
     # that works with a peer who has a different save, a different BIOS or a
     # different build.
+    # How long the reason a mirror match ended stays on screen. Long: it is the only
+    # thing the player can tell anybody afterwards, and a session can die in under a
+    # second -- fast enough that a short flash is gone before it is read.
+    MIRROR_ERROR_MS = 15_000
+
     def attach_mirror(self, session, peer_session) -> None:
         """`session` is a core.netplay.MirrorSession already wired to the transport;
         `peer_session` is the second console's NativeSession, kept so it can be
@@ -4637,14 +4652,19 @@ class PlayPage(QWidget):
         # session waits for an input that will never come, for ever, showing "waiting
         # for the other player" -- the same failure the cable mode had to fix (see
         # core.link.TcpLink.lost) and just as unreadable from the player's seat.
+        # ⚡ A REASON THE PLAYER CAN ACTUALLY READ. These three lines are the only
+        # account of why a match ended, and they were plain `setText`, so the next
+        # `_flash` timer still counting down from "mirror ready" erased them a second
+        # later. Flashed, and for long enough to read and repeat back.
         lost = getattr(self._mirror.pipe, "lost", None)
         if lost:
-            self.overlay.setText(t("link_lost").format(why=lost))
+            self._flash(t("link_lost").format(why=lost), self.MIRROR_ERROR_MS)
             self.mirror_ended.emit(str(lost))
             return None
         result = self._mirror.step(self._joypad_byte())
         if result == "rejected":
-            self.overlay.setText(t("mirror_refused").format(why=self._mirror.rejected))
+            self._flash(t("mirror_refused").format(why=self._mirror.rejected),
+                        self.MIRROR_ERROR_MS)
             self.mirror_ended.emit(str(self._mirror.rejected))
             return None
         if result == "waiting":
@@ -4660,7 +4680,7 @@ class PlayPage(QWidget):
             # pretending otherwise would let the match carry on as a fiction. The frame
             # itself DID run, so it is still counted -- only the session ends.
             self._mirror_desynced = True
-            self.overlay.setText(t("mirror_desync"))
+            self._flash(t("mirror_desync"), self.MIRROR_ERROR_MS)
             self.mirror_ended.emit("desync")
         # The session already ran our console's frame; hand back a summary for the
         # crash/breakpoint checks the rest of _tick does.
@@ -6000,6 +6020,16 @@ class Shell(QMainWindow):
         self._start_net("host", "", int(port),
                         cfg.tr(cfg.language(self._settings), "link_waiting")
                         .format(port=port))
+        # ⛔ THE HOST HAS TO BE TOLD ITS OWN ADDRESS -- there is no other way for the
+        # other player to reach it, and "listening on port 7789" is not an address. The
+        # cable mode has shown this panel (LAN address, auto-detected public one, a
+        # ready-to-paste line) since it existed; the mirror was simply never wired to
+        # it, so hosting a mirror game meant going and finding your IP by hand.
+        import ngpc_lobby
+        game = self.play._rom_path.stem if self.play._rom_path else "?"
+        self._host_info = ngpc_lobby.HostInfoDialog(
+            game, int(port), cfg.language(self._settings), self)
+        self._host_info.show()
 
     def _join_mirror(self) -> None:
         if self.play.machine is None or self._one_link_at_a_time(True):
@@ -6011,8 +6041,12 @@ class Shell(QMainWindow):
             return
         host, _, pt = text.strip().partition(":")
         port = int(pt) if pt.strip().isdigit() else 7789
-        if not self._ask_mirror_delay():
-            return
+        # ⛔ NOT ASKED FOR ANY MORE. The input delay has to be identical on both PCs,
+        # and asking two people to type the same number is not a design -- any
+        # difference refused the session, and a refusal is a hang-up, which the other
+        # player saw as a bare `[WinError 10054]`. The host's number is the one that
+        # counts; this side takes it from the handshake, exactly as the lobby already
+        # did (core.netplay.Handshake.check).
         self._mirror_pending = "join"
         self._start_net("join", host.strip(), port,
                         cfg.tr(cfg.language(self._settings), "link_connecting")
@@ -6099,6 +6133,18 @@ class Shell(QMainWindow):
             # mismatch), so when the room advertises one, that is the one -- the joiner
             # follows the host rather than its own setting.
             delay=(cfg.mirror_delay(self._settings) if delay is None else int(delay)),
+            # ⚡ ...and the per-player settings that shape THIS console, so the other PC
+            # can build its mirror of it the same way. Not a thing to agree on -- a
+            # thing to copy, like the cartridge. The cartridge LANGUAGE byte (0x6F87)
+            # is per player and a bilingual cart branches on it, so a mirror built from
+            # the local setting was a different machine and the match died on its own
+            # checksum, saying only "desync".
+            #
+            # Mono/colour follows the selected BIOS, which the fingerprint compares --
+            # EXCEPT when the BIOS is simulated: an NGP and an NGPC running without a
+            # BIOS file both fingerprint as "hle", and they are not the same console.
+            console={"lang": int(cfg.cart_language(self._settings)),
+                     "mono": bool(self.play._mono_console())},
             host=host)
 
     def _begin_mirror(self, pipe, host: bool, delay: int | None = None) -> None:
@@ -6146,7 +6192,8 @@ class Shell(QMainWindow):
         lang = cfg.language(self._settings)
         if x.failed:
             self._end_mirror_bringup()
-            self.play._flash(cfg.tr(lang, "mirror_refused").format(why=x.failed))
+            self.play._flash(cfg.tr(lang, "mirror_refused").format(why=x.failed),
+                             PlayPage.MIRROR_ERROR_MS)
             return
         if not x.done:
             up, down = x.progress
@@ -6188,12 +6235,18 @@ class Shell(QMainWindow):
             page._rom_path, rom_bytes=peer_image, autosave=False,
             bios_path=page._bios_path(), real_bios=page._real_bios,
             save_to_rom=False, sidecar=False,
-            # ⛔ Sized from the IMAGE, not from this PC's flash setting. The setting is
-            # per-player; sizing the peer's console by it would build a different
-            # machine on each side of the same match.
-            flash_size=cfg.flash_capacity_bytes(self._settings, len(peer_image)),
-            k1ge_console=page._mono_console(),
-            language=cfg.cart_language(self._settings),
+            # ⛔ Sized from the IMAGE, and ONLY from the image. The peer's session
+            # already padded its cartridge up to its own flash capacity before sending
+            # it, so the image's length IS that capacity. Passing it through
+            # `flash_capacity_bytes` re-applied OUR setting on top -- an explicit
+            # 16 Mbit here turned a peer's 8 Mbit cart into a 16 Mbit one, which is a
+            # different machine on each side of the same match. The comment said "from
+            # the image"; the code still asked this PC.
+            flash_size=len(peer_image),
+            k1ge_console=bool(hs.peer_console.get("mono", page._mono_console())),
+            # ⚡ THEIR cartridge-language setting, not ours: it is a property of the
+            # console being mirrored (0x6F87), and a bilingual cart branches on it.
+            language=int(hs.peer_console.get("lang", cfg.cart_language(self._settings))),
             hle_bios=resolve_selected_bios(self._settings)[1] == cfg.BIOS_USE_HLE)
         # ⚡ AND THE SAME TIMING. PlayPage.start tunes its machine AFTER building it
         # (silicon-calibrated cart wait-states); a mirror built without them executes
