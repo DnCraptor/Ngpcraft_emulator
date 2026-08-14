@@ -378,8 +378,19 @@ STATE_SLOTS = 8
 # somewhere else. The main CPU thinks it already asked for that music, so it never asks
 # again -- until the game changes scene and issues a fresh command, which is exactly the
 # "a scene change fixes it" in the bug report. v1 files still load (without the block).
+#
+# ⛔ v2 SNAPSHOTS HAD NO CABLE, AND A LINKED SESSION RESTORED TO THE WRONG ONE. Same
+# family, one subsystem over: serial channel 0's FIFOs, shift register and handshake
+# pins live in the core's Machine, not in the image, so a v2 restore was a NO-OP on the
+# cable. MEASURED 2026-08-04: captured at rx_depth=2, ran 30 frames to rx_depth=3,
+# restored -- every field stayed at the post-30-frame value; and two re-simulations from
+# the "same" restored state diverged by one cable byte in 60 frames. Reachable wherever
+# F2 and rewind are live in a cabled session (local 2P, direct-IP; mirror refuses them
+# for its own reason). v3 adds core.native.LinkState. v1 and v2 files still load, each
+# without the blocks it predates. See LINK_NETPLAY_STUDY.md.
 STATE_MEM_LEN = 0x00C000
-STATE_MAGIC = b"NGPCST02"
+STATE_MAGIC = b"NGPCST03"
+STATE_MAGIC_V2 = b"NGPCST02"
 STATE_MAGIC_V1 = b"NGPCST01"
 CRASH_DIR = REPO / "crashes"
 # stop_status codes the core reports; the ones here mean the ROM did something the CPU
@@ -2730,6 +2741,7 @@ class PlayPage(QWidget):
     mirror_ended = pyqtSignal(str)        # a mirror session refused or desynced
     net_mirror_host_requested = pyqtSignal()   # 🔗 : host a MIRROR game
     net_mirror_join_requested = pyqtSignal()   # 🔗 : join a MIRROR game
+    net_cancel_requested = pyqtSignal()   # 🔗 : take back a host/join not yet connected
     link_frame_requested = pyqtSignal()   # 🔗 : both consoles inside one window
 
     def __init__(self, settings, library: lib.Library) -> None:
@@ -2746,6 +2758,9 @@ class PlayPage(QWidget):
         # for our own tick to collect them. See _run_frame_interleaved.
         self._prerun = deque()
         self._net_link = None                # a core.link.TcpLink, when linked online
+        # True while a direct host/join is still looking for its peer. The shell owns
+        # the attempt; this is the page's copy, so the 🔗 menu can offer to cancel it.
+        self.net_pending = False
         # Mirror netplay (core/netplay.py): both consoles run HERE and only the
         # controller bytes cross the network. None = not in that mode.
         self._mirror = None
@@ -3035,7 +3050,14 @@ class PlayPage(QWidget):
             language=cfg.cart_language(self._settings),
             # The HLE image has no BIOS setup screen, so there the UI setting is the
             # console's only control panel. With a real BIOS, the BIOS owns it.
-            hle_bios=resolve_selected_bios(self._settings)[1] == cfg.BIOS_USE_HLE)
+            hle_bios=resolve_selected_bios(self._settings)[1] == cfg.BIOS_USE_HLE,
+            # ⚡ PLAYER 2 IS A SECOND CONSOLE, not a second window onto the first.
+            # Both pages are built here, so without this they shared one coin cell:
+            # the same clock down to the crystal's sub-second phase, and a write-back
+            # race where the last window closed stamped its time over the other's.
+            # `set_player(2)` runs before `start()`, so this is already right.
+            # See NativeSession.second_console for the measurements.
+            second_console=(self._player == 2))
         self.machine = self.session.machine
         if self._link_peer is not None:          # keep the cable live across a restart
             self.machine.serial_set_enabled(True)
@@ -3046,7 +3068,10 @@ class PlayPage(QWidget):
             self.machine.set_cart_data_wait(cfg.CART_DATA_WAIT)
             # LDIR block-copy timing: the last, strongly-evidenced but not-yet-ROM-confirmed
             # piece that takes self-timed games (Cool Boarders) to their hardware 30fps.
+            # Priced per width -- the word form moves two bytes an iteration and Bomberman's
+            # raster copier measures it at 18 (see cfg.CART_LDIRW_COST).
             self.machine.set_ldir_cost(cfg.CART_LDIR_COST)
+            self.machine.set_ldirw_cost(cfg.CART_LDIRW_COST)
         self.watches.rearm()
         self.apply_debug()                 # arm breakpoints + write-log for this ROM
         self._rebuild_rewind_buffer()      # pick up any rewind-length change
@@ -3226,14 +3251,87 @@ class PlayPage(QWidget):
             return True
         return super().event(e)
 
-    def _toggle_pause(self) -> None:
-        self.paused = not self.paused
+    # ---- two consoles on one PC move TOGETHER ------------------------------
+    # ⛔ THE BUG THIS ENDS, reported by a homebrew author building a link game:
+    # "if you adjust the speed (or pause) in one session, it would be useful to
+    # apply the same adjustment to the other side". It is not a convenience --
+    # it is a desync. `_run_frame_relaying` deliberately refuses to drive a peer
+    # that is paused or rewinding (a console must stay where the user put it), so
+    # pausing ONE window left the OTHER console running alone against a partner
+    # that had stopped answering, and the game's own link protocol timed out.
+    # Speed is the same story one step down: one console at 0.25x and the other
+    # at 1x are two consoles that no longer agree on when a byte is due.
+    #
+    # 🔑 MIRROR NETPLAY IS DELIBERATELY NOT INCLUDED, and that is not an oversight.
+    # There both consoles run on BOTH PCs from one shared input stream, and
+    # `MirrorSession.step()` returns "waiting" until the peer's input for THIS
+    # frame has arrived (core/netplay.py) -- so neither PC can run ahead of the
+    # other whatever its speed dial says. The mode is already self-limiting:
+    # nothing to propagate, and nothing to refuse either.
+    def _link_both(self, apply) -> None:
+        """Run `apply` on this console and, in local 2-player, on the peer too.
+
+        `apply` takes a PlayPage and must be one of the `_apply_*` helpers below,
+        which never mirror in turn -- so the propagation lives HERE and only here
+        and there is no way to build a loop out of it.
+        """
+        apply(self)
+        peer = self._link_peer
+        if peer is not None and peer is not self and peer.machine is not None:
+            apply(peer)
+
+    def _apply_pause(self, on: bool) -> None:
+        self.paused = bool(on)
         self.overlay.setText(
             cfg.tr(cfg.language(self._settings), "paused") if self.paused else "")
 
+    def _pause_peer(self, on: bool) -> None:
+        """Pause/resume ONLY the linked peer. For callers that already own what
+        their own console shows -- the pause MENU draws itself over the screen, so
+        it must not also get the "paused" banner underneath, while player 2, who
+        sees no menu at all, needs to be told why their console just stopped."""
+        peer = self._link_peer
+        if peer is not None and peer is not self and peer.machine is not None:
+            peer._apply_pause(on)                            # noqa: SLF001
+
+    def _apply_ff(self, on: bool, *, flush_audio: bool, sync_button: bool = False) -> None:
+        """`flush_audio` keeps the two callers' behaviour exactly as it was: the
+        toolbar toggle drops the queued audio (a stale fast-forward backlog froze
+        the loop), the held hotkey only restarts the wall clock.
+
+        ⚠️ `sync_button` is for the TOGGLE path only. The held hotkey must leave the
+        toolbar button alone: releasing it restores whatever the button says, so a
+        press that also ticked the button would make fast-forward stick on release.
+        """
+        self._ff = bool(on)
+        btn = getattr(self, "_ff_btn", None)
+        if sync_button and btn is not None and btn.isChecked() != self._ff:
+            btn.blockSignals(True)       # ...or the peer's toggle calls us straight back
+            btn.setChecked(self._ff)
+            btn.blockSignals(False)
+        if flush_audio:
+            self._reset_pacing()
+        else:
+            self.wall_last = time.perf_counter(); self.debt = 0.0
+
+    def _apply_speed(self, speed: float) -> None:
+        self._speed = speed
+        self._reset_pacing()
+        if hasattr(self, "_speed_lbl"):
+            self._speed_lbl.setText(f"{self._speed:g}×")
+        self._flash(cfg.tr(cfg.language(self._settings), "speed").format(x=self._speed))
+
+    def _toggle_pause(self) -> None:
+        want = not self.paused
+        self._link_both(lambda pg: pg._apply_pause(want))    # noqa: SLF001 -- sibling page
+
     def _begin_fast_forward(self) -> None:
-        self._ff = True
-        self.wall_last = time.perf_counter(); self.debt = 0.0
+        self._link_both(lambda pg: pg._apply_ff(True, flush_audio=False))  # noqa: SLF001
+
+    def _end_fast_forward(self) -> None:
+        """Releasing the hotkey returns to whatever the toolbar's toggle says."""
+        on = self._ff_btn.isChecked()
+        self._link_both(lambda pg: pg._apply_ff(on, flush_audio=False))    # noqa: SLF001
 
     def _hotkey_actions(self) -> dict:
         """action id -> what it does. Every entry must exist in cfg.HOTKEYS, and
@@ -3276,9 +3374,7 @@ class PlayPage(QWidget):
         """What ends a held hotkey. Only cfg.HOLD_HOTKEYS need an entry."""
         return {
             # releasing fast-forward returns to whatever the toolbar's toggle says
-            cfg.HK_FF: lambda: (setattr(self, "_ff", self._ff_btn.isChecked()),
-                                setattr(self, "wall_last", time.perf_counter()),
-                                setattr(self, "debt", 0.0)),
+            cfg.HK_FF: self._end_fast_forward,
             cfg.HK_REWIND: self.stop_rewind,
         }
 
@@ -3782,8 +3878,8 @@ class PlayPage(QWidget):
             self._open_audio()
 
     def _set_ff(self, on: bool) -> None:
-        self._ff = bool(on)
-        self._reset_pacing()
+        self._link_both(                                                 # noqa: SLF001
+            lambda pg: pg._apply_ff(on, flush_audio=True, sync_button=True))
 
     # ---- save states (per-ROM slots) --------------------------------------
     def _state_path(self, slot: int) -> Path | None:
@@ -3853,17 +3949,20 @@ class PlayPage(QWidget):
     def _capture_state(self) -> bytes:
         return (bytes(self.machine.cpu())
                 + bytes(self.machine.aux_state())
+                + bytes(self.machine.link_state())
                 + self.machine.read(0, STATE_MEM_LEN))
 
-    def _apply_state(self, body: bytes, aux: bool = True) -> None:
+    def _apply_state(self, body: bytes, aux: bool = True, link: bool = True) -> None:
         # Frames a link peer ran ahead for us describe the console we are about to
         # overwrite; collecting them after the load would report work this timeline
         # never did (and rewind calls this for every step).
         self._prerun.clear()
         cpu_len = ctypes.sizeof(type(self.machine.cpu()))
         aux_len = ctypes.sizeof(native.AuxState) if aux else 0
+        link_len = ctypes.sizeof(native.LinkState) if link else 0
+        head = cpu_len + aux_len + link_len
         cpu = type(self.machine.cpu()).from_buffer_copy(body[:cpu_len])
-        mem = body[cpu_len + aux_len:cpu_len + aux_len + STATE_MEM_LEN]
+        mem = body[head:head + STATE_MEM_LEN]
         self.machine.write(0, mem)
         self.machine.set_cpu(cpu)
         # ⚠️ AFTER the image, never before. Writing the image goes through the control
@@ -3873,6 +3972,12 @@ class PlayPage(QWidget):
         if aux:
             st = native.AuxState.from_buffer_copy(body[cpu_len:cpu_len + aux_len])
             self.machine.set_aux_state(st)
+        # ...and the cable after the image for the same shape of reason: SC0MOD/BR0CR
+        # live in the image and decide how fast a byte shifts.
+        if link:
+            ls = native.LinkState.from_buffer_copy(
+                body[cpu_len + aux_len:cpu_len + aux_len + link_len])
+            self.machine.set_link_state(ls)
 
     def save_state(self, slot: int | None = None) -> None:
         if self.machine is None:
@@ -3897,12 +4002,17 @@ class PlayPage(QWidget):
             self._flash(cfg.tr(cfg.language(self._settings), "state_empty").format(n=slot + 1))
             return
         blob = path.read_bytes()
-        # A v1 file predates the sound block: load it as it was written (the music will
-        # still need a scene change), rather than refuse a state the user already has.
+        # An older file predates a block: load it as it was written, rather than refuse
+        # a state the user already has. v1 has no sound block (the music will still need
+        # a scene change); v2 has no cable block (a state taken mid-transfer restores the
+        # channel the machine happens to be holding -- which is exactly what v2 always
+        # did, so nothing gets worse by loading one).
         if blob.startswith(STATE_MAGIC):
             self._apply_state(blob[len(STATE_MAGIC):])
+        elif blob.startswith(STATE_MAGIC_V2):
+            self._apply_state(blob[len(STATE_MAGIC_V2):], link=False)
         elif blob.startswith(STATE_MAGIC_V1):
-            self._apply_state(blob[len(STATE_MAGIC_V1):], aux=False)
+            self._apply_state(blob[len(STATE_MAGIC_V1):], aux=False, link=False)
         else:
             self._flash("bad state"); return
         self._rewind.clear(); self._rw_pos = None      # a loaded state starts a new timeline
@@ -4104,7 +4214,12 @@ class PlayPage(QWidget):
         self._show_rewind_bar()
 
     def _rebuild_rewind_buffer(self) -> None:
-        """Size the rewind ring from the setting (0 s = off). ~48 KiB per frame."""
+        """Size the rewind ring from the setting (0 s = off). ~51 KiB per frame.
+
+        (48 KiB of image + the CPU struct + the sound/timer block + the 2112-byte link
+        block, whose two 1 KiB FIFOs are nearly always almost empty -- a fixed size is
+        what keeps the block ABI-stable, and it costs ~4% more ring: 28.5 -> 29.7 MiB
+        at the 10 s setting.)"""
         secs = cfg.rewind_seconds(self._settings)
         self._rewind_on = secs > 0
         self._rewind = deque(maxlen=max(1, secs * 60))
@@ -4156,8 +4271,13 @@ class PlayPage(QWidget):
         L.append(f"opcode    : {summ.stop_opcode:02X}")
         L.append(f"frame     : {summ.frame_count}   scanline: {summ.scanline}"
                  f"   cycles: {summ.total_cycles}")
+        # ⚠️ EVERY KNOB THE MACHINE WAS GIVEN, or the line lies by omission. This block
+        # exists so a crash can be re-run under the timing that produced it, and `ldirw`
+        # is now a SEPARATE answer from `ldir` (a word iteration moves two bytes -- see
+        # cfg.CART_LDIRW_COST). Reporting one and not the other reproduces another run.
         L.append(f"timing    : cart_wait={cfg.CART_FETCH_WAIT} data={cfg.CART_DATA_WAIT}"
-                 f" ldir={cfg.CART_LDIR_COST}   real_bios={self._real_bios}")
+                 f" ldir={cfg.CART_LDIR_COST} ldirw={cfg.CART_LDIRW_COST}"
+                 f"   real_bios={self._real_bios}")
         L.append("")
         # registers
         L.append("registers (32-bit):")
@@ -4224,16 +4344,13 @@ class PlayPage(QWidget):
         except ValueError:
             i = 2
         i = max(0, min(len(steps) - 1, i + (1 if up else -1)))
-        self._speed = steps[i]
-        self._reset_pacing()
-        if hasattr(self, "_speed_lbl"):
-            self._speed_lbl.setText(f"{self._speed:g}×")
-        self._flash(cfg.tr(cfg.language(self._settings), "speed").format(x=self._speed))
+        self._link_both(lambda pg: pg._apply_speed(steps[i]))    # noqa: SLF001
 
     def open_menu(self) -> None:
         if self.machine is None:
             return
         self.paused = True
+        self._pause_peer(True)         # local 2P: the other console waits for us
         self._menu_open = True
         lang = cfg.language(self._settings)
         t = lambda key: cfg.tr(lang, key)
@@ -4251,6 +4368,7 @@ class PlayPage(QWidget):
         self._menu_open = False
         if self.machine is not None:
             self.paused = False
+            self._pause_peer(False)
             self.setFocus()
 
     def _on_menu_choice(self, action: str) -> None:
@@ -4277,6 +4395,7 @@ class PlayPage(QWidget):
         if self.machine is None:
             return
         self.paused = True
+        self._pause_peer(True)         # local 2P: it must not play on without us
         self.timer.stop()
         self._commit_playtime()
         if self.sink is not None:
@@ -4288,6 +4407,12 @@ class PlayPage(QWidget):
             return
         self.menu.hide(); self._menu_open = False
         self.paused = False
+        # ⚠️ THE PEER MUST BE WOKEN HERE TOO, and this is the path that is easy to
+        # miss: `_on_menu_choice` leaves the pause menu for Video/Audio/Controls
+        # WITHOUT going through close_menu -- it stays paused on purpose and comes
+        # back through resume_play. Pausing the peer in open_menu and forgetting it
+        # here left player 2 frozen for the rest of the session.
+        self._pause_peer(False)
         self._play_t0 = time.perf_counter()   # the clock restarts (see _commit_playtime)
         self.apply_settings()
         if cfg.audio_enabled(self._settings) and self.sink is None:
@@ -4526,6 +4651,13 @@ class PlayPage(QWidget):
         """The 🔗 button: pick how to link a second console."""
         t = lambda k: cfg.tr(cfg.language(self._settings), k)
         m = QMenu(self)
+        # A host/join still looking for its peer needs a way OUT of the menu it was
+        # started from -- without one, "waiting for player 2" was a one-way door and
+        # every other entry below silently did nothing. First, because that is what
+        # the player came back here for.
+        if self.net_pending:
+            m.addAction(t("link_cancel_pending"), self.net_cancel_requested.emit)
+            m.addSeparator()
         m.addAction(t("link_2p_local"), self.link_requested.emit)
         m.addAction(t("link_2p_framed"), self.link_frame_requested.emit)
         m.addSeparator()
@@ -4778,6 +4910,28 @@ class PlayPage(QWidget):
     # an earlier attempt at this concluded "sub-frame relaying does not help". It does;
     # the slice was simply too coarse. Do not raise it without re-running that table.
     # Shared with mirror netplay, which owns two consoles for the same reason.
+    #
+    # ⛔ AND `ngpc_set_serial_break` DOES NOT REPLACE IT. MEASURED 2026-08-14, after a
+    # perf report ("link games run about half speed vs hardware") sent us looking here.
+    # The temptation is obvious: the core knows the exact cycle a byte hits the wire, so
+    # arm the break, drop the quota, and stop guessing. It is wrong, because THIS NUMBER
+    # DOES TWO JOBS and the break only does one of them:
+    #     1. relay the cable promptly            -- the break is strictly better
+    #     2. advance BOTH consoles in small steps -- the break cannot do this at all
+    # Job 2 is what the table above measures. The break fires on OUR transmit and OUR RTS;
+    # a console that is quietly computing produces no event, so it runs until the frame
+    # ends -- and the other console has not run at all meanwhile. Measured step size per
+    # `run()` call, same harness, 120 frames:
+    #     slice 400   : every step 400 instructions, 0 of 4901 steps >= 0.8 frame
+    #     break, free : median step 6263 (A WHOLE FRAME), 242 of 484 steps >= 0.8 frame
+    # That is precisely the "a frame each, then relay" scheduling this class exists to
+    # replace, and which the CFC bench scores 2 of 5 against 5 of 5.
+    #
+    # Keeping the cap AND arming the break (stop at 400, or earlier on a byte) is safe but
+    # buys nothing: 20 544 FFI calls against 19 164, the same wall time to two decimals,
+    # and cable throughput was already identical (1.7 bytes/frame either way on the probe
+    # ROM). The relay was never the bottleneck -- two consoles cost 2x by construction and
+    # the slicing on top is 6%, leaving ~880 emulated fps here, 14.7x realtime.
     LINK_SLICE = core_link.CABLE_SLICE
 
     # How far ahead of its own tick a linked peer may be driven. A pacer hands out up
@@ -5232,41 +5386,173 @@ def _local_ip() -> str:
         s.close()
 
 
+class _Cancelled(Exception):
+    """The player took the attempt back. Not a failure -- nothing to report."""
+
+
+def _net_error_text(lang: str, exc: Exception, mode: str) -> str:
+    """Turn a socket failure into a sentence that names a CAUSE, not an errno.
+
+    ⛔ WHAT THIS REPLACES: `failed.emit(str(e))`, which put "[WinError 10061] No
+    connection could be made because the target machine actively refused it" in
+    front of a player. Every one of these cases has a different fix, and the
+    number is the only part that does not say which.
+    """
+    import errno
+    import socket
+    key = None
+    if isinstance(exc, socket.gaierror):
+        key = "net_err_name"
+    elif isinstance(exc, TimeoutError):
+        key = "net_err_timeout_host" if mode == "host" else "net_err_timeout_join"
+    elif isinstance(exc, ConnectionRefusedError):
+        key = "net_err_refused"
+    elif isinstance(exc, PermissionError):
+        key = "net_err_denied"
+    elif isinstance(exc, OSError) and exc.errno is not None:
+        # ⚠️ `errno is not None` is not defensive noise: an OSError raised without
+        # one would otherwise match the `None` that getattr leaves in these tuples
+        # on a platform without the WSA aliases, and report "port already in use"
+        # for something else entirely.
+        in_use = {errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", errno.EADDRINUSE)}
+        if exc.errno in in_use:
+            key = "net_err_in_use"
+        elif exc.errno in (errno.EADDRNOTAVAIL, errno.EACCES):
+            key = "net_err_denied"
+    if key is None:
+        return cfg.tr(lang, "link_failed").format(why=str(exc))
+    return cfg.tr(lang, "link_failed").format(why=cfg.tr(lang, key))
+
+
 class _NetConnect(QThread):
     """Background accept (host) or connect (join) so the UI never blocks on the
-    handshake. Emits the connected socket on success."""
+    handshake. Emits the connected socket on success.
+
+    ⛔ THE BUG THIS ENDS, reported as "direct host/client mode never seems to
+    actually get through". Three faults compounded into one dead end:
+
+      1. The host's `accept()` blocked FOREVER -- no timeout at all, while the
+         joining side already had one.
+      2. `cancel()` existed but was reachable from no menu: its only callers were
+         peer-loss and app teardown, both of which assume a link that EXISTS. A
+         pending attempt could not be taken back.
+      3. So `_start_net`'s "one attempt at a time" guard stayed armed for the rest
+         of the session, and every later Host/Join click returned in silence.
+
+    The player's experience: click Host, nothing; click Join, nothing, without a
+    word; restart the emulator. So the wait is now bounded, interruptible at any
+    moment, and joining RETRIES -- because "the other player has not clicked Host
+    yet" is the normal case, not an error, and it used to fail instantly with
+    ECONNREFUSED the moment you were the first of the two to be ready.
+    """
 
     connected = pyqtSignal(object)     # a connected socket.socket
-    failed = pyqtSignal(str)
+    failed = pyqtSignal(str)           # already-translated, player-facing
 
-    def __init__(self, mode: str, host: str, port: int) -> None:
+    HOST_TIMEOUT_S = 300.0    # five minutes of "waiting for player 2" is generous
+    JOIN_TIMEOUT_S = 120.0    # ...and two of "waiting for the host to click Host"
+    POLL_S = 0.25             # how fast a cancel is noticed
+
+    def __init__(self, mode: str, host: str, port: int, lang: str = "en") -> None:
         super().__init__()
+        import threading
         self._mode = mode
         self._host = host
         self._port = port
+        self._lang = lang
         self._srv = None
+        self._cancel = threading.Event()
+
+    # ---- the two ways in ---------------------------------------------------
+    def _accept(self):
+        """Listen, then wait in POLL_S slices so a cancel lands within a quarter
+        second instead of never."""
+        import select
+        import socket
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", self._port))
+            srv.listen(1)
+            self._srv = srv
+            deadline = time.monotonic() + self.HOST_TIMEOUT_S
+            while not self._cancel.is_set():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("nobody connected")
+                # ⚠️ THE ACCEPT BELONGS INSIDE THIS GUARD, and a test proved it: a
+                # socket that cancel() closed under us is reported READABLE, so the
+                # accept that follows raises WSAENOTSOCK. Guarding only the select
+                # turned a cancel the player asked for into "⚠ link failed: [WinError
+                # 10038]" -- an error message for doing exactly what was requested.
+                try:
+                    ready, _, _ = select.select([srv], [], [], self.POLL_S)
+                    if ready:
+                        if self._cancel.is_set():
+                            break
+                        conn, _ = srv.accept()
+                        return conn
+                except OSError:
+                    if not self._cancel.is_set():
+                        raise                  # a real failure, not our own cancel
+                    break                      # cancel() closed the socket under us
+            raise _Cancelled()
+        finally:
+            self._srv = None
+            try:
+                srv.close()
+            except OSError:
+                pass
+
+    def _dial(self):
+        """Connect, retrying while the host is not listening yet."""
+        import socket
+        deadline = time.monotonic() + self.JOIN_TIMEOUT_S
+        last: Exception | None = None
+        while not self._cancel.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                return socket.create_connection((self._host, self._port),
+                                                timeout=min(2.0, left))
+            except socket.gaierror:
+                raise                          # a name that does not resolve never will
+            except OSError as e:
+                last = e
+            if self._cancel.wait(self.POLL_S):
+                break
+        if self._cancel.is_set():
+            raise _Cancelled()
+        raise last if last is not None else TimeoutError("could not connect")
 
     def run(self) -> None:
         import socket
         try:
-            if self._mode == "host":
-                self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self._srv.bind(("0.0.0.0", self._port))
-                self._srv.listen(1)
-                conn, _ = self._srv.accept()
-                self._srv.close(); self._srv = None
-            else:
-                conn = socket.create_connection((self._host, self._port), timeout=60)
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.connected.emit(conn)
+            conn = self._accept() if self._mode == "host" else self._dial()
+        except _Cancelled:
+            return                             # the player asked; say nothing
         except Exception as e:  # noqa: BLE001 -- any failure is just "could not link"
-            self.failed.emit(str(e))
+            self.failed.emit(_net_error_text(self._lang, e, self._mode))
+            return
+        # ⚠️ A CANCEL AND A CONNECTION CAN CROSS. The peer may land in the instant
+        # between the last `_cancel` check and here, and emitting then would attach
+        # a link the player has just taken back. Losing the race means dropping the
+        # socket, which is what "cancel" was asked to mean.
+        if self._cancel.is_set():
+            try:
+                conn.close()
+            except OSError:
+                pass
+            return
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.connected.emit(conn)
 
     def cancel(self) -> None:
-        if self._srv is not None:               # unblock a pending accept()
+        self._cancel.set()
+        srv = self._srv                        # unblock a pending select() at once
+        if srv is not None:
             try:
-                self._srv.close()
+                srv.close()
             except OSError:
                 pass
 
@@ -5522,6 +5808,7 @@ class Shell(QMainWindow):
         self.play.net_host_requested.connect(self._host_online)
         self.play.net_join_requested.connect(self._join_online)
         self.play.net_lobby_requested.connect(self._open_lobby)
+        self.play.net_cancel_requested.connect(self._cancel_net_attempt)
         self.play.net_link_lost.connect(self._on_net_link_lost)
         self.play.net_mirror_host_requested.connect(self._host_mirror)
         self.play.net_mirror_join_requested.connect(self._join_mirror)
@@ -5534,6 +5821,7 @@ class Shell(QMainWindow):
         self._link_input = None            # the global key router, when active
         self._link_status = None           # P2 title-bar link diagnostic timer
         self._net_thread = None            # background accept/connect, when linking online
+        self._net_retiring = []            # cancelled workers, held until they really stop
         self._net_status = None            # online link diagnostic timer
         self._host_info = None             # the host connection-info dialog
         self.settings.changed.connect(self._on_settings_changed)
@@ -5951,15 +6239,12 @@ class Shell(QMainWindow):
             self, "Host a network game", "Listen on port:", 7788, 1, 65535)
         if not ok:
             return
-        self._start_net("host", "", int(port),
-                        cfg.tr(cfg.language(self._settings), "link_waiting")
-                        .format(port=port))
+        if not self._start_net("host", "", int(port),
+                               cfg.tr(cfg.language(self._settings), "link_waiting")
+                               .format(port=port)):
+            return
         # Show the connection info (public IP auto-detected) + port-forward/risks help.
-        from ngpc_lobby import HostInfoDialog
-        game = self.play._rom_path.stem if self.play._rom_path else "?"
-        self._host_info = HostInfoDialog(game, int(port),
-                                         cfg.language(self._settings), self)
-        self._host_info.show()
+        self._show_host_info(int(port))
 
     def _join_online(self) -> None:
         if self.play.machine is None or self._one_link_at_a_time(False):
@@ -5975,21 +6260,164 @@ class Shell(QMainWindow):
                         cfg.tr(cfg.language(self._settings), "link_connecting")
                         .format(addr=f"{host}:{port}"))
 
-    def _start_net(self, mode: str, host: str, port: int, waiting: str) -> None:
-        if self._net_thread is not None:            # one attempt at a time
-            return
-        self.play.overlay.setText(waiting)
-        self._net_thread = _NetConnect(mode, host, port)
-        self._net_thread.connected.connect(self._on_net_connected)
-        self._net_thread.failed.connect(self._on_net_failed)
-        self._net_thread.finished.connect(self._clear_net_thread)
-        self._net_thread.start()
+    def _start_net(self, mode: str, host: str, port: int, waiting: str) -> bool:
+        """True when the attempt actually started.
 
-    def _clear_net_thread(self) -> None:
+        ⚠️ THE CALLER MUST HONOUR THE ANSWER, and the mirror is why: it arms
+        `_mirror_pending` to say which kind of session the next connection becomes.
+        Arming it BEFORE a start that gets refused leaves the flag set over an
+        earlier CABLE attempt still in flight -- which then connects and silently
+        opens a mirror session instead. So the flag is armed only on a real start.
+        """
+        lang = cfg.language(self._settings)
+        if self._net_thread is not None:            # one attempt at a time
+            # ⛔ NEVER A SILENT `return`. This guard is what turned a host attempt
+            # nobody could reach into a dead emulator: it stayed armed for the rest
+            # of the session and swallowed every later Host/Join click without a
+            # word. Say it is busy, and offer the way out in the same breath.
+            if QMessageBox.question(
+                    self, cfg.tr(lang, "net_pending_title"),
+                    cfg.tr(lang, "net_pending_ask"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes) \
+                    == QMessageBox.StandardButton.Yes:
+                self._cancel_net_attempt()
+            return False
+        self.play.overlay.setText(waiting)
+        th = _NetConnect(mode, host, port, lang)
+        th.connected.connect(self._on_net_connected)
+        th.failed.connect(self._on_net_failed)
+        th.finished.connect(lambda t=th: self._on_net_thread_finished(t))
+        self._net_thread = th
+        self.play.net_pending = True
+        th.start()
+        return True
+
+    def _on_net_thread_finished(self, th) -> None:
+        """⚠️ WHICH worker finished matters, and the old handler did not ask.
+
+        A cancelled attempt does not stop instantly -- the join path can sit inside
+        a blocking connect for up to its 2 s slice -- and the player may well have
+        started a NEW attempt in between. A handler that just cleared `_net_thread`
+        would then throw away the new attempt's bookkeeping, and with it the only
+        Python reference keeping its QThread alive.
+        """
+        if th in self._net_retiring:
+            self._net_retiring.remove(th)
+        if self._net_thread is th:
+            self._net_thread = None
+            self.play.net_pending = False
+
+    def _retire_net_thread(self, th) -> None:
+        """Cancel a worker and KEEP IT ALIVE until it has really stopped.
+
+        ⛔ THE CRASH THIS AVOIDS. Dropping the last Python reference to a RUNNING
+        QThread destroys the C++ object under the OS thread that is still in it,
+        and Qt answers in ~QThread with "Destroyed while thread is still running"
+        followed by terminate() -- a hard process death, no traceback, exactly the
+        signature the root conftest documents for the test runner. `cancel()` is
+        not instantaneous, so the object is parked here until its own `finished`
+        takes it off the list.
+        """
+        if th is None:
+            return
+        self._net_retiring.append(th)
+        th.cancel()
+
+    def _shutdown_net(self) -> None:
+        """Leave no running worker behind when the window goes away."""
+        self._retire_net_thread(self._net_thread)
         self._net_thread = None
+        for th in list(self._net_retiring):
+            th.cancel()
+            th.wait(2500)
+        self._net_retiring.clear()
+
+    def _net_attempt_pending(self) -> bool:
+        return self._net_thread is not None
+
+    def _from_current_worker(self) -> bool:
+        """True unless this signal comes from a worker we have already let go.
+
+        ⚠️ A BOOLEAN "abandoned" FLAG IS NOT ENOUGH, and that was the first try at
+        this. There can be TWO workers in flight -- one retiring after a cancel, one
+        the player has just started -- and starting the new one resets the flag,
+        which lets the cancelled one's late `connected` through after all: the
+        emulator attaches the very attempt that was taken back. The SENDER is the
+        only thing that says which worker is talking.
+
+        A direct call (no signal) has no sender and is trusted, so the slots stay
+        callable from a test.
+        """
+        src = self.sender()
+        return src is None or src is self._net_thread
+
+    def _cancel_net_attempt(self) -> None:
+        """Take back a host/join that has not connected. Reachable from the 🔗 menu
+        and from closing the host-info panel -- the two places a player who wants
+        out actually looks.
+
+        ⚠️ IT CAN BE ASKED FOR AFTER THE ATTEMPT HAS ALREADY SUCCEEDED, and both ways
+        in are why: `QMessageBox.question` and `QMenu.exec` each run a NESTED event
+        loop, inside which the worker's queued `connected` is delivered like any
+        other. So the peer can arrive between the question being put and the answer
+        coming back, and between the menu opening and the entry being clicked.
+        Without this guard the cancel then wiped a LIVE session -- overlay banner,
+        host panel and mirror mode -- for a link that was already up.
+        """
+        if not self._net_attempt_pending():
+            return
+        # The worker's signals are QUEUED to this thread, so one emitted just before
+        # the cancel is still in flight and will be delivered AFTER us. Clearing
+        # `_net_thread` first is what lets `_from_current_worker` recognise it and
+        # drop it -- without that, a cancelled attempt could still attach itself.
+        th, self._net_thread = self._net_thread, None
+        self.play.net_pending = False
+        self._retire_net_thread(th)
+        self._close_host_info()
+        self._mirror_pending = None            # or the next Host would start a mirror
+        self.play.overlay.setText("")
+        self.play._flash(cfg.tr(cfg.language(self._settings), "net_cancelled"))
+
+    def _close_host_info(self) -> None:
+        dlg, self._host_info = getattr(self, "_host_info", None), None
+        if dlg is not None:
+            dlg.close()
+
+    def _show_host_info(self, port: int) -> None:
+        """The host's own address panel -- and the cancel handle that goes with it.
+
+        Closing it while nothing has connected yet means "never mind", which is the
+        gesture a player makes long before finding a menu entry. `_close_host_info`
+        clears the attribute BEFORE closing, so tearing it down on success cannot
+        loop back round and cancel the link that just came up.
+        """
+        from ngpc_lobby import HostInfoDialog
+        game = self.play._rom_path.stem if self.play._rom_path else "?"
+        self._host_info = HostInfoDialog(game, int(port),
+                                         cfg.language(self._settings), self)
+        self._host_info.finished.connect(self._on_host_info_closed)
+        self._host_info.show()
+
+    def _on_host_info_closed(self, *_a) -> None:
+        if getattr(self, "_host_info", None) is not None and self._net_attempt_pending():
+            self._cancel_net_attempt()
 
     def _on_net_connected(self, sock) -> None:
         from core.link import TcpLink
+        # ⚠️ THE CONSOLE MAY HAVE MOVED ON WHILE WE WERE SEARCHING. An attempt can be
+        # in flight for minutes, and nothing stopped the player wiring a local cable
+        # or a mirror in the meantime -- `_one_link_at_a_time` only sees links that
+        # already EXIST. Attaching on top of one is the exact fight that guard was
+        # written to prevent: two relays over one serial FIFO.
+        busy = self.play._link_peer is not None or self.play._mirror is not None
+        if not self._from_current_worker() or busy:  # cancelled, superseded, or too late
+            try: sock.close()
+            except OSError: pass
+            if busy:
+                self.play._flash(cfg.tr(cfg.language(self._settings), "link_busy"))
+            return
+        self._close_host_info()      # the panel answered its question: they are in
         if self._mirror_pending is not None:        # the other online mode
             from core.netplay import SocketPipe
             mode, self._mirror_pending = self._mirror_pending, None
@@ -6016,20 +6444,17 @@ class Shell(QMainWindow):
             self, "Host a mirror game", "Listen on port:", 7789, 1, 65535)
         if not ok or not self._ask_mirror_delay():
             return
-        self._mirror_pending = "host"
-        self._start_net("host", "", int(port),
-                        cfg.tr(cfg.language(self._settings), "link_waiting")
-                        .format(port=port))
+        if not self._start_net("host", "", int(port),
+                               cfg.tr(cfg.language(self._settings), "link_waiting")
+                               .format(port=port)):
+            return
+        self._mirror_pending = "host"      # only once the attempt is really ours
         # ⛔ THE HOST HAS TO BE TOLD ITS OWN ADDRESS -- there is no other way for the
         # other player to reach it, and "listening on port 7789" is not an address. The
         # cable mode has shown this panel (LAN address, auto-detected public one, a
         # ready-to-paste line) since it existed; the mirror was simply never wired to
         # it, so hosting a mirror game meant going and finding your IP by hand.
-        import ngpc_lobby
-        game = self.play._rom_path.stem if self.play._rom_path else "?"
-        self._host_info = ngpc_lobby.HostInfoDialog(
-            game, int(port), cfg.language(self._settings), self)
-        self._host_info.show()
+        self._show_host_info(int(port))
 
     def _join_mirror(self) -> None:
         if self.play.machine is None or self._one_link_at_a_time(True):
@@ -6047,10 +6472,11 @@ class Shell(QMainWindow):
         # player saw as a bare `[WinError 10054]`. The host's number is the one that
         # counts; this side takes it from the handshake, exactly as the lobby already
         # did (core.netplay.Handshake.check).
-        self._mirror_pending = "join"
-        self._start_net("join", host.strip(), port,
-                        cfg.tr(cfg.language(self._settings), "link_connecting")
-                        .format(addr=f"{host}:{port}"))
+        if not self._start_net("join", host.strip(), port,
+                               cfg.tr(cfg.language(self._settings), "link_connecting")
+                               .format(addr=f"{host}:{port}")):
+            return
+        self._mirror_pending = "join"      # only once the attempt is really ours
 
     # ⚡ IN MIRROR MODE THE TWO CONSOLES ARE BUILT THE SAME WAY ON BOTH PCs, and that
     # is not a detail -- it is the whole mode.
@@ -6256,6 +6682,7 @@ class Shell(QMainWindow):
             peer.machine.set_cart_wait(cfg.CART_FETCH_WAIT)
             peer.machine.set_cart_data_wait(cfg.CART_DATA_WAIT)
             peer.machine.set_ldir_cost(cfg.CART_LDIR_COST)
+            peer.machine.set_ldirw_cost(cfg.CART_LDIRW_COST)
         clock = native.RtcState(1, *self.MIRROR_CLOCK)
         for m in (page.machine, peer.machine):
             m.set_rtc(clock)
@@ -6290,6 +6717,8 @@ class Shell(QMainWindow):
             self._net_status.stop(); self._net_status = None
 
     def _on_net_failed(self, msg: str) -> None:
+        if not self._from_current_worker():
+            return          # a worker we let go; its failure notice would be noise
         # ⛔ CLEAR THE MODE FLAG. Left set by a mirror attempt that timed out, the next
         # ordinary Host/Join would silently start a MIRROR session instead of a cable.
         self._mirror_pending = None
@@ -6353,9 +6782,10 @@ class Shell(QMainWindow):
         if self._net_status is not None:
             self._net_status.stop(); self._net_status = None
             self.setWindowTitle("NgpCraft")
-        if self._net_thread is not None:
-            self._net_thread.cancel()
-            self._net_thread = None
+        th, self._net_thread = self._net_thread, None
+        self._retire_net_thread(th)
+        self.play.net_pending = False
+        self._close_host_info()
         self.play.detach_net_link()
 
     def _open_debug(self) -> None:
@@ -6438,6 +6868,7 @@ class Shell(QMainWindow):
         self._settings.setValue("win/geometry", self.saveGeometry())
         if self._debug_win is not None:
             self._debug_win.close()
+        self._shutdown_net()      # a host/join still searching must not outlive us
         self.play.stop()
         self.library._stop_worker()
         self._settings.sync()

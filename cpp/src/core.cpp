@@ -574,6 +574,11 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
     std::memset(&s, 0, sizeof(s));
     s.stop_status = NGPC_COUNT_REACHED;
 
+    /* "Something crossed the cable during THIS call" -- so the question is asked
+     * fresh each time. Cleared even when nobody armed the break, otherwise the
+     * first armed call would answer for traffic that happened before it. */
+    m->serial_event = false;
+
     ngpc_record_t scratch;
     for (uint32_t i = 0; i < max_instrs; ++i) {
         /* Breakpoints are checked HERE, in the core. The Python shell does it by
@@ -661,7 +666,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 continue;                              // resume inside the boot handler
             }
 
-            bool woke = false, wd_stop = false;
+            bool woke = false, wd_stop = false, ser_stop = false;
             for (unsigned line = 0; line <= kScanlinesPerFrame; ++line) {
                 advance_raster(*m, kCyclesPerScanline);
                 m->adc_tick(kCyclesPerScanline);
@@ -681,8 +686,19 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                     woke = true;
                     break;
                 }
+                /* A byte can finish shifting out while the CPU is parked on a
+                 * HALT, and its own INTTX0 may be masked -- so waiting for the
+                 * wake-up would hold the relay for the rest of the frame. Tested
+                 * after delivery: when both happen the interrupt wins and the
+                 * end-of-iteration test below picks the event up instead. */
+                if (m->serial_break_on_event && m->serial_event) { ser_stop = true; break; }
             }
             if (wd_stop) break;
+            if (ser_stop) {
+                s.stop_status = NGPC_SERIAL_EVENT;
+                s.stop_pc     = pc_before;   /* still parked ON the halt */
+                break;
+            }
             if (!woke) {
                 s.stop_status = NGPC_HALTED;
                 s.stop_pc     = pc_before;
@@ -748,6 +764,19 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
             m->apu.tick(kIrqDeliveryCycles);
             if (m->watchdog_tick(kIrqDeliveryCycles)
                 && note_watchdog(*m, s, pc_before)) break;
+        }
+
+        /* ⚡ THE CABLE MOVED -- hand back so the host can relay it NOW.
+         *
+         * Tested here, at the very end of the iteration, so the instruction is
+         * fully retired first: its cycles are counted, its peripherals ticked,
+         * its interrupt delivered. The machine is left on an instruction
+         * boundary and the next ngpc_run resumes as if nothing had happened --
+         * this is a RENDEZVOUS, not a trap. */
+        if (m->serial_break_on_event && m->serial_event) {
+            s.stop_status = NGPC_SERIAL_EVENT;
+            s.stop_pc     = m->cpu.pc;
+            break;
         }
     }
 
@@ -1091,6 +1120,14 @@ NGPC_API void ngpc_set_ldir_cost(ngpc_t* h, uint32_t cycles_per_byte) {
     reinterpret_cast<Machine*>(h)->ldir_cost = uint16_t(cycles_per_byte ? cycles_per_byte : 7);
 }
 
+/* Cost per ITERATION of the WORD block copies (LDIRW/LDDRW). 0 = follow ldir_cost, which
+ * is what every existing caller gets, so nothing moves until someone asks for it.
+ * Measured at 18 on Bomberman's open-loop HiColor copier -- see Machine::ldirw_cost. */
+NGPC_API void ngpc_set_ldirw_cost(ngpc_t* h, uint32_t cycles_per_iteration) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->ldirw_cost = uint16_t(cycles_per_iteration);
+}
+
 /* Present the cart as a flash chip of `bytes` capacity (a standard 4/8/16 Mbit part),
  * rebuilding the erasable-block map. A real flashcart's chip is bigger than an under-filled
  * homebrew ROM, and a game that saves in the chip's top block (StarGunner -> block 33 at
@@ -1152,6 +1189,17 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
         m.serial_tx_cycles = 0;
         m.serial_rx_cycles = 0;
     }
+}
+
+/* Ask ngpc_run to hand back the moment the cable moves. See the header for why
+ * this replaces the host's instruction-quota poll rather than tuning it. */
+NGPC_API void ngpc_set_serial_break(ngpc_t* h, int on) {
+    if (!h) return;
+    Machine& m = *reinterpret_cast<Machine*>(h);
+    m.serial_break_on_event = (on != 0);
+    /* Arming is not a report about the past: drop anything already noticed so
+     * the first run afterwards answers only for its own traffic. */
+    m.serial_event = false;
 }
 
 /* Drain up to `max` bytes this machine has transmitted; returns the count. */
@@ -1452,6 +1500,80 @@ NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
     m->scanline           = in->scanline;
     m->frame_count        = in->frame_count;
     m->cycle_residue      = in->cycle_residue;
+    return 0;
+}
+
+/* --- the link cable as saveable state (see ngpc_core.h for WHY) ------------- */
+
+NGPC_API void ngpc_get_link_state(ngpc_t* h, ngpc_link_state_t* out) {
+    if (!h || !out) return;
+    const Machine* m = reinterpret_cast<Machine*>(h);
+
+    std::memset(out, 0, sizeof(*out));
+    out->version = NGPC_LINK_STATE_VERSION;
+    out->size    = uint32_t(sizeof(ngpc_link_state_t));
+
+    out->link_enabled = m->serial_link_enabled ? 1 : 0;
+    out->tx_busy      = m->serial_tx_busy ? 1 : 0;
+    out->tx_shifting  = m->serial_tx_shifting ? 1 : 0;
+    out->tx_byte      = m->serial_tx_byte;
+    out->cts_high     = m->serial_cts_high ? 1 : 0;
+    out->rx_pending   = m->serial_rx_pending ? 1 : 0;
+    out->rx_byte      = m->serial_rx_byte;
+    out->tx_cycles    = m->serial_tx_cycles;
+    out->rx_cycles    = m->serial_rx_cycles;
+
+    /* Clamp rather than truncate in silence: a snapshot that quietly dropped cable
+     * bytes would be the very bug this block closes, wearing a green hat. */
+    const size_t tx_n = m->serial_tx.size();
+    const size_t rx_n = m->serial_rx.size();
+    if (tx_n > NGPC_LINK_FIFO_MAX || rx_n > NGPC_LINK_FIFO_MAX) out->overflow = 1;
+    out->tx_len = uint32_t(tx_n < NGPC_LINK_FIFO_MAX ? tx_n : NGPC_LINK_FIFO_MAX);
+    out->rx_len = uint32_t(rx_n < NGPC_LINK_FIFO_MAX ? rx_n : NGPC_LINK_FIFO_MAX);
+    for (uint32_t i = 0; i < out->tx_len; ++i) out->tx_fifo[i] = m->serial_tx[i];
+    for (uint32_t i = 0; i < out->rx_len; ++i) out->rx_fifo[i] = m->serial_rx[i];
+
+    out->tx_count        = m->serial_tx_count;
+    out->wire_count      = m->serial_wire_count;
+    out->rx_queued_count = m->serial_rx_queued_count;
+    out->rx_read_count   = m->serial_rx_read_count;
+    out->irq_tx_count    = m->serial_irq_tx_count;
+    out->irq_rx_count    = m->serial_irq_rx_count;
+    out->cts_hold_ticks  = m->serial_cts_hold_ticks;
+    out->rts_hold_ticks  = m->serial_rts_hold_ticks;
+}
+
+NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
+    if (!h || !in) return -1;
+    /* Same contract as the aux block: a blob from another build is refused whole. */
+    if (in->version != NGPC_LINK_STATE_VERSION || in->size != sizeof(ngpc_link_state_t))
+        return -1;
+    if (in->tx_len > NGPC_LINK_FIFO_MAX || in->rx_len > NGPC_LINK_FIFO_MAX)
+        return -1;
+
+    Machine* m = reinterpret_cast<Machine*>(h);
+
+    m->serial_link_enabled = in->link_enabled != 0;
+    m->serial_tx_busy      = in->tx_busy != 0;
+    m->serial_tx_shifting  = in->tx_shifting != 0;
+    m->serial_tx_byte      = in->tx_byte;
+    m->serial_cts_high     = in->cts_high != 0;
+    m->serial_rx_pending   = in->rx_pending != 0;
+    m->serial_rx_byte      = in->rx_byte;
+    m->serial_tx_cycles    = in->tx_cycles;
+    m->serial_rx_cycles    = in->rx_cycles;
+
+    m->serial_tx.assign(in->tx_fifo, in->tx_fifo + in->tx_len);
+    m->serial_rx.assign(in->rx_fifo, in->rx_fifo + in->rx_len);
+
+    m->serial_tx_count        = in->tx_count;
+    m->serial_wire_count      = in->wire_count;
+    m->serial_rx_queued_count = in->rx_queued_count;
+    m->serial_rx_read_count   = in->rx_read_count;
+    m->serial_irq_tx_count    = in->irq_tx_count;
+    m->serial_irq_rx_count    = in->irq_rx_count;
+    m->serial_cts_hold_ticks  = in->cts_hold_ticks;
+    m->serial_rts_hold_ticks  = in->rts_hold_ticks;
     return 0;
 }
 

@@ -496,6 +496,19 @@ timers, for instance). Pull one
 and you would have a console that runs its first-boot setup while still insisting it knows the
 date, which is why the reset below clears both.
 
+**Two-player on one PC is two consoles, and two consoles cannot share one battery.** Player 2
+boots from your configured cell — same language, same date, which is what somebody with two
+consoles would have — but it is **read-only** for it: player 2 never writes the cell back, so
+closing its window cannot stamp its clock over yours. Its crystal also runs on its own
+sub-second phase. That last part sounds like a detail and is not: both consoles used to come
+up with a bit-identical clock down to the oscillator's phase, so a game that seeds its random
+numbers from the clock got the *same numbers on both consoles* — and a link game that decides
+which console is player 1 by drawing lots then had nothing to draw with. That bug was reported
+from the field. On hardware two coin cells never share a phase, and now they do not here
+either. A game seeding on the *second* alone can still see both consoles agree about half the
+time; giving player 2 a genuinely separate date would mean a second saved cell, which is
+deliberately not done.
+
 The clock **runs while you play** and, by default, **keeps running while the emulator is
 closed** — shut it for three days and the console comes back three days later, exactly as the
 coin cell does on hardware. Choose in **Settings ▸ Console (BIOS) ▸ "Clock while the emulator
@@ -565,7 +578,10 @@ player toolbar's **🔗** button:
 
 - **Two players — this PC** — opens a second window. Player 2 loads their **own** cartridge
   (its flash save loads normally); each player has their own controls (keyboard or pad),
-  routed by player regardless of which window has focus.
+  routed by player regardless of which window has focus. **Pause, speed and fast-forward
+  apply to both consoles**, from either window: they are wired together, and a console left
+  running against a partner that has stopped answering makes the *game's* link protocol time
+  out, which reads as a link failure rather than as a pause.
 - **Online lobby…** — connect to a lobby server, set a nickname, and **create** or **join**
   a game (public, or private with a password). The list shows each game's title, server
   name and creator. When you create one you also pick **which link it is for** — the
@@ -577,6 +593,19 @@ player toolbar's **🔗** button:
   be reachable (port-forwarding, or a zero-config option like **Tailscale**/**playit.gg**).
   The host dialog auto-detects your public IP, gives a ready-to-share line, and **explains
   the risks of opening a port** honestly.
+
+  Whoever is ready first simply waits: **joining retries** until the host clicks Host, so the
+  two of you do not have to press within the same instant. The wait is bounded and can be
+  taken back at any time — **✖ Cancel the pending connection**, at the top of the 🔗 menu
+  while an attempt is running, or just close the host panel. And when it does not work, the
+  message says *which* thing failed — nobody listening, a name that does not resolve, a port
+  already taken, a firewall — instead of an error number.
+
+  ⚠️ **If nothing gets through at all, it is almost never the emulator: it is the inbound
+  connection.** Behind a router with no port forward — or behind carrier-grade NAT, where no
+  forward is even possible — nothing can reach you, whatever you click. Use the **online
+  lobby** instead: it relays through the server, so it needs no port forwarding and no public
+  address. Think of direct mode as the LAN/Tailscale option.
 - **🪞 Mirror play — host / join** — the *other* online mode, for when your ping is the
   problem (also reachable from the lobby above, as a 🪞 room). Instead of sending the cable's bytes, each PC runs **both** consoles and only
   the **controller bytes** cross the network, so the cable is local and the delay is spent
@@ -640,6 +669,15 @@ If a game refuses to see the other console, the debugger's [**Link** tab](#link-
 (`F1`) shows the cable byte by byte and names the end that is at fault — and can drive the
 serial path with **one** console, so you can test without a partner.
 
+**Writing a link game?** Two symptoms look like emulator faults and are not. *Both consoles
+claiming to be player one* is your own role election, decided above the cable — the console
+is a UART with no master, so nothing in the hardware breaks the tie for you. And *the ball
+jumping backwards* when a game hands authority over an object between consoles is a protocol
+without a step number: each side keeps applying the peer's last known state, which is its own
+state from a few frames back. The link is asynchronous by design and the two consoles are
+never on the same frame — see the *Link Cable* page of the NgpCraft dev reference for the
+role rule and for input lockstep, which removes the handover problem rather than managing it.
+
 ## Timing — wait states, and the default that catches embedders
 
 The cartridge flash is **slow**, and on this console that is not a detail: every instruction
@@ -656,7 +694,8 @@ numbers are in [`hw_calibration/`](hw_calibration/README.md).
 |---|---|---|
 | `cart_wait` — cycles per **instruction-fetch** byte off the cart | **3** | `cpu_calib_v1` on hardware: fetch-bound classes came back ~3.4× slower than this core, execution-bound ones ~2.5×, raster exact — the signature of a per-fetch-byte cost |
 | `cart_data_wait` — cycles per **data** byte read off the cart | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). Only fetch is wait-stated. An earlier guess of **5** was curve-fit to a frame rate and this ROM **refuted** it |
-| `ldir_cost` — cycles per byte of `LDIR`/`LDDR` | **14** | The datasheet says 7, but its MUL/DIV figures already proved to be floors. 14 puts Cool Boarders at its hardware 30 fps and leaves Fatal Fury at 60 — one fix, both games. Strongly evidenced, not yet pinned by a clean ROM |
+| `ldir_cost` — cycles per iteration of the **byte** `LDIR`/`LDDR` | **14** | The datasheet says 7, but its MUL/DIV figures already proved to be floors. 14 puts Cool Boarders at its hardware 30 fps and leaves Fatal Fury at 60 — one fix, both games. Strongly evidenced, not yet pinned by a clean ROM |
+| `ldirw_cost` — cycles per iteration of the **word** `LDIRW`/`LDDRW` | **18** | A different instruction, and the loop is billed per *iteration*: a word iteration moves **two** bytes, so reusing 14 sold a word copy at half price. Measured on Bomberman's HiColor title screen, whose open-loop raster copier must spend exactly 8 scanlines per block — at 14 a block came to 0.793× and the picture sheared, at 18 the frame is pixel-identical to the same ROM's self-synchronising path, and 19 breaks it again. `0` means "follow `ldir_cost`" |
 | `vram_wait` — cycles per byte written to display RAM | **0 (off)** | The K2GE throttle is **real**: `cpu_calib_v3` on silicon gave VWR 452 < MEM 471. The cost per byte is not pinned, so nothing ships a number rather than shipping a guess |
 
 ### ⚠️ The application and the library do not start the same way
@@ -675,7 +714,8 @@ So anything measuring performance must ask for hardware timing explicitly:
 ```python
 m.set_cart_wait(cfg.CART_FETCH_WAIT)      # 3
 m.set_cart_data_wait(cfg.CART_DATA_WAIT)  # 0
-m.set_ldir_cost(cfg.CART_LDIR_COST)       # 14
+m.set_ldir_cost(cfg.CART_LDIR_COST)       # 14  -- byte block copies
+m.set_ldirw_cost(cfg.CART_LDIRW_COST)     # 18  -- word block copies
 ```
 
 (`core/romcheck.py` does exactly this; copy it rather than re-deriving the numbers.)

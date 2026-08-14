@@ -23,13 +23,19 @@ that game writes VRAM in vblank. The residual is its per-frame **LDIR** block co
 what **v6** measures (`ldir_cost`, shipped at 14 pending that ROM). See `../DEVLOG.md` and
 memory `project_ngpc_emulator_fps_waitstates`.
 
+**Since (2026-08-06):** that block cost turned out to be **two** numbers, not one — the byte
+form and the word form are different instructions and the loop is billed per iteration. The
+word form is now `ldirw_cost`, shipped at **18**, measured on a homebrew raster oracle to a
+one-cycle tolerance. See [v7](#v7--the-word-block-copy-ldirw-and-why-v6-cannot-answer-it).
+
 ## What the emulator actually ships today
 
 | Knob | Field default (`Machine`) | Shipped by the shell | Status |
 |---|---|---|---|
 | `cart_wait` (fetch) | `0` — free fetch, the pre-feature behaviour | **3** (`cfg.CART_FETCH_WAIT`) | ✅ silicon (v1) |
-| `cart_data_wait` | `0` | **0** (`cfg.CART_DATA_WAIT`) | ✅ silicon (v2): 0 is the answer, not "unset" |
-| `ldir_cost` | `7` (datasheet) | **14** (`cfg.CART_LDIR_COST`) | ⚠️ strongly evidenced, ROM measurement still open (v6) |
+| `cart_data_wait` | `0` | **0** (`cfg.CART_DATA_WAIT`) | ✅ silicon (v2): 0 is the answer, not "unset" — **re-confirmed 2026-08-06**, see below |
+| `ldir_cost` — **byte** LDIR/LDDR | `7` (datasheet) | **14** (`cfg.CART_LDIR_COST`) | ⚠️ strongly evidenced, ROM measurement still open (v6) |
+| `ldirw_cost` — **word** LDIRW/LDDRW | `0` = follow `ldir_cost` | **18** (`cfg.CART_LDIRW_COST`) | ⚠️ measured on a homebrew raster oracle (2026-08-06), no calib ROM yet — **v7 would settle it** |
 | `vram_wait` | `0` | *not set* | ⚠️ effect confirmed (v3: VWR 452 < MEM 471), cost/byte not pinned — no guess shipped |
 
 ⚠️ **The two defaults differ on purpose, and it catches people.** The field default of `0` is
@@ -141,6 +147,62 @@ leaves Fatal Fury at 60 — one instruction-cost fix explaining both — but tha
 not guessed. **LDRR** = one 2000-byte LDIR RAM→RAM per batch (pure block cost); **LDVR** =
 2000-byte LDIR RAM→VRAM (block + any VRAM throttle). Emulator (LDIR=7): **LDRR == LDVR == 430**
 (2000×7 = 14000 cycles dominates the batch — verified in the emulator, unlike v4/v5).
+
+## v7 — the WORD block copy (`LDIRW`), and why v6 cannot answer it
+
+**The gap v6 leaves.** `ldir_cost` is charged **per iteration of the loop**, and a `LDIRW`
+iteration moves **two** bytes where a `LDIR` iteration moves one. They were on the same
+number, so a word copy was billed at half price per byte. Cool Boarders — the game that
+pinned 14 — uses the **byte** form, and LDRR/LDVR in v4/v5/v6 are byte copies too. **Nothing
+we have ever measured constrains the word form**, and one field could not have held both
+answers anyway.
+
+**What settled it in the meantime — a homebrew ROM, not a calib ROM.** Thor's *BOMBERMAN*
+(2004) draws its title screen with a HiColor raster trick that ships **two** implementations
+and picks between them at boot by timing a delay loop against RAS.V:
+
+- `hc_showEmu` — polls `RAS.V & 7` between blocks, so it **self-synchronises** and comes out
+  right whatever the cycle costs are. This is the reference picture.
+- `hc_showHW` — **open loop**: 19 blocks of 224 `ldirw` words, no polling at all, each of
+  which must cost exactly one 8-scanline slice (8 × 515 = **4120 cycles**) or the image
+  shears. This is the path a real console takes.
+
+This core is accurate enough that the ROM's own detector answers "real hardware"
+(`in_emu = 0` at RAM `0x476E`) and takes the open-loop path — so the open-loop path has to
+be right. Measured with the event log armed on `0x8280` (one write per block pair, target
+pitch **8240** cycles):
+
+| `ldirw_cost` | pitch | vs target | pixels matching the reference |
+|---|---|---|---|
+| 14 (= `ldir_cost`, the old behaviour) | 6536 | **0.793×** | 30 % |
+| 17 | 7880 | 0.956× | 83 % |
+| **18** | 8328 | 1.011× | **100 %** |
+| 19 | 8418 | 1.022× | 4 % |
+
+**The window is one cycle wide.** That is what makes this a better instrument than any
+frame-rate average: Cool Boarders tells you whether a number is roughly right, this tells
+you whether it is exactly right.
+
+⛔ **The other explanation was tested and refuted, again by v2.** "The copy's source is slow
+cart flash, so charge `cart_data_wait`" also closes the gap — `cart_data_wait = 2` gives the
+same 100 % picture. Re-running `a_cpu_calib_v2.ngc` with it: **CRND 252, RRND 255**. Silicon
+says those two are equal. So the same ROM that killed `cart_data_wait = 5` in 2026-07 kills
+`= 2` as well, and the width split is the explanation left standing. 🔑 **A fix that produces
+the right picture is not thereby the right fix** — ask the oracle that already exists.
+
+**What v7 should measure.** v6's harness with a fourth row: **`LDWR`** = one 2000-**byte**
+block moved by `LDIRW` (so 1000 iterations), RAM→RAM, alongside the existing `LDRR`. Then
+`LDRR` pins the byte form and `LDRR / LDWR` pins the word form, in one flash. Emulator-side
+reading scale, so a silicon number can be read off directly:
+
+| what comes back | means |
+|---|---|
+| `LDRR ≈ 217` | byte form = 14 (what we ship) |
+| `LDRR ≈ 169` | byte form = 18 |
+| `LDRR ≈ 430` | byte form = 7, the datasheet floor is the truth |
+
+⚠️ v6 **boots in the emulator and crashes on hardware** — unexplained. Build v7 from the v3
+source (which flashed fine) rather than from v6, or the same divergence will eat it.
 
 ## How to use it (real hardware)
 1. Flash `a_cpu_calib_v6.ngc` to your flashcart, boot it.

@@ -458,6 +458,10 @@ void Machine::serial_tick(uint32_t cycles) {
                 irq_pending |= 1u << kIrqVectorSerialTransmit;
                 ++serial_wire_count;
                 ++serial_irq_tx_count;
+                /* THE byte is on the wire, this exact cycle. A host that asked to
+                 * be woken (ngpc_set_serial_break) relays it now instead of at the
+                 * end of some instruction quota. */
+                serial_event = true;
             }
         } else {
             ++serial_cts_hold_ticks;       /* debugger: "held by the peer", not idle */
@@ -481,6 +485,19 @@ void Machine::serial_tick(uint32_t cycles) {
         }
     } else if (!serial_rx.empty() && (mem[0x0000B2] & 0x01) != 0) {
         ++serial_rts_hold_ticks;    /* debugger: bytes waiting, WE are not ready */
+    }
+
+    /* OUR RTS drives the PEER's CTS, and the peer's transmitter is held while it
+     * is high -- so an RTS edge is cable traffic even though no byte moved. A
+     * host that only relayed on bytes would leave the peer stalled against a
+     * handshake we already released: that is the shape of the Card Fighters'
+     * Clash hang, where each console waits for the other. Sampled here rather
+     * than hooked onto the 0xB2 write so that ONE place decides what "the cable
+     * moved" means. */
+    const uint8_t rts_now = uint8_t(mem[0x0000B2] & 0x01);
+    if (rts_now != serial_rts_last) {
+        serial_rts_last = rts_now;
+        serial_event = true;
     }
 }
 

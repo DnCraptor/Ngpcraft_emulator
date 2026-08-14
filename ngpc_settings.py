@@ -499,6 +499,13 @@ CART_DATA_WAIT = 0
 # evidenced (one fix, both games; datasheet was a floor for MUL/DIV too) but not yet
 # confirmed by a clean calibration ROM -- verify the in-game timer against a stopwatch.
 CART_LDIR_COST = 14
+# ...and the WORD form, LDIRW/LDDRW, which is a different instruction. The cost above is
+# charged PER ITERATION, and a word iteration moves two bytes, so reusing 14 for it sold a
+# word copy at half price per byte. Cool Boarders uses the byte form and never measured
+# this one. 18 comes from Bomberman's HiColor title screen, whose open-loop copier must
+# spend exactly 8 scanlines per block: at 14 it ran 0.793x and sheared, at 18 the frame is
+# pixel-identical to the same ROM's self-synchronising path, and 19 breaks it again.
+CART_LDIRW_COST = 18
 
 
 # -- library view --

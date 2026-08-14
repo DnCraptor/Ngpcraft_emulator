@@ -38,7 +38,10 @@ from pathlib import Path
 
 from core import bios_fingerprint
 
-ABI_VERSION = 15
+# 16: + ngpc_get_link_state / ngpc_set_link_state.
+# 17: + ngpc_set_serial_break. Must track NGPC_ABI_VERSION in
+# cpp/include/ngpc_core.h -- the loader compares them and asks for a rebuild.
+ABI_VERSION = 17
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -79,6 +82,10 @@ STATUS = {
     30: "unimplemented",
     40: "breakpoint",
     41: "count-reached",
+    # Only ever seen when the host armed set_serial_break(). Named here all the same:
+    # this table is what stops a status printing as "unknown-status-42", and a planned
+    # rendezvous that reads like an unknown fault is the worst of both.
+    42: "serial-event",
 }
 
 STATUS_OK = 0
@@ -87,6 +94,9 @@ STATUS_SYSTEM_STACK_VIOLATION = 14
 STATUS_WATCHDOG_RESET = 15
 STATUS_BREAKPOINT = 40
 STATUS_COUNT_REACHED = 41
+# The link cable moved and the host armed set_serial_break(). Never seen unless
+# it did: this is a rendezvous, not a fault.
+STATUS_SERIAL_EVENT = 42
 
 # The shared library's name follows the platform. CMake strips the `lib` prefix
 # (PROPERTIES PREFIX "", see cpp/CMakeLists.txt), so it is `ngpc_core.<ext>` on
@@ -293,6 +303,48 @@ class SerialState(Structure):
         return {name: int(getattr(self, name)) for name, _ in self._fields_}
 
 
+LINK_STATE_VERSION = 1
+LINK_FIFO_MAX = 1024
+
+
+class LinkState(Structure):
+    """The link cable as SAVEABLE state. Mirrors `ngpc_link_state_t` FIELD FOR FIELD.
+
+    ⛔ WHY THIS EXISTS, MEASURED 2026-08-04. A save state was the CPU struct + AuxState
+    + the memory image, and the cable is in none of the three: its FIFOs, its shift
+    register and its handshake pins live in the core's `Machine` and were reachable only
+    through `SerialState`, which is read-only. Restoring a state taken mid-transfer was
+    a NO-OP on the channel, and two re-simulations from the "same" restored state
+    diverged by one cable byte inside 60 frames. See LINK_NETPLAY_STUDY.md and
+    tests/test_link_savestate_roundtrip.py.
+
+    ⚡ Its own block, NOT extra fields in AuxState: that struct is the sound CPU, the
+    T6W28 and the timers, and growing it would have shifted the memory image inside
+    every NGPCST02 save state a player already has.
+
+    ⚠️ `overflow` is set when a FIFO was deeper than LINK_FIFO_MAX. The snapshot is
+    then INEXACT -- clamped, not truncated in silence -- and a caller must not pretend
+    otherwise. `SerialState` is still the door for looking; this one is for keeping.
+    """
+
+    _fields_ = [
+        ("version", c_uint32),
+        ("size", c_uint32),
+        ("link_enabled", c_uint8), ("tx_busy", c_uint8),
+        ("tx_shifting", c_uint8), ("tx_byte", c_uint8),
+        ("cts_high", c_uint8), ("rx_pending", c_uint8),
+        ("rx_byte", c_uint8), ("overflow", c_uint8),
+        ("tx_cycles", c_int32), ("rx_cycles", c_int32),
+        ("tx_len", c_uint32), ("rx_len", c_uint32),
+        ("tx_count", c_uint32), ("wire_count", c_uint32),
+        ("rx_queued_count", c_uint32), ("rx_read_count", c_uint32),
+        ("irq_tx_count", c_uint32), ("irq_rx_count", c_uint32),
+        ("cts_hold_ticks", c_uint32), ("rts_hold_ticks", c_uint32),
+        ("tx_fifo", c_uint8 * LINK_FIFO_MAX),
+        ("rx_fifo", c_uint8 * LINK_FIFO_MAX),
+    ]
+
+
 class WriteRec(Structure):
     """One logged memory write: who wrote, where, what. Mirrors `ngpc_write_t`."""
 
@@ -454,6 +506,13 @@ def _bind(path: Path) -> ctypes.CDLL:
     # --- link cable (serial channel 0) ---
     lib.ngpc_serial_set_enabled.argtypes = [c_void_p, c_int]
     lib.ngpc_serial_set_enabled.restype = None
+    # Guarded, like set_ldirw_cost: a DLL built before ABI 17 is a real situation
+    # (dist/, release/, a stale cpp/build), and binding it unconditionally would
+    # take the WHOLE core down over one optional feature. set_serial_break() says
+    # so out loud instead of silently doing nothing.
+    if hasattr(lib, "ngpc_set_serial_break"):
+        lib.ngpc_set_serial_break.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_serial_break.restype = None
     lib.ngpc_serial_read_tx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
     lib.ngpc_serial_read_tx.restype = c_uint32
     lib.ngpc_serial_write_rx.argtypes = [c_void_p, POINTER(c_uint8), c_uint32]
@@ -470,6 +529,10 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_get_aux_state.restype = None
     lib.ngpc_set_aux_state.argtypes = [c_void_p, POINTER(AuxState)]
     lib.ngpc_set_aux_state.restype = c_int
+    lib.ngpc_get_link_state.argtypes = [c_void_p, POINTER(LinkState)]
+    lib.ngpc_get_link_state.restype = None
+    lib.ngpc_set_link_state.argtypes = [c_void_p, POINTER(LinkState)]
+    lib.ngpc_set_link_state.restype = c_int
     lib.ngpc_set_apu_channel_mask.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_apu_channel_mask.restype = None
     lib.ngpc_set_layer_mask.argtypes = [c_void_p, c_uint32]
@@ -510,6 +573,13 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_vram_wait.restype = None
     lib.ngpc_set_ldir_cost.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_ldir_cost.restype = None
+    # Guarded, unlike its neighbours: a DLL built before this symbol existed is a real
+    # situation (dist/, release/, a stale cpp/build), and binding it unconditionally would
+    # take the WHOLE core down over one optional timing knob. set_ldirw_cost() below says
+    # so out loud rather than silently doing nothing.
+    if hasattr(lib, "ngpc_set_ldirw_cost"):
+        lib.ngpc_set_ldirw_cost.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_ldirw_cost.restype = None
     lib.ngpc_set_flash_size.argtypes = [c_void_p, c_uint32, c_uint32]
     lib.ngpc_set_flash_size.restype = None
     lib.ngpc_flash_capacity.argtypes = [c_void_p, c_uint32]
@@ -672,7 +742,8 @@ class NativeMachine:
 
             m.set_cart_wait(3)        # cfg.CART_FETCH_WAIT -- instruction fetch
             m.set_cart_data_wait(0)   # cfg.CART_DATA_WAIT  -- cart data reads are free
-            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies
+            m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies, BYTE form
+            m.set_ldirw_cost(18)      # cfg.CART_LDIRW_COST -- block copies, WORD form
 
         Without them cart code runs ~2.9-3.4x too fast, self-timed games (Cool Boarders,
         Densha de Go) show 60fps where hardware shows 30 -- and, the subtler one, any
@@ -734,6 +805,24 @@ class NativeMachine:
         as MUL/DIV proved to be. Pass 14 if you want the shipping timing.
         See Machine::ldir_cost."""
         self._lib.ngpc_set_ldir_cost(self._h, int(cycles_per_byte))
+
+    def set_ldirw_cost(self, cycles_per_iteration: int) -> None:
+        """Cycles per ITERATION for the WORD block copies, LDIRW/LDDRW. 0 = follow
+        set_ldir_cost(), which is the pre-existing behaviour.
+
+        The two widths are different instructions and the loop is billed per iteration,
+        so one number cannot price both: an LDIRW iteration moves TWO bytes, and charging
+        it the byte figure sells a word copy at half price. Cool Boarders pinned the byte
+        form at 14 and never constrained this one. The shell ships 18 (cfg.CART_LDIRW_COST),
+        measured on Bomberman's open-loop HiColor copier, where a block must cost exactly
+        8 scanlines and the tolerance is one cycle. See Machine::ldirw_cost.
+        """
+        fn = getattr(self._lib, "ngpc_set_ldirw_cost", None)
+        if fn is None:
+            raise NativeCoreUnavailable(
+                "this ngpc_core has no ngpc_set_ldirw_cost -- it predates the "
+                "byte/word split of the block-copy cost; rebuild cpp/")
+        fn(self._h, int(cycles_per_iteration))
 
     def set_flash_size(self, size_bytes: int, *, chip: int = 0) -> None:
         """Present the cart as a flash chip of this capacity (rebuilds the erasable-block
@@ -1158,6 +1247,26 @@ class NativeMachine:
         """
         return self._lib.ngpc_set_aux_state(self._h, ctypes.byref(st)) == 0
 
+    def link_state(self) -> LinkState:
+        """The link cable, as something a savestate can keep. See LinkState.
+
+        `serial_state()` is the debugger's read-only view of the same channel; this is
+        the one that round-trips. A snapshot taken with a FIFO deeper than
+        LINK_FIFO_MAX comes back with `overflow` set and is inexact.
+        """
+        st = LinkState()
+        self._lib.ngpc_get_link_state(self._h, ctypes.byref(st))
+        return st
+
+    def set_link_state(self, st: LinkState) -> bool:
+        """Put the cable back. False if the blob is from another build.
+
+        ⚠️ Like the aux block, AFTER the memory image: SC0MOD/BR0CR live in the image
+        and decide how fast a byte shifts, so restoring the channel first would run it
+        against the previous timeline's baud setup for one call.
+        """
+        return self._lib.ngpc_set_link_state(self._h, ctypes.byref(st)) == 0
+
     def read(self, address: int, count: int) -> bytes:
         out = (c_uint8 * count)()
         self._lib.ngpc_read_mem(self._h, address, out, count)
@@ -1176,6 +1285,30 @@ class NativeMachine:
     # (serial_write_rx). See core/link.py for the in-process / TCP bridges.
     def serial_set_enabled(self, on: bool) -> None:
         self._lib.ngpc_serial_set_enabled(self._h, 1 if on else 0)
+
+    def set_serial_break(self, on: bool) -> None:
+        """Stop `run()` the moment the cable moves, instead of polling for it.
+
+        A host bridging two machines has to relay bytes and had no way to know
+        when, so it pumped every N instructions -- N chosen for the worst known
+        game (400: The Last Blade breaks past it). That is cable time measured in
+        instructions, and the core already counts the real unit: `serial_tick`
+        knows the exact cycle a byte finishes shifting, from BR0CR/SC0MOD.
+
+        Armed, `run()` returns with `stop_status == STATUS_SERIAL_EVENT` as soon
+        as a byte reaches the transmit FIFO or this machine's RTS changes (it
+        drives the peer's CTS, and Card Fighters' Clash's handshake stalls on it).
+        The instruction in flight is completed first, so the machine is always
+        left on an instruction boundary and the run simply resumes.
+
+        Off by default: every existing caller keeps its exact behaviour.
+        """
+        fn = getattr(self._lib, "ngpc_set_serial_break", None)
+        if fn is None:
+            raise NativeCoreUnavailable(
+                "this ngpc_core has no ngpc_set_serial_break -- it predates ABI 17; "
+                "rebuild cpp/")
+        fn(self._h, 1 if on else 0)
 
     def serial_read_tx(self, max_bytes: int = 64) -> bytes:
         """Drain the bytes this machine has transmitted since the last call."""

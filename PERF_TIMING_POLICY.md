@@ -138,8 +138,20 @@ Valeurs **mesurees** (ROMs dans `hw_calibration/`, jamais reglees a l'oreille) :
 |---|---|---|
 | `cart_wait` — cycles par octet de **fetch** | **3** | `cpu_calib_v1` : classes fetch-bound ~3,4x trop rapides, MUL/DIV ~2,5x, raster juste |
 | `cart_data_wait` — cycles par octet **lu en donnee** | **0** | `cpu_calib_v2` : lecture cartouche == lecture RAM (252 == 252). Une valeur de 5, calee sur un framerate, a ete **refutee** par cette ROM |
-| `ldir_cost` — cycles par octet de `LDIR` | **14** | fait tomber Cool Boarders a ses 30 fps sans toucher Fatal Fury. Fortement etaye, ROM de mesure (`v6`) encore ouverte |
+| `ldir_cost` — cycles par **iteration** du `LDIR`/`LDDR` **octet** | **14** | fait tomber Cool Boarders a ses 30 fps sans toucher Fatal Fury. Fortement etaye, ROM de mesure (`v6`) encore ouverte |
+| `ldirw_cost` — cycles par **iteration** du `LDIRW`/`LDDRW` **mot** | **18** | le copieur raster en boucle ouverte du BOMBERMAN de Thor : chaque bloc doit couter exactement 8 lignes (8 × 515 = 4120 cycles) ou l'image cisaille. A 14 le bloc tombe a 0,793× et l'ecran est illisible ; a 18 la trame est **pixel-identique** au chemin auto-synchronise de la meme ROM ; a 17 → 83 % des pixels, a 19 → 4 %. Fenetre d'**un cycle**, ce qui en fait un meilleur instrument qu'une moyenne de framerate |
 | `vram_wait` — ecriture VRAM | **0 (off)** | l'effet est reel (`cpu_calib_v3` : VWR 452 < MEM 471) mais le cout/octet n'est pas fixe : on ne livre pas un entier devine |
+
+⚖️ **`ldir` et `ldirw` sont deux instructions, pas un reglage a deux noms.** Le cout est
+paye **par iteration**, et une iteration du `LDIRW` deplace **deux** octets : lui facturer
+le chiffre de la forme octet vend la copie mot a moitie prix. Cool Boarders, qui a fixe le
+14, utilise la forme **octet** — cette mesure n'a jamais rien contraint sur la forme mot, et
+un seul champ ne pouvait pas porter les deux reponses. `ldirw_cost = 0` signifie « suivre
+`ldir_cost` », c'est-a-dire le comportement d'avant, pour tout appelant qui ne demande rien.
+
+⛔ L'autre facon de combler le meme ecart — `cart_data_wait=2`, sur l'idee que la source de
+la copie est de la flash cartouche lente — est **refutee** par `cpu_calib_v2` sur silicium
+(CRND == RRND) : rejouee ici, elle fait tomber CRND a 252 sous RRND 255. Ne pas la ressusciter.
 
 ### ⚠️ Deux defauts differents, et c'est voulu
 

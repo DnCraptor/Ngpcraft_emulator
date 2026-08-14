@@ -779,6 +779,16 @@ struct Machine {
     mutable bool    serial_rx_pending = false;
     mutable uint8_t serial_rx_byte = 0;
     int32_t  serial_rx_cycles = 0;
+    /* --- waking the host when the cable moves (ngpc_set_serial_break) --------
+     * NOT saved state: `serial_event` means "something crossed during THIS
+     * ngpc_run", and ngpc_run clears it on entry. `serial_break_on_event` is a
+     * host policy, like a breakpoint, not a property of the console -- which is
+     * why neither belongs in ngpc_link_state_t. */
+    bool     serial_break_on_event = false;
+    bool     serial_event = false;
+    /* Last RTS bit seen by serial_tick, to spot a CHANGE. 0xFF = never sampled,
+     * so the first tick after a reset does not invent an edge. */
+    uint8_t  serial_rts_last = 0xFF;
     /* --- counters, for the debugger's Link tab (ngpc_serial_state) ----------
      * Bytes crossing the cable are visible from Python, but WHY they are not
      * crossing is not: a byte can sit in serial_tx_busy because the peer holds
@@ -963,6 +973,31 @@ struct Machine {
      * field keeps the datasheet number. Strongly evidenced, still pending a clean silicon
      * measurement (hw_calibration a_cpu_calib_v6.ngc, LDRR/LDVR). `ngpc_set_ldir_cost`. */
     uint16_t ldir_cost = 7;
+    /* Cycles per ITERATION for the WORD forms, LDIRW/LDDRW. 0 = follow ldir_cost.
+     *
+     * ⚖️ THE TWO WIDTHS ARE NOT THE SAME INSTRUCTION AND THE LOOP IS PAID PER ITERATION,
+     * NOT PER BYTE. `ldir_cost` is documented "per byte" and it is -- for the BYTE form,
+     * where one iteration moves one byte. LDIRW moves TWO bytes per iteration, so billing
+     * it the same number charged a word transfer at half price per byte. Cool Boarders,
+     * which pinned 14, uses the BYTE form; nothing in that measurement ever constrained
+     * the word form, and one field could not hold both answers anyway.
+     *
+     * ⚖️ MEASURED, on Thor's BOMBERMAN (2004) HiColor title screen. Its `hc_showHW` is an
+     * OPEN-LOOP raster copier: 19 blocks of 224 `ldirw` words, no polling, each of which
+     * must cost exactly one 8-scanline slice (8 * 515 = 4120 cycles) or the picture shears.
+     * At 14 a block came to 3268 cycles -- 0.793x -- and the screen was garbage. 18 puts it
+     * at 8328 per pair against a target of 8240 and the frame comes out PIXEL-IDENTICAL to
+     * the same ROM's self-synchronising path (`hc_showEmu`, which polls RAS.V and is right
+     * whatever the costs are). 17 -> 83% of pixels, 19 -> 4%: the window is one cycle wide,
+     * which is what makes this ROM a better instrument than any frame-rate average.
+     *
+     * ⛔ The other way to close the same gap -- `cart_data_wait=2`, on the theory that the
+     * copy's source is slow cart flash -- is REFUTED by cpu_calib_v2 on silicon (CRND ==
+     * RRND). It was re-run here and it drops CRND to 252 under RRND 255. Do not revive it.
+     *
+     * a_cpu_calib_v6.ngc measures the BYTE form only; a word-form ROM would settle this
+     * one the same way. `ngpc_set_ldirw_cost`. */
+    uint16_t ldirw_cost = 0;
     mutable uint32_t access_wait = 0;
     /* Set by the run loop to the PC of the instruction being executed, so read8() can
      * tell a fetch byte (inside [pc, pc+8)) from a data read and charge the right cost. */

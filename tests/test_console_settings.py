@@ -299,3 +299,80 @@ class ManualClock(unittest.TestCase):
         s.setValue("bios/clock_manual", self.WHEN)
         self.assertEqual(cfg.clock_manual(s), self.WHEN)
         s.remove("bios/clock_mode"); s.remove("bios/clock_manual")
+
+
+@unittest.skipUnless(native.available(), "native core not built")
+@unittest.skipUnless(_images(), "no BIOS image to test against")
+class TwoConsolesTwoCoinCells(unittest.TestCase):
+    """⛔ LOCAL 2-PLAYER GAVE BOTH CONSOLES ONE COIN CELL.
+
+    `SYSTEM_RAM_PATH` / `SYSTEM_RTC_PATH` are the cell of THE console, and the shell
+    builds player 2's page through the same `PlayPage.start`, so both machines booted
+    from the same file. MEASURED before the fix: two sessions created 400 ms apart came
+    up bit-identical down to `counter` -- the sub-second CYCLE phase of the crystal
+    (1321875 on both). Two coin cells do not share an oscillator.
+
+    It is reachable, not merely untidy. A game that seeds its RNG off the clock then
+    gets the SAME stream on both consoles: Ahchay's HEADTOHEAD does exactly that
+    (`RandomNumberCounter = Second << 5`), and its host/client election had nothing left
+    to break a tie -- "I quite often end up with both sides claiming to be the host".
+    Attaching the cable power-cycles both at once, so they boot in step too. The
+    emulator was manufacturing a role collision that hardware makes far rarer.
+
+    And the write-back collided: both sessions committed the same file, so whichever
+    window closed LAST stamped its clock over the other's (P1 left 0x21 on disk, P2
+    closed, the file read 0x02).
+    """
+
+    def setUp(self):
+        from core import native_session as ns
+        self.ns = ns
+        self.rom = PROBE_ROM
+
+    def _session(self, second):
+        return self.ns.NativeSession(self.rom, bios_path=REAL_BIOS, save_to_rom=False,
+                                     sidecar=False, second_console=second)
+
+    def test_the_second_console_has_its_own_crystal(self):
+        with self._session(False) as p1, self._session(True) as p2:
+            a, b = p1.machine.rtc(), p2.machine.rtc()
+            self.assertNotEqual(a.counter, b.counter,
+                                "both consoles share one oscillator phase")
+
+    def test_it_moves_the_phase_and_nothing_else(self):
+        """No displayed field may move: this says the crystals differ, it does not
+        invent a time. A second console reading a different DATE would be fabricated
+        data, which is a worse bug than the one being fixed."""
+        with self._session(False) as p1, self._session(True) as p2:
+            a, b = p1.machine.rtc(), p2.machine.rtc()
+            self.assertEqual(
+                (a.year, a.month, a.day, a.hour, a.minute, a.second, a.weekday),
+                (b.year, b.month, b.day, b.hour, b.minute, b.second, b.weekday),
+                "the second console's displayed clock was altered, not just its phase")
+
+    def test_the_first_console_is_unchanged(self):
+        """The ordinary single-player path must be bit-for-bit what it was."""
+        with self._session(False) as a, self._session(False) as b:
+            self.assertEqual(a.machine.rtc().counter, b.machine.rtc().counter,
+                             "two ordinary consoles stopped agreeing on the saved cell")
+
+    def test_the_second_console_never_writes_the_coin_cell(self):
+        p1, p2 = self._session(False), self._session(True)
+        p2.machine.rtc_advance(3600 * 5)          # the two consoles ran different lives
+        self.assertNotEqual(p1.machine.rtc().hour, p2.machine.rtc().hour)
+        p1.close()
+        after_p1 = self.ns.read_rtc_file(self.ns.SYSTEM_RTC_PATH)[0].hour
+        p2.close()                                 # ...closed LAST, the losing order
+        after_p2 = self.ns.read_rtc_file(self.ns.SYSTEM_RTC_PATH)[0].hour
+        self.assertEqual(after_p1, after_p2,
+                         "the second console stamped its clock over the first one's cell")
+
+    def test_the_cartridge_save_is_still_written(self):
+        """Only the CELL is read-only. Player 2 picked its own cartridge and played it,
+        so that cartridge's save is its own and must survive -- guarding too much here
+        would trade a fidelity bug for a lost save."""
+        import inspect
+        src = inspect.getsource(self.ns.NativeSession.close)
+        body = src.split("if not self.second_console")[0]
+        self.assertIn("commit_save()", body,
+                      "the cartridge save must be committed regardless of which console")

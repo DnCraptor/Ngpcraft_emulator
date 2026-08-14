@@ -404,8 +404,16 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
          * figures already proved to be FLOORS (v2 silicon), and 7 leaves Cool Boarders (big
          * per-frame RAM ldir) at ~51fps vs its silicon 30. m_ldir_cost lets us test higher
          * values: 14 puts Cool Boarders at 30fps AND leaves Fatal Fury at 60 -- one fix, both
-         * games. Default 7 (datasheet); the shell can raise it, pending final confirmation. */
-        const uint16_t per = (is_compare ? 6 : m.ldir_cost);
+         * games. Default 7 (datasheet); the shell can raise it, pending final confirmation.
+         *
+         * ⚡ THE COST IS PER ITERATION, AND AN ITERATION OF THE WORD FORM MOVES TWO BYTES.
+         * Charging LDIRW the byte number bills a word copy at half price per byte, which is
+         * what left BOMBERMAN's open-loop HiColor copier running 21% fast and shearing its
+         * title screen. `ldirw_cost` (0 = follow ldir_cost, so nothing moves until a caller
+         * asks) carries the word answer; see Machine::ldirw_cost for the measurement. */
+        const uint16_t per = is_compare        ? 6
+                           : (sz && m.ldirw_cost) ? m.ldirw_cost
+                                                 : m.ldir_cost;
         out_cycles = uint16_t(
             (repeats ? per * iterations + 1
                      : (is_compare ? 6 : 8)) + e.extra);

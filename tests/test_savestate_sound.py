@@ -207,25 +207,41 @@ class ShellSavestateReaderTests(unittest.TestCase):
     file the shell writes. The sound block sits between the CPU struct and the image,
     so a reader that does not know about it reads the image one struct too early and
     hands every downstream tool a memory map shifted by a few hundred bytes -- wrong,
-    plausible, and silent. Both generations are checked here, with a byte planted at a
+    plausible, and silent. Every generation is checked here, with a byte planted at a
     known address as the witness. No DLL needed: the ctypes structs are declarations.
+
+    ⛔ AND THIS CLASS NAMED A READER IT NEVER RAN. `ngpc_native.load_state` was in the
+    paragraph above from the day it was written, and only `load_shell_savestate` was
+    ever called -- so when v3 shipped in the shell and that reader was not updated, the
+    file it exists to protect stayed green while `--state` REFUSED every state a player
+    produces. A second reader is only covered if the test actually opens it, so both go
+    through `_check` now, and adding a generation means adding it to `MAGICS`.
     """
 
     MARKER_ADDR = 0x004242
     MARKER = 0x5A
+    # Newest first. `ngpc_shell.STATE_MAGIC` must be the head of this list.
+    MAGICS = (b"NGPCST03", b"NGPCST02", b"NGPCST01")
 
     def _blob(self, magic: bytes) -> bytes:
-        from core.native import AuxState, CpuState
+        from core.native import AuxState, CpuState, LinkState
 
         cpu = CpuState()
         cpu.pc = 0x00201234
-        aux = AuxState()
-        aux.version = native.AUX_STATE_VERSION
-        aux.size = ctypes.sizeof(AuxState)
+        body = bytes(cpu)
+        if magic in (b"NGPCST03", b"NGPCST02"):
+            aux = AuxState()
+            aux.version = native.AUX_STATE_VERSION
+            aux.size = ctypes.sizeof(AuxState)
+            body += bytes(aux)
+        if magic == b"NGPCST03":
+            link = LinkState()
+            link.version = native.LINK_STATE_VERSION
+            link.size = ctypes.sizeof(LinkState)
+            body += bytes(link)
         mem = bytearray(STATE_MEM_LEN)
         mem[self.MARKER_ADDR] = self.MARKER
-        body = bytes(cpu) + (bytes(aux) if magic == b"NGPCST02" else b"") + bytes(mem)
-        return magic + body
+        return magic + body + bytes(mem)
 
     def _check(self, magic: bytes) -> None:
         from core import savestate
@@ -233,15 +249,76 @@ class ShellSavestateReaderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "state.bin"
             path.write_bytes(self._blob(magic))
+
             doc = savestate.load_shell_savestate(path)
-            self.assertEqual(doc.cpu.pc, 0x00201234)
-            self.assertEqual(doc.writable_overlay.get(self.MARKER_ADDR), self.MARKER)
+            self.assertEqual(doc.cpu.pc, 0x00201234, f"{magic.decode()}: CPU misread")
+            self.assertEqual(doc.writable_overlay.get(self.MARKER_ADDR), self.MARKER,
+                             f"{magic.decode()}: the image was read at the wrong offset")
+
+            self._check_headless_reader(magic, path)
+
+    def _check_headless_reader(self, magic: bytes, path: Path) -> None:
+        """`ngpc_native.load_state` on the same file, with a recording stand-in for the
+        machine -- it only has to prove it ACCEPTS the generation and lands the image at
+        the right offset, which is precisely what a missed magic breaks."""
+        import ngpc_native
+        from core.native import CpuState
+
+        written: dict[int, bytes] = {}
+
+        class Recorder:
+            def cpu(self):
+                return CpuState()
+
+            def write(self, addr, data):
+                written[addr] = bytes(data)
+
+            def set_cpu(self, cpu):
+                self.restored_pc = cpu.pc
+
+            def set_aux_state(self, st):
+                pass
+
+            def set_link_state(self, st):
+                pass
+
+        rec = Recorder()
+        try:
+            ngpc_native.load_state(rec, path)
+        except SystemExit as e:                       # pragma: no cover -- the failure
+            self.fail(f"ngpc_native.load_state refused {magic.decode()}: {e}")
+        self.assertEqual(rec.restored_pc, 0x00201234,
+                         f"{magic.decode()}: headless reader misread the CPU")
+        image = written.get(0)
+        self.assertIsNotNone(image, f"{magic.decode()}: headless reader wrote no image")
+        self.assertEqual(len(image), STATE_MEM_LEN,
+                         f"{magic.decode()}: headless reader wrote a short image")
+        self.assertEqual(image[self.MARKER_ADDR], self.MARKER,
+                         f"{magic.decode()}: headless reader read the image at the "
+                         f"wrong offset -- it does not know about a block")
+
+    def test_it_reads_a_v3_state_at_the_right_offset(self) -> None:
+        self._check(b"NGPCST03")
 
     def test_it_reads_a_v2_state_at_the_right_offset(self) -> None:
         self._check(b"NGPCST02")
 
     def test_it_still_reads_a_v1_state(self) -> None:
         self._check(b"NGPCST01")
+
+    def test_the_shells_own_magic_is_one_the_readers_know(self) -> None:
+        """The drift alarm. The shell decides the format; a generation it starts writing
+        and the readers do not know is a door closing on every downstream tool."""
+        import ngpc_native
+        import ngpc_shell
+
+        self.assertEqual(ngpc_shell.STATE_MAGIC, self.MAGICS[0],
+                         "the shell writes a generation this file does not cover")
+        self.assertIn(ngpc_shell.STATE_MAGIC, ngpc_native.SHELL_MAGICS,
+                      "ngpc_native.load_state cannot read what the shell now writes")
+        from core import savestate
+        self.assertIn(ngpc_shell.STATE_MAGIC, savestate.SHELL_SAVESTATE_MAGICS,
+                      "core.savestate cannot read what the shell now writes")
 
     def test_an_unknown_magic_is_refused(self) -> None:
         from core import savestate

@@ -664,6 +664,12 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
                 m.set_cart_wait(cfg.CART_FETCH_WAIT)
                 m.set_cart_data_wait(cfg.CART_DATA_WAIT)
                 m.set_ldir_cost(cfg.CART_LDIR_COST)
+                # ⚠️ THIS PAIR IS A REPLICA OF `Shell._begin_mirror`, so a knob added
+                # there and not here quietly stops it being one. The test still passes
+                # either way -- both far consoles get the same treatment -- which is
+                # exactly why the drift is invisible: what it stops proving is that the
+                # far pair runs the code at the speed a real session does.
+                m.set_ldirw_cost(cfg.CART_LDIRW_COST)
             m.set_rtc(clock)
             m.serial_set_enabled(True)
             m.reset(bios_handoff=True)
@@ -1163,10 +1169,19 @@ def test_hosting_a_mirror_game_shows_the_host_its_own_address(sh, app, monkeypat
     built = []
 
     class FakeHostInfo:
+        """The real one is a QDialog, and the shell uses two things of it beyond
+        `show()`: `finished`, to read "closing this panel means never mind" as a
+        cancel, and `close()`, to take the panel away once the peer is in."""
+
+        finished = type("_Sig", (), {"connect": staticmethod(lambda *a: None)})()
+
         def __init__(self, game, port, lang, parent=None):
             built.append((game, port))
 
         def show(self):
+            pass
+
+        def close(self):
             pass
 
     monkeypatch.setattr(ngpc_lobby, "HostInfoDialog", FakeHostInfo)
@@ -1176,7 +1191,12 @@ def test_hosting_a_mirror_game_shows_the_host_its_own_address(sh, app, monkeypat
     # ⚠️ No real listener: a QThread left blocked in accept() and torn down with the
     # test is a Qt-level abort, not a test failure -- and it lands on whoever runs
     # next. What this test is about is one wire: hosting must build the panel.
-    monkeypatch.setattr(shell.Shell, "_start_net", lambda *a, **k: None)
+    # ⚠️ AND IT MUST RETURN True, LIKE THE REAL ONE. `_start_net` now reports whether
+    # the attempt actually started, and its callers stop when it did not -- that is
+    # what stops `_mirror_pending` being armed over an earlier attempt still in
+    # flight. A fake returning None reads as "refused" and skips the very panel this
+    # test is about.
+    monkeypatch.setattr(shell.Shell, "_start_net", lambda *a, **k: True)
     try:
         sh.play.start(ROM)
         sh._host_mirror()
