@@ -204,6 +204,75 @@ reading scale, so a silicon number can be read off directly:
 ⚠️ v6 **boots in the emulator and crashes on hardware** — unexplained. Build v7 from the v3
 source (which flashed fine) rather than from v6, or the same divergence will eat it.
 
+## v8 — the ACCESS COST during active display (bus contention), the top open question
+
+**Where it came from, and it is not our own suspicion.** `Emulator_vs_Hardware_20260807`
+(xenon project), measured on device, same-session pairs. Their `SetSpriteEx` writes a sprite
+position to a work-RAM shadow and can either keep it in a register or *read it back* as the
+source for the OAM store — one extra **work-RAM read** per sprite, 40–60 sprites/frame:
+
+| | with the readback | without | verdict |
+|---|---|---|---|
+| device, clean pair 2026-08-07 | 117 | 107 | **+9 %** |
+| this core, calibrated | 90 | 90 | **0 %** — invisible |
+
+And a third case flips the SIGN: metasprite chaining (fewer OAM writes, more bookkeeping)
+measures **−1.8 VBl against** the chain here and **+5 VBl in favour** of it on device. A model
+that reverses an optimisation's sign is worse than one that is merely imprecise — it makes the
+developer choose backwards.
+
+**What the mechanism is.** Their own source comment names it: *"every access during active
+display is penalised by the display controller"*, and *"the emulator reported 1.5 % faster
+because it counts instructions and not bus accesses"*. This is **bus contention**, not a cost
+of a region.
+
+⚖️ **AND THIS CORE ALREADY HAS THE RIGHT SHAPE — it is simply too narrow** (`execute.cpp`):
+
+```cpp
+if (m.vram_wait && a >= 0x8000 && a <= 0xBFFF && !m.in_vblank())
+    m.access_wait += m.vram_wait;
+```
+
+Per access, and only outside vblank — exactly right, and backed by v3 (`VWR < MEM`). Three
+things keep it from covering the case: `vram_wait` **defaults to 0**, it applies to **writes
+only**, and it is limited to **0x8000–0xBFFF**. Their readback is a work-RAM READ, so it is
+outside all three — turning `vram_wait` on would not touch it. (They also cannot help pin
+`vram_wait` itself: their game does all its VRAM writes in vblank.)
+
+🔑 **And v2 left a hole nobody noticed.** v2 proved cart-data reads and RAM reads are **EQUAL
+TO EACH OTHER**; it never said what they equal. `cart_data_wait = 0` reads "equal" as
+"therefore free", which v2 does not license. Their +9 % is the first evidence that the shared
+value is not 0.
+
+**What v8 must measure — and it is NOT "RAM vs cart" (v2 answered that) nor `vram_wait`:**
+
+> **N accesses versus N+1, SAME region, run once during ACTIVE DISPLAY and once during
+> VBLANK.**
+
+Four pairs, same harness as v2/v3, each a tight loop of a fixed instruction sequence differing
+by exactly one data access:
+
+| row | what it isolates |
+|---|---|
+| `RD_A` / `RD_V` | one extra **work-RAM READ**, active display vs vblank |
+| `WR_A` / `WR_V` | one extra **work-RAM WRITE**, same split |
+| `CD_A` / `CD_V` | one extra **cart-data READ**, same split (closes v2's hole) |
+| `OR_A` / `OR_V` | one extra **OAM/VRAM READ** (v3 did writes only) |
+
+Reading the result:
+- **`X_A == X_V` on every row** → there is no display-phase penalty; the +9 % is something
+  else and Case B re-opens. Do NOT ship a number.
+- **`X_A < X_V`** → the difference IS the per-access contention cost, per region and per
+  direction. That one set of numbers pins `cart_data_wait`, extends the `vram_wait` guard to
+  reads, and gives work RAM the term it has never had — which is what all three of their open
+  cases are waiting on.
+
+⚠️ Do not calibrate against their ABSOLUTE cycle figures. Their `README.md` states "86 922
+cycles per frame at a fixed 30 fps" and, two paragraphs later, that a frame's compute "sits
+just above two VBlanks" — 86 922 is **0.85** VBlank here, so the two cannot share a unit.
+Their **ratios** (VBl/30F, HW-vs-emu factors) carry no unit and are sound; the absolute
+figures are not, until the unit is settled with them.
+
 ## How to use it (real hardware)
 1. Flash `a_cpu_calib_v6.ngc` to your flashcart, boot it.
 2. Wait a few seconds for the numbers to settle, note them all (+ RASV).

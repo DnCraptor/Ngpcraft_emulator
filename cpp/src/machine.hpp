@@ -1201,7 +1201,21 @@ struct Machine {
             const bool is_fetch = (a - fetch_window) < 8u;   // unsigned wrap => outside == huge
             /* Silicon (cpu_calib_v2: CRND == RRND) says a cart DATA read costs the same
              * as RAM -- only the instruction FETCH is wait-stated. So data reads get
-             * cart_data_wait, which defaults to 0 (free); no fallback to cart_wait. */
+             * cart_data_wait; no fallback to cart_wait.
+             *
+             * ⚠️ AND ITS DEFAULT OF 0 IS AN ASSUMPTION, NOT THAT MEASUREMENT. v2 proved
+             * cart-data and RAM are EQUAL TO EACH OTHER; it never said what they equal.
+             * Reading "equal" as "therefore free" is a step v2 does not license, and the
+             * value has sat at 0 ever since with nothing constraining it. First evidence
+             * that it is NOT 0, from outside: Emulator_vs_Hardware_20260807 "Case B" --
+             * ONE extra work-RAM read per sprite (40-60 sprites/frame) costs the device
+             * ~9%, and this core charges exactly 0 for it. That is a RAM read, so the
+             * same unmeasured quantity, in the other region v2 tied it to.
+             *
+             * Do NOT "fix" it by guessing a number here: a guessed cart_data_wait = 5 was
+             * already shipped once and refuted by v2 itself. The measurement that would
+             * settle it is specified in hw_calibration/README.md as v8 (N accesses vs
+             * N+1, same region, active display vs vblank). */
             access_wait += is_fetch ? cart_wait : cart_data_wait;
         }
         if (a >= rlog_lo && a <= rlog_hi) note_read(a, mem[a]);   // disarmed by default
