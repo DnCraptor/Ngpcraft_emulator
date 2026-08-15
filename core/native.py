@@ -39,9 +39,11 @@ from pathlib import Path
 from core import bios_fingerprint
 
 # 16: + ngpc_get_link_state / ngpc_set_link_state.
-# 17: + ngpc_set_serial_break. Must track NGPC_ABI_VERSION in
-# cpp/include/ngpc_core.h -- the loader compares them and asks for a rebuild.
-ABI_VERSION = 17
+# 17: + ngpc_set_serial_break.
+# 18: + ngpc_run_linked -- both cabled consoles and the relay, inside the core.
+# Must track NGPC_ABI_VERSION in cpp/include/ngpc_core.h -- the loader compares
+# them and asks for a rebuild.
+ABI_VERSION = 18
 
 # How the machine comes up (NGPC_RESET_* in ngpc_core.h). This was a bool, and a third
 # case was hiding inside it: "no hand-off" ALSO started at the cart's entry point, so
@@ -493,6 +495,13 @@ def _bind(path: Path) -> ctypes.CDLL:
 
     lib.ngpc_run_frames.argtypes = [c_void_p, c_uint32, c_uint32, POINTER(Summary)]
     lib.ngpc_run_frames.restype = c_int
+    lib.ngpc_run_linked.argtypes = [c_void_p, c_void_p, c_uint32, c_uint32,
+                                    POINTER(Summary), POINTER(Summary)]
+    lib.ngpc_run_linked.restype = c_int
+    lib.ngpc_link_relay_count.argtypes = [c_void_p]
+    lib.ngpc_link_relay_count.restype = c_uint32
+    lib.ngpc_link_pair_max_gap.argtypes = [c_void_p]
+    lib.ngpc_link_pair_max_gap.restype = ctypes.c_uint64
     lib.ngpc_get_z80.argtypes = [c_void_p, POINTER(Z80State)]
     lib.ngpc_get_z80.restype = None
     lib.ngpc_get_apu_writes.argtypes = [c_void_p, POINTER(ApuWrite), c_uint32]
@@ -1342,6 +1351,24 @@ class NativeMachine:
         self._lib.ngpc_serial_state(self._h, ctypes.byref(st))
         return st
 
+    def link_pair_max_gap(self) -> int:
+        """Widest cycle gap between the two consoles during the last linked call.
+
+        The number that says whether they were really interleaved -- totals cannot,
+        because a whole frame each in sequence costs exactly the same cycles as
+        taking turns while leaving one console frozen throughout the other's frame.
+        """
+        return int(self._lib.ngpc_link_pair_max_gap(self._h))
+
+    def link_relay_count(self) -> int:
+        """Relays the CORE has done for this console since the cable came up.
+
+        Zero while a host owns the relay itself. The question it answers is the one
+        The Last Blade's handshake cares about: was the cable relayed many times
+        inside a frame, or once at the end of it?
+        """
+        return int(self._lib.ngpc_link_relay_count(self._h))
+
     def run_frames(self, frames: int = 1, *, max_instrs: int | None = None) -> Summary:
         """Advance whole FRAMES. The core owns the raster, so it owns the boundary.
 
@@ -1368,6 +1395,35 @@ class NativeMachine:
             return summary, list(recs[: summary.emitted])
         self._lib.ngpc_run(self._h, count, None, 0, ctypes.byref(summary))
         return summary, []
+
+
+def run_linked(a: "NativeMachine", b: "NativeMachine", frames: int = 1, *,
+               max_instrs: int | None = None) -> "tuple[Summary, Summary]":
+    """Advance two CABLED consoles together, with the relay done inside the core.
+
+    This replaces the host-side pattern it was written from -- run `a` for a slice of
+    instructions, cross the FFI boundary, move the bytes, run `b` for a slice, cross
+    back -- and it replaces it for a reason that is not performance.
+
+    ⛔ AN INSTRUCTION COUNT IS NOT CABLE TIME. `CABLE_SLICE = 400` approximated one by
+    the other, and the two link faults this project paid most for -- Card Fighters'
+    Clash's versus handshake and The Last Blade's threshold -- are the same symptom of
+    that approximation rather than two separate bugs. Every emulator that shipped a
+    working serial link reached the same conclusion first (LINK_NETPLAY_STUDY.md L3):
+    put BOTH consoles and the cable in the core, paced by the hardware's serial clock.
+
+    ⚡ The core now advances whichever console is BEHIND IN CYCLES, in steps bounded by
+    a fraction of the cable's own byte time, and relays the moment either console says
+    the cable moved. The pair can never be more than one quantum of emulated time apart.
+
+    Both machines must have the serial hardware enabled first: the cable goes in before
+    either console boots. Returns one summary per console, in the order given.
+    """
+    budget = max_instrs if max_instrs is not None else max(frames, 1) * 400_000
+    sa, sb = Summary(), Summary()
+    a._lib.ngpc_run_linked(a._h, b._h, frames, budget,
+                           ctypes.byref(sa), ctypes.byref(sb))
+    return sa, sb
 
 
 def status_name(code: int) -> str:

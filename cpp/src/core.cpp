@@ -854,6 +854,274 @@ NGPC_API int ngpc_run_frames(ngpc_t* h, uint32_t frames, uint32_t max_instrs,
     return 0;
 }
 
+/* ============================ THE CABLED PAIR =============================
+ *
+ * ⚡ BOTH CONSOLES AND THE CABLE, INSIDE THE CORE. Until now the core owned the
+ * serial hardware but not the cable: the host ran console A for a slice, crossed
+ * the FFI boundary to relay bytes, ran console B for a slice, crossed back. That
+ * slice was counted in INSTRUCTIONS -- an approximation of cable time by something
+ * that is not cable time -- and the study of how the Game Boy scene solved this
+ * exact problem (LINK_NETPLAY_STUDY.md §4, L3) found the same answer everywhere:
+ * everyone who shipped a working link put BOTH consoles and the cable in the core,
+ * paced by the hardware's own serial clock. Card Fighters' Clash's versus handshake
+ * and The Last Blade's threshold are not two bugs; they are two symptoms of pacing
+ * a cable with an instruction count.
+ *
+ * ⛔ WHY AN EVENT ALONE IS NOT ENOUGH, measured 2026-08-14. `ngpc_set_serial_break`
+ * hands back at the exact cycle the cable moves, which sounds like the whole answer
+ * -- and as the ONLY rule it is worse than the slice it replaces: it fires on what
+ * a console SENDS, so a console that is quietly computing says nothing and runs to
+ * the end of its frame while its peer has not run at all. Median step measured at
+ * one whole frame, which is exactly the scheduling that loses the VS handshake.
+ *
+ * ⚡ SO THE RULE HERE IS BOTH, AND THE SECOND HALF IS A CLOCK, NOT A COUNT: always
+ * advance whichever console is BEHIND IN CYCLES, in steps bounded by a fraction of
+ * the cable's own byte time, and relay whenever either console reports the cable
+ * moved. The two consoles can therefore never be more than one quantum of emulated
+ * time apart -- which is the property "run a slice each" never had, and the reason
+ * one console could answer a byte a whole frame late in one direction.
+ *
+ * Determinism: the lag test breaks ties towards A, the quantum is derived from the
+ * machine's own registers, and nothing here reads a wall clock. Two runs of the
+ * same pair from the same state produce the same bytes in the same order. */
+
+/* How finely the pair is interleaved, as a divisor of one byte's time on the wire.
+ * The cable's own clock is the unit that matters, so this is expressed against it
+ * rather than picked: at the byte time every cartridge actually programs (3200
+ * cycles) it gives 400 CYCLES, where the host-side slice it replaces was 400
+ * INSTRUCTIONS -- roughly ten times coarser, and in the wrong unit. */
+constexpr int32_t kCableQuantumDivisor = 8;
+constexpr uint32_t kCableQuantumFloor = 64;      /* cycles; a sane floor if a game
+                                                  * programs an absurd baud rate  */
+/* Average cycles per instruction used to turn a cycle budget into an instruction
+ * budget. Same reasoning as ngpc_run_frames: divide by a FAT instruction so the
+ * chunk cannot sail past its target. */
+constexpr uint32_t kCyclesPerFatInstruction = 40;
+
+namespace {
+
+/* One relay, both directions, with the hardware handshake cross-wired.
+ *
+ * Each console's CTS0 pin is the OTHER console's RTS line (datasheet 3.11: RTS is
+ * any GPIO wired to the peer's CTS0). A console ready to receive (RTS low) pulls its
+ * peer's CTS0 low, letting the peer's CTSE-gated transmitter START a byte.
+ *
+ * ⚠️ BYTES ARE THEN PUSHED UNCONDITIONALLY, NOT GATED ON THE RECEIVER'S RTS — and
+ * that is a decision, not an oversight. Two relays exist in this project and they
+ * disagree: the shell's local two-player path pushes unconditionally, on the grounds
+ * that `serial_tick` is the authoritative gate (it only PRESENTS a queued byte to the
+ * CPU once that console's RTS is low, so delivering early merely queues it, exactly
+ * like a real cable) and that gating here could strand a handshake byte and read to
+ * the game as "no cable". `InProcessLink._relay`, which mirror netplay uses, gates.
+ * Both have been validated on Card Fighters' Clash — on different core versions,
+ * which is why project memory records the divergence as UNSETTLED and says to measure
+ * before touching it.
+ *
+ * This function replaces the SHELL's local path first, so it copies the shell's rule.
+ * Changing mirror netplay to come through here means settling that question with a
+ * measurement, not inheriting an answer by accident. */
+void relay_pair(Machine& a, Machine& b) {
+    ++a.serial_relay_count;
+    ++b.serial_relay_count;
+    const bool a_ready = (a.mem[0x0000B2] & 0x01) == 0;
+    const bool b_ready = (b.mem[0x0000B2] & 0x01) == 0;
+    a.serial_cts_high = !b_ready;
+    b.serial_cts_high = !a_ready;
+
+    if (!a.serial_tx.empty()) {
+        b.serial_rx_queued_count += uint32_t(a.serial_tx.size());
+        b.serial_rx.insert(b.serial_rx.end(), a.serial_tx.begin(), a.serial_tx.end());
+        a.serial_tx.clear();
+    }
+    if (!b.serial_tx.empty()) {
+        a.serial_rx_queued_count += uint32_t(b.serial_tx.size());
+        a.serial_rx.insert(a.serial_rx.end(), b.serial_tx.begin(), b.serial_tx.end());
+        b.serial_tx.clear();
+    }
+}
+
+/* The interleaving quantum in cycles, taken from the cable rather than chosen. Both
+ * consoles are asked and the SMALLER wins: a pair is only as coarse as its faster
+ * side can afford, and two consoles with different baud rates are a case the host
+ * bridge could not express at all. */
+uint32_t cable_quantum_cycles(const Machine& a, const Machine& b) {
+    const int32_t ba = a.serial_byte_cycles();
+    const int32_t bb = b.serial_byte_cycles();
+    int32_t byte_cycles = (ba < bb ? ba : bb);
+    if (byte_cycles <= 0) byte_cycles = 3200;          /* the standard configuration */
+    uint32_t q = uint32_t(byte_cycles / kCableQuantumDivisor);
+    if (q < kCableQuantumFloor) q = kCableQuantumFloor;
+    return q;
+}
+
+} // namespace
+
+/* Advance two cabled consoles by `frames` frames each, relaying between them here.
+ *
+ * The two summaries are per console. A console that stops (a trap, a breakpoint, a
+ * terminal halt) stops the pair: leaving its peer running against a console that is
+ * no longer executing is how one screen ends up a second ahead of the other.
+ *
+ * The host must still enable the serial hardware on both machines first -- the cable
+ * is plugged in BEFORE either console boots, which is what a game checking for a peer
+ * during its own start-up requires. ABI 18. */
+NGPC_API int ngpc_run_linked(ngpc_t* ha, ngpc_t* hb, uint32_t frames,
+                             uint32_t max_instrs,
+                             ngpc_summary_t* out_a, ngpc_summary_t* out_b) {
+    if (!ha || !hb || ha == hb) return -1;
+    Machine* a = reinterpret_cast<Machine*>(ha);
+    Machine* b = reinterpret_cast<Machine*>(hb);
+
+    const uint32_t target_a = a->frame_count + frames;
+    const uint32_t target_b = b->frame_count + frames;
+
+    ngpc_summary_t sa, sb;
+    std::memset(&sa, 0, sizeof(sa));
+    std::memset(&sb, 0, sizeof(sb));
+    sa.stop_status = sb.stop_status = NGPC_COUNT_REACHED;
+
+    /* The rendezvous is armed for the duration and restored afterwards: it is a host
+     * policy everywhere else, and a linked run must not silently redefine it. */
+    const bool saved_break_a = a->serial_break_on_event;
+    const bool saved_break_b = b->serial_break_on_event;
+    a->serial_break_on_event = true;
+    b->serial_break_on_event = true;
+
+    uint32_t budget = max_instrs;
+    /* ⛔ THE HANG THIS PREVENTS. `budget` only falls as instructions retire, and a step
+     * can legitimately return NGPC_SERIAL_EVENT having retired NONE: a console parked on
+     * a HALT idles forward a scanline at a time, and the peer's byte arriving during that
+     * idle IS an event. Treating the event as "carry on" -- which it is -- while the
+     * budget does not move is an infinite loop with no exit, and the two-player window
+     * would simply freeze. So rounds that retire nothing are counted, and enough of them
+     * in a row ends the call even though nothing has failed. The bound is generous: a
+     * real HALT is resolved by its interrupt within a line or two, so this cannot cut a
+     * healthy pair short -- it exists to make the pathological case terminate. */
+    unsigned idle_rounds = 0;
+    constexpr unsigned kMaxIdleRounds = 512;
+    /* ⛔ THE LAG IS MEASURED WITHIN THIS CALL, NOT SINCE POWER-ON. Comparing the two
+     * machines' lifetime cycle counts looks equivalent and is not: the two consoles can
+     * drift apart OUTSIDE this function -- the shell runs one alone whenever its peer is
+     * paused, rewinding, or already holds frames in its queue, and a restored save state
+     * moves one of them wholesale. With a lifetime comparison, the first steps of the
+     * next call then belong entirely to whichever console is "behind", so its peer stands
+     * still for that long: the whole-frame latency the interleaving exists to remove,
+     * reappearing only sometimes, depending on how the frame pacer batched its work.
+     *
+     * MEASURED as the user reported it: the old scheduling played Card Fighters' Clash
+     * fine while this one failed DIFFERENTLY EACH TRY -- white screen, frozen screen, a
+     * character select that never ends. A deterministic core failing differently each
+     * run means the decision depends on something outside it, and this was it.
+     *
+     * Counting from zero here makes each call self-contained: whatever happened before,
+     * the two consoles share this frame evenly. */
+    uint64_t used_a = 0, used_b = 0;
+    a->serial_pair_max_gap = b->serial_pair_max_gap = 0;
+    /* ⛔ A CONSOLE THAT STOPS MUST NOT TAKE ITS PEER DOWN MID-FRAME. Ending the whole
+     * call on the first stop looks tidy and is wrong twice over: with a breakpoint on
+     * player 1 -- an ordinary thing to do, the two-player debugger exists -- player 2
+     * never ran at all (MEASURED: executed = 0), so the shell recorded a frame for it
+     * that did not happen, and on screen player 2 simply froze. The arrangement this
+     * replaces let the other console finish its frame, and so does this: a stopped
+     * console stops being a CANDIDATE, its peer runs on to its own frame boundary, and
+     * the call ends when both are done or stopped. */
+    bool stop_a = false, stop_b = false;
+    while (budget > 0 && idle_rounds < kMaxIdleRounds &&
+           ((a->frame_count < target_a && !stop_a) ||
+            (b->frame_count < target_b && !stop_b))) {
+        relay_pair(*a, *b);
+
+        /* Whichever console is behind in EMULATED TIME runs next -- ties to A, so the
+         * order is fixed and two runs of the same pair agree byte for byte. A console
+         * that has finished its frames, or that stopped, is no longer a candidate; its
+         * peer then runs on alone, which is the only way both can land on a boundary. */
+        const bool a_out = stop_a || a->frame_count >= target_a;
+        const bool b_out = stop_b || b->frame_count >= target_b;
+        Machine* lag;
+        ngpc_summary_t* lag_sum;
+        ngpc_t* lag_handle;
+        bool* lag_stop;
+        if (a_out) { lag = b; lag_sum = &sb; lag_handle = hb; lag_stop = &stop_b; }
+        else if (b_out) { lag = a; lag_sum = &sa; lag_handle = ha; lag_stop = &stop_a; }
+        else if (used_a <= used_b) {
+            lag = a; lag_sum = &sa; lag_handle = ha; lag_stop = &stop_a;
+        } else {
+            lag = b; lag_sum = &sb; lag_handle = hb; lag_stop = &stop_b;
+        }
+
+        /* Never overshoot the peer by more than a quantum, and never overshoot the
+         * frame boundary either -- the same cycles-left arithmetic run_frames uses. */
+        const uint32_t quantum = cable_quantum_cycles(*a, *b);
+        const uint32_t cycles_per_frame = kCyclesPerScanline * kScanlinesPerFrame;
+        const uint32_t cycles_done =
+            lag->scanline * kCyclesPerScanline + lag->cycle_residue;
+        const uint32_t cycles_left =
+            cycles_done < cycles_per_frame ? cycles_per_frame - cycles_done : 1;
+        const uint32_t cycles_step = cycles_left < quantum ? cycles_left : quantum;
+
+        uint32_t chunk = cycles_step / kCyclesPerFatInstruction;
+        if (chunk == 0) chunk = 1;
+        if (chunk > budget) chunk = budget;
+
+        ngpc_summary_t s;
+        ngpc_run(lag_handle, chunk, nullptr, 0, &s);
+
+        lag_sum->executed       += s.executed;
+        lag_sum->total_cycles   += s.total_cycles;
+        (lag == a ? used_a : used_b) += s.total_cycles;
+        const uint64_t gap = used_a > used_b ? used_a - used_b : used_b - used_a;
+        if (gap > a->serial_pair_max_gap)
+            a->serial_pair_max_gap = b->serial_pair_max_gap = gap;
+        lag_sum->irq_deliveries += s.irq_deliveries;
+        budget -= s.executed;
+
+        /* NGPC_SERIAL_EVENT is the rendezvous, not a fault: the cable moved, so the
+         * loop simply relays it on the next turn. Anything else ends the pair. */
+        if (s.stop_status != NGPC_COUNT_REACHED && s.stop_status != NGPC_SERIAL_EVENT) {
+            lag_sum->stop_status = s.stop_status;
+            lag_sum->stop_pc     = s.stop_pc;
+            lag_sum->stop_opcode = s.stop_opcode;
+            *lag_stop = true;
+        }
+        if (s.executed == 0) {
+            /* A rendezvous with nothing retired is fine once -- see kMaxIdleRounds. A
+             * stop with nothing retired and no event is a console that will not move. */
+            if (s.stop_status != NGPC_SERIAL_EVENT) break;
+            ++idle_rounds;
+        } else {
+            idle_rounds = 0;
+        }
+    }
+    /* One last relay so a byte produced by the final step is not left in a FIFO
+     * until the next call -- the frame the host is about to present would be one
+     * relay behind the state it reports. */
+    relay_pair(*a, *b);
+
+    a->serial_break_on_event = saved_break_a;
+    b->serial_break_on_event = saved_break_b;
+
+    sa.scanline = a->scanline; sa.frame_count = a->frame_count;
+    sb.scanline = b->scanline; sb.frame_count = b->frame_count;
+    if (out_a) *out_a = sa;
+    if (out_b) *out_b = sb;
+    return 0;
+}
+
+/* How many times the core relayed this console's cable since the link came up.
+ * Zero unless ngpc_run_linked is driving the pair -- a host relaying for itself
+ * counts its own pumps. See Machine::serial_relay_count. ABI v18. */
+/* The widest cycle gap that opened between the two consoles during the last linked
+ * call -- the honest measure of whether they were interleaved. See the header. */
+NGPC_API uint64_t ngpc_link_pair_max_gap(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->serial_pair_max_gap;
+}
+
+NGPC_API uint32_t ngpc_link_relay_count(ngpc_t* h) {
+    if (!h) return 0;
+    return reinterpret_cast<Machine*>(h)->serial_relay_count;
+}
+
 NGPC_API void ngpc_set_write_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
     if (!h) return;
     Machine* m = reinterpret_cast<Machine*>(h);
@@ -1180,6 +1448,7 @@ NGPC_API void ngpc_serial_set_enabled(ngpc_t* h, int on) {
     m.serial_rx_queued_count = m.serial_rx_read_count = 0;
     m.serial_irq_tx_count = m.serial_irq_rx_count = 0;
     m.serial_cts_hold_ticks = m.serial_rts_hold_ticks = 0;
+    m.serial_relay_count = 0;
     if (!on) {
         m.serial_tx.clear();
         m.serial_rx.clear();

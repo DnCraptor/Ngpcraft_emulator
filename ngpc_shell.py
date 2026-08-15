@@ -5043,6 +5043,34 @@ class PlayPage(QWidget):
         # its watchpoints and its access probe have to be armed for it HERE. Its own
         # tick cannot do it -- by the time it runs, the frame is over.
         peer._arm_capture(*peer._capture_windows())                # noqa: SLF001
+
+        # ⚡ THE PAIR IS THE CORE'S JOB NOW. Below this line is the arrangement it
+        # replaces: a slice of INSTRUCTIONS each, with the relay done from here between
+        # slices. An instruction count is not cable time -- the core paces the pair on
+        # the cable's own byte time and relays the moment either console reports a byte
+        # moved, so the two can never be more than one quantum of emulated time apart.
+        # See ngpc_run_linked and LINK_NETPLAY_STUDY.md L3.
+        #
+        # ⛔ EXCEPT WHEN SOMETHING IS SITTING IN THE WIRE. The debugger's link monitor
+        # records every byte and can deliberately delay, drop or inject them; it is a
+        # synthetic tool by design and it lives in Python, so a relay inside the core
+        # cannot call it. An armed monitor therefore keeps the host-side path, which is
+        # the behaviour it was written against. Same for a net link: that relay goes to
+        # a socket, not to the peer beside it.
+        if (not core_link.host_relay_forced()
+                and self.link_monitor is None and peer.link_monitor is None
+                and self._net_link is None and peer._net_link is None):   # noqa: SLF001
+            summ_a, summ_b = native.run_linked(self.machine, peer.machine, 1)
+            peer._prerun.append(summ_b)                            # noqa: SLF001
+            # ⛔ THE BYTE COUNTER HAS TO COME FROM SOMEWHERE ELSE NOW. It used to be
+            # totted up by _pump_link, which this path does not call -- so the two-player
+            # window title would have sat at "P1->0 B  P2->0 B" for ever, which reads as
+            # a dead cable rather than as a counter that stopped being fed. The core has
+            # the honest number: bytes that actually finished shifting out onto the wire.
+            self._link_tx_total = self.machine.serial_state().wire_count
+            peer._link_tx_total = peer.machine.serial_state().wire_count   # noqa: SLF001
+            return summ_a
+
         pages = (self, peer)
         starts = [p.machine.run(0, record=False)[0].frame_count for p in pages]
         totals = [0, 0]

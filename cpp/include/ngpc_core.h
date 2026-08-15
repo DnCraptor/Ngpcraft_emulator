@@ -35,7 +35,10 @@ extern "C" {
  * with the new core/native.py fails on the missing symbol instead, which reads as a
  * ctypes bug rather than as "your DLL is old". */
 /* 17: + ngpc_set_serial_break (the core wakes the host when the cable moves). */
-#define NGPC_ABI_VERSION 17
+/* 18: + ngpc_run_linked -- BOTH cabled consoles and the relay, inside the core;
+ *     + ngpc_link_relay_count, so "how often was the cable relayed" stays
+ *       measurable now that the relaying happens in here. */
+#define NGPC_ABI_VERSION 18
 
 /* ---------------------------------------------------------------- status --
  * Execution status of one instruction. The tri-state "requires-known-*"
@@ -262,6 +265,47 @@ NGPC_API int ngpc_run_frames(ngpc_t*, uint32_t frames, uint32_t max_instrs,
 NGPC_API int ngpc_run(ngpc_t*, uint32_t max_instrs,
                       ngpc_record_t* out_records, uint32_t records_cap,
                       ngpc_summary_t* out_summary);
+
+/* ---------------------------------------------------- THE CABLED PAIR ------
+ * Advance two cabled consoles together, WITH THE CABLE RELAYED IN HERE.
+ *
+ * The host used to own the relay: run A for a slice, cross the FFI boundary,
+ * move the bytes, run B for a slice, cross back. That slice was counted in
+ * INSTRUCTIONS, which is not cable time -- and every emulator that shipped a
+ * working serial link (TGB Dual, BizHawk, mGBA's lockstep) put both consoles
+ * and the cable in the core instead, paced by the hardware's serial clock.
+ * See LINK_NETPLAY_STUDY.md L3.
+ *
+ * Here the console that is BEHIND IN CYCLES always runs next, in steps bounded
+ * by a fraction of the cable's own byte time, and the relay also happens the
+ * moment either console reports the cable moved. The two can therefore never be
+ * more than one quantum of emulated time apart -- the property `a slice each`
+ * never had, and the reason an answer could arrive a whole frame late in one
+ * direction. Deterministic: ties break towards `a`, the quantum comes from the
+ * machines' own registers, and no wall clock is read.
+ *
+ * Enable the serial hardware on BOTH machines before the first call -- the cable
+ * is plugged in before either console boots, which is what a game that looks for
+ * a peer during start-up requires. Summaries are per console; a console that
+ * stops stops the pair. ABI v18. */
+NGPC_API int ngpc_run_linked(ngpc_t* a, ngpc_t* b, uint32_t frames,
+                             uint32_t max_instrs,
+                             ngpc_summary_t* out_a, ngpc_summary_t* out_b);
+
+/* Relays this console has taken part in since the cable came up. The property it
+ * makes testable is "the cable is relayed MANY times inside one frame, not once"
+ * -- one relay a frame is what breaks The Last Blade's handshake. Zero unless
+ * ngpc_run_linked is driving the pair. ABI v18. */
+NGPC_API uint32_t ngpc_link_relay_count(ngpc_t*);
+
+/* The widest gap, in cycles, that opened between the two consoles during the last
+ * ngpc_run_linked call. ⚡ THIS IS THE NUMBER THAT SAYS WHETHER THEY WERE REALLY
+ * INTERLEAVED, and totals cannot say it: two consoles that run a whole frame each
+ * in sequence consume exactly the same cycles as two that take turns, while one of
+ * them sits frozen through the other's frame -- the latency a link handshake dies
+ * of. Expect roughly one interleaving quantum; a whole frame means no interleaving
+ * at all. ABI v18. */
+NGPC_API uint64_t ngpc_link_pair_max_gap(ngpc_t*);
 
 /* ------------------------------------------------------------------ state */
 /* ------------------------------------------------------------------- SAVES --

@@ -204,6 +204,40 @@ def test_attaching_the_cable_power_cycles_a_running_console(app, monkeypatch):
         sh.play.stop()
 
 
+def test_the_two_player_byte_counter_keeps_counting(app, monkeypatch):
+    """⛔ A COUNTER THAT SILENTLY STOPS READS AS A DEAD CABLE.
+
+    The two-player window title shows "P1->n B  P2->n B", and those totals used to be
+    added up by PlayPage._pump_link. Moving the relay into the core means that method is
+    no longer called for a linked pair -- so the title would have sat at zero for ever
+    while the cable worked perfectly, which is indistinguishable from a link that is not
+    running. The numbers now come from the core's own count of bytes that finished
+    shifting out. This test exists because nothing else would have noticed.
+    """
+    import ngpc_shell
+    from PyQt6.QtWidgets import QFileDialog
+
+    sh = ngpc_shell.Shell()
+    try:
+        sh._settings.setValue("paths/bios", str(BIOS))
+        sh.play._frames_due = lambda: 1
+        sh.play.start(ROM)
+        monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                            staticmethod(lambda *a, **k: (str(ROM), "")))
+        sh._launch_link_2p()
+        p2 = sh._link2p.play
+        p2._frames_due = lambda: 1
+        for _ in range(60):
+            sh.play._tick()
+            p2._tick()
+        assert sh.play._link_tx_total > 0, "player 1's byte counter never moved"
+        assert p2._link_tx_total > 0, "player 2's byte counter never moved"
+    finally:
+        if sh._link2p is not None:
+            sh._link2p.close()
+        sh.play.stop()
+
+
 def test_a_linked_frame_relays_the_cable_many_times_over(app, monkeypatch):
     """⚡ Relaying the cable once per frame costs a frame of latency ONE WAY, and
     that is enough to break a real handshake.
@@ -235,6 +269,22 @@ def test_a_linked_frame_relays_the_cable_many_times_over(app, monkeypatch):
         p2 = sh._link2p.play
         p2._frames_due = lambda: 1
 
+        # ⚡ COUNTED WHERE THE RELAYING NOW HAPPENS. This used to count calls to
+        # PlayPage._pump_link, which was right while the host owned the relay. The core
+        # owns it now (ngpc_run_linked), so that counter reads ZERO for a linked pair --
+        # an instrument that can no longer fire, and it would have read as "the cable is
+        # never relayed" rather than as "you are counting the wrong thing". The
+        # requirement is unchanged: MANY relays inside one frame, not one at the end.
+        FRAMES = 10
+        before = sh.play.machine.link_relay_count()
+        for _ in range(FRAMES):
+            sh.play._tick()
+            p2._tick()
+        linked = sh.play.machine.link_relay_count() - before
+
+        # CONTROL: the same page with no peer relays nothing in the core, and still
+        # pumps once a frame from here. Without it, "many relays" could just mean
+        # "_tick ran many times".
         seen = {"n": 0}
         real = ngpc_shell.PlayPage._pump_link
 
@@ -244,22 +294,15 @@ def test_a_linked_frame_relays_the_cable_many_times_over(app, monkeypatch):
             return real(self)
 
         monkeypatch.setattr(ngpc_shell.PlayPage, "_pump_link", counting)
-
-        FRAMES = 10
-        for _ in range(FRAMES):
-            sh.play._tick()
-            p2._tick()
-        linked = seen["n"]
-
-        # CONTROL: the same page with no peer takes the plain path, one relay a
-        # frame. Without it, "many relays" could just mean "_tick ran many times".
         sh.play._link_peer = None
-        seen["n"] = 0
+        alone_before = sh.play.machine.link_relay_count()
         for _ in range(FRAMES):
             sh.play._tick()
         alone = seen["n"]
 
-        assert alone == FRAMES, f"unlinked page should relay once a frame, got {alone}"
+        assert alone == FRAMES, f"unlinked page should pump once a frame, got {alone}"
+        assert sh.play.machine.link_relay_count() == alone_before, (
+            "an unlinked console had its cable relayed by the core")
         assert linked > FRAMES * 5, (
             f"a linked frame relayed the cable {linked / FRAMES:.1f} times on average; "
             "one relay a frame breaks The Last Blade's handshake")

@@ -544,9 +544,15 @@ def test_the_mirrors_own_cable_is_stepped_like_a_cable():
         sess = MirrorSession(local, peer, Counting(local, peer), pa,
                              Handshake(rom_hash="r", bios_hash="b", core_version="c",
                                        delay=FRAMES + 2, host=True))
+        relays_before = local.link_relay_count()
         for _ in range(FRAMES):
             assert sess.step(0) == "ran"
-        real = Counting.pumps
+        # ⚡ COUNTED WHERE THE RELAYING NOW HAPPENS. This used to count InProcessLink.pump
+        # calls, which was right while the host owned the relay. The core owns it now
+        # (ngpc_run_linked), so that counter reads ZERO for a real pair -- an instrument
+        # that can no longer fire, and it would have read as "the cable is never stepped"
+        # rather than as "you are counting the wrong thing". The requirement is unchanged.
+        real = Counting.pumps + (local.link_relay_count() - relays_before)
 
         # CONTROL: the same session over machines with no sliced interface takes the
         # whole-frame path -- two pumps a frame. Without it, "many pumps" could just

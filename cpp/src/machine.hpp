@@ -804,6 +804,19 @@ struct Machine {
     uint32_t serial_irq_tx_count = 0;    /* INTTX0 raised (vector 0x19)        */
     uint32_t serial_irq_rx_count = 0;    /* INTRX0 raised (vector 0x18)        */
     uint32_t serial_cts_hold_ticks = 0;  /* ticks a byte was held by CTS0 high */
+    /* How many times the cable was relayed while this console ran. Only
+     * ngpc_run_linked moves it: a host that owns its own relay counts its own
+     * pumps. It exists because the property "the cable is relayed MANY times
+     * inside one frame, not once" is what The Last Blade's handshake needs, and
+     * once the relay moved into the core the test that guarded it was counting
+     * pumps that no longer happen -- an instrument that cannot fire. */
+    uint32_t serial_relay_count = 0;
+    /* The widest gap, in cycles, that opened between this console and its peer
+     * during the last ngpc_run_linked call. THE number that says whether the pair
+     * was really interleaved: totals can look perfectly even while the two ran a
+     * whole frame each in sequence, which is the latency that loses a handshake.
+     * Reset at the start of every linked call. */
+    uint64_t serial_pair_max_gap = 0;
     uint32_t serial_rts_hold_ticks = 0;  /* ticks RX was held by our own RTS   */
     /* One byte on the wire, in CPU cycles, COMPUTED from what the machine actually
      * programmed -- see the derivation above kSerialByteCycles and specs/LINK_CABLE.md
