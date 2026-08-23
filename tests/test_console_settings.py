@@ -11,8 +11,10 @@ bilingual cartridge ran in Japanese by accident.
 
 from __future__ import annotations
 
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 HLE_IMAGE = REPO / "hle_bios" / "bios_hle.bin"
@@ -313,7 +315,7 @@ class TwoConsolesTwoCoinCells(unittest.TestCase):
     (1321875 on both). Two coin cells do not share an oscillator.
 
     It is reachable, not merely untidy. A game that seeds its RNG off the clock then
-    gets the SAME stream on both consoles: Ahchay's HEADTOHEAD does exactly that
+    gets the SAME stream on both consoles: a two-console homebrew does exactly that
     (`RandomNumberCounter = Second << 5`), and its host/client election had nothing left
     to break a tie -- "I quite often end up with both sides claiming to be the host".
     Attaching the cable power-cycles both at once, so they boot in step too. The
@@ -328,7 +330,29 @@ class TwoConsolesTwoCoinCells(unittest.TestCase):
         from core import native_session as ns
         self.ns = ns
         self.rom = PROBE_ROM
-
+        # ⏱️ L'HORLOGE MURALE EST FIGEE, ET C'EST LE RATTRAPAGE QU'ELLE PIEGE.
+        #
+        # En mode materiel, `apply_saved_clock` rattrape le temps passe hors tension :
+        # `elapsed = int(time.time()) - saved_at`, puis `rtc_advance(elapsed)`. Chaque
+        # test d'ici construit DEUX sessions, donc lit `time.time()` deux fois -- et une
+        # seconde qui tombe entre les deux en avance une d'un cran de plus. Resultat :
+        # `test_it_moves_the_phase_and_nothing_else` tombait une fois sur huit, sans
+        # aucun rapport avec ce qu'il teste.
+        #
+        # ⛔ Poser une pile sauvegardee ne suffit PAS (essaye) : c'est le rattrapage
+        # qu'il faut neutraliser, pas la valeur de depart. Et basculer les sessions en
+        # horloge manuelle ferait passer les tests en leur retirant le chemin de la pile
+        # sauvegardee, qui est justement ce que deux d'entre eux verifient. Figer la
+        # seconde laisse tout le chemin en place et ne supprime que la course.
+        # Deux lectures a neutraliser, pas une : `time.time()` pour le rattrapage, et
+        # `time.localtime()` pour l'amorce quand aucune pile n'est encore sauvegardee --
+        # c'est celle-la qui restait, et figer la premiere seule ne changeait rien.
+        fige = int(time.time())
+        instant = time.localtime(fige)
+        for nom, valeur in (("time", lambda: fige), ("localtime", lambda *a: instant)):
+            patch = mock.patch.object(ns.time, nom, valeur)
+            patch.start()
+            self.addCleanup(patch.stop)
     def _session(self, second):
         return self.ns.NativeSession(self.rom, bios_path=REAL_BIOS, save_to_rom=False,
                                      sidecar=False, second_console=second)

@@ -181,6 +181,133 @@ conclure qu'elle ne sert a rien.**
 
 ---
 
+## 9ter. ✅ LE MODELE DE TEMPS, RECONSTRUIT ET LIVRE (2026-08-21)
+
+⚠️ **Le §9bis ci-dessus decrit l'ancien modele.** Il reste vrai sur le fond -- sans
+wait-states le code cartouche vole -- mais ses NOMBRES sont perimes, et `cart_wait` a
+change de sens. Ce qui suit remplace sa partie chiffree.
+
+### Un seul appel
+
+`ngpc_set_timing_silicon(word_wait, bios_wait)`. **Ne jamais rearmer les reglages un par
+un** : ce sont huit choses qui doivent s'accorder, et la meme erreur s'est produite TROIS
+fois le 21/08 -- `Shell._begin_mirror`, `test_netplay_mirror`, et le helper `silicon()` du
+banc de la sonde. Dans les trois cas une moitie du modele etait armee et l'autre non, ce
+qui donne une machine que personne n'a. **Appeler ce que le shell appelle.**
+
+### Les huit pieces
+
+| piece | provenance |
+|---|---|
+| etats Toshiba **x2** | manuel CPU 900/L1 ; fiche TMP95C061B (un etat = 80 ns a 25 MHz, `tosc` = 40 ns) |
+| fetch par **mot 16 bits** | le bus externe est 16 bits |
+| fetch **pipeline** (dette du BIU) | fiche 3.3.1 : *l'unite d'execution et l'unite de bus fonctionnent independamment* |
+| avance du BIU = **2 x cout/mot** | file de **4 octets**, dite trois fois dans le manuel 900/L1 |
+| entree d'interruption **x2** | 18 **etats** (3.3.1 + annexe B table (11)) |
+| le **BIOS paie le meme bus** | il est sur le meme bus 16 bits |
+| **transmetteur a deux etages** | fiche 3.11 : `SC0BUF` et le registre a decalage sont distincts |
+| retrait du **double comptage** a la reception | defaut reel, condition de sortie remplie |
+| `word = 10`, `bios = 8` | ⚠️ **les deux seuls chiffres CALIBRES** |
+
+### Contre le silicium (tir du 21/08, recoupe en interne)
+
+| | silicium | modele |
+|---|---|---|
+| aller-retour x3 | 1218/1220/1217 | 1215/1216/1216 (**−0,2 %**) |
+| cout CPU d'un octet recu | 96,2 µs | 95,7 (**−0,5 %**) |
+| debit sature | 3963 | 4006 (**+1,1 %**) |
+| `QUIET` | 6457 | 6912 (**+7 %**, ouvert) |
+
+### ⛔ L'etat de timing EST de l'etat
+
+`biu_debt` et les etages de tampon sont de l'etat machine : ils doivent etre remis a zero
+au reset **et** sauvegardes. Les oublier a casse le determinisme du rejeu (barriere
+libretro : *non-deterministic state after replay*). `ngpc_link_state_t` est passe en
+**version 2** pour les porter ; les savestates anterieurs sont **refuses**, pas mal lus.
+
+**Tout ce qui est ajoute a `Machine` et influence le temps doit suivre la meme regle.**
+
+---
+
+### ⚖️ C'EST LE DEFAUT DEPUIS LE 23/08/2026 (bureau, libretro, Android)
+
+`--timing legacy` (ou `NGPCRAFT_TIMING=legacy`) garde l'ancien modele, et sert a
+attribuer une regression en secondes au lieu d'en discuter. ⚠️ Le shell **refuse** une
+valeur inconnue : le defaut etant desormais le silicium, une faute de frappe donnerait le
+silicium en silence et on croirait comparer deux machines alors qu'on en mesure une seule.
+
+Ce qui bloquait la bascule, et ce que ca valait :
+
+| defaut vu en jeu | verdict |
+|---|---|
+| KOF R-2, fond et chrono qui glitchent | **c'etait nous** : `MUL`/`DIV` et `LDIR` sont etalonnes en CYCLES, pas en etats -- le modele les doublait |
+| Cool Boarders, HUD qui clignote | **ce n'etait pas nous** : l'ancien timing lache les memes trames, le jeu est auto-time a 30 fps, et « reparer » pousse son horloge a 41 -- ⛔ confirme sur console reelle |
+
+Validation : corpus A/B 83 ROMs / 46 empreintes deplacees / **0 perte soutenue** · suite
+**2098 passed** sous ce defaut · KOF R-2 en combat depuis un savestate partage, **572
+trames identiques au pixel AVEC du mouvement** · libretro 5/5.
+
+⛔ **Non prouve** : le glitch KOF d'origine n'a jamais ete reproduit sans tete, ni sous
+l'ancien timing ni sous le modele. On ne peut donc pas ecrire « repare ».
+
+---
+
+## 9bis-legacy. ⛔ ET `cart_wait` MASQUE UN DEFAUT PLUS PROFOND (historique, 2026-08-20)
+
+Tout ce qui precede reste vrai : sans wait-states le code cartouche vole. Mais
+`cart_wait = 3` n'est **pas** un temps d'attente de bus. Il compense une erreur d'unite.
+
+### Un « state » Toshiba vaut DEUX cycles
+
+`1 state = 2 / f_FPH`, avec `f_FPH = fc` sur cette puce. Confirme deux fois,
+independamment :
+
+- le manuel CPU 900/L1 l'ecrit tel quel ;
+- la fiche TMP95C061B chiffre un state a **80 ns a 25 MHz** (table des modes micro-DMA)
+  alors que son §4.3 donne `tosc` = **40 ns** au meme quartz. 80 = 2 x 40.
+
+Et notre unite est bien `fc` : `kSerialByteCycles = 3200` pour un octet a 19200 bps tient
+contre les **551 µs mesures sur silicium**, et la trame fait 102485 de ces cycles a 60 Hz.
+
+### Or chaque gestionnaire facture l'etat comme s'il valait un cycle
+
+`nop` 2, `push #8` 4, `halt` 6, `swi` 19, `LD R,r` 2 — verifies un par un contre l'annexe B
+du manuel 900/L1, **tous exacts en states**. Donc **la table d'instructions du coeur est en
+demi-states**, et `cart_wait = 3` absorbe la difference depuis le premier jour.
+
+### ⛔ Et doubler ne repare pas — mesure, pas suppose
+
+Bouton `Machine::base_scale` (defaut 1) ajoute pour le tester contre la campagne silicium :
+
+| echelle | `cart_wait` | REG | ROM | RAM | LOOP | debit |
+|---|---|---|---|---|---|---|
+| 1 | 3 | +9 % | +7 % | +7 % | **+23 %** | −6 % |
+| 2 | 1 | +24 % | +17 % | +17 % | −2 % | −12 % |
+| 2 | 2 | −2 % | −6 % | −6 % | −14 % | −11 % |
+| 2 | 3 | −20 % | −21 % | −21 % | −23 % | −11 % |
+
+Boucles courtes et boucles a appels BIOS veulent **toujours** des `cart_wait` differents.
+🔑 **L'erreur a une FORME, pas une echelle** : elle est dans *quelle instruction coute
+quoi*. Un multiplicateur global ne peut pas la corriger, et en poser un serait exactement
+le facteur d'ajustement que le §8 interdit.
+
+### 📄 La table pour le faire proprement est dans le depot
+
+Annexe B, « 900/L1 Instruction Lists (1/10) » a (10/10) —
+`NgpCraft_toolchain/misc/Toshiba-TLCS-900-L-Resources-master/BMSKTOPAS91FY42 CD/Data sheets/900L1 Core (e_900l1_chap3_cpu) Datasheet.pdf`, pages 159-168. Texte extractible.
+
+⚠️ **Le PDF, pas le `.txt`** : l'extraction texte du catalogue perd les colonnes d'etats de
+la Table 5.2 **sans le signaler** — c'est ce qui a fait croire que la table manquait.
+
+⚠️ Le 900/L1 s'applique : Table 1 « CPU Core Different Points » met 900/H et 900/L1 dans la
+**meme colonne**. (Le coeur *900* d'origine, lui, a d'autres timings — toujours nommer la
+variante.)
+
+⇒ **Chantier ouvert**, voir `OPEN_ITEMS.md`. Il change le temps de tous les jeux : il
+demande son propre corpus A/B et sa propre validation, pas un coin de session.
+
+---
+
 ## 10. Vitesse du modele de reference Python (mesure 2026-07-10)
 
 ⚠️ Ne pas confondre avec les §1-9 : celles-ci parlent de la **cadence de la

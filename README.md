@@ -500,14 +500,19 @@ date, which is why the reset below clears both.
 boots from your configured cell — same language, same date, which is what somebody with two
 consoles would have — but it is **read-only** for it: player 2 never writes the cell back, so
 closing its window cannot stamp its clock over yours. Its crystal also runs on its own
-sub-second phase. That last part sounds like a detail and is not: both consoles used to come
-up with a bit-identical clock down to the oscillator's phase, so a game that seeds its random
-numbers from the clock got the *same numbers on both consoles* — and a link game that decides
-which console is player 1 by drawing lots then had nothing to draw with. That bug was reported
-from the field. On hardware two coin cells never share a phase, and now they do not here
-either. A game seeding on the *second* alone can still see both consoles agree about half the
-time; giving player 2 a genuinely separate date would mean a second saved cell, which is
-deliberately not done.
+sub-second phase: both consoles used to come up with a bit-identical clock down to the
+oscillator's own phase, which is not a machine that ever existed — on hardware two coin cells
+never share one. A game seeding on the *second* alone can still see both consoles agree about
+half the time; giving player 2 a genuinely separate date would mean a second saved cell, which
+is deliberately not done.
+
+⚠️ This was found while chasing a homebrew author's report of a link game electing **two
+hosts**, on the theory that an identical clock gives both consoles an identical random stream.
+**That theory is not established** — the author reports their RNG does diverge between the two
+windows, and their own handshake has a sufficient bug of its own (it compares its current draw
+against the peer's previous one, so the two consoles weigh different pairs). What is fixed here
+is the shared cell, which is a fidelity and save-safety defect on its own terms and was
+measured directly. Do not cite it as the cause of that report.
 
 The clock **runs while you play** and, by default, **keeps running while the emulator is
 closed** — shut it for three days and the console comes back three days later, exactly as the

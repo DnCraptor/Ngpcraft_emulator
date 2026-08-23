@@ -414,6 +414,19 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
         const uint16_t per = is_compare        ? 6
                            : (sz && m.ldirw_cost) ? m.ldirw_cost
                                                  : m.ldir_cost;
+        /* ⛔ DEJA EN CYCLES quand la boucle se REPETE -- voir Machine::cycles_already_measured.
+         *
+         * `ldir_cost` / `ldirw_cost` ne sortent pas d'une table d'etats : 14 vient de Cool
+         * Boarders ramene a ses 30 fps reels, 18 du copieur en boucle ouverte de Bomberman
+         * (a 17 comme a 19 l'image se dechire -- une fenetre d'UN cycle). Laisser le modele
+         * les doubler facturait chaque copie de bloc au double, et un HUD en split raster
+         * vit de ces copies : le HUD de Cool Boarders dechirait, manette en main.
+         *
+         * ⚠️ Il ne suffisait PAS de remettre le champ a 14 : le total passe par
+         * `rec->cycles`, que la boucle d'execution met a l'echelle. Le drapeau est le seul
+         * endroit qui le dit. La forme non repetee garde son cout d'annexe B (8 / 6 etats)
+         * et reste donc mise a l'echelle. */
+        if (repeats) m.cycles_already_measured = true;
         out_cycles = uint16_t(
             (repeats ? per * iterations + 1
                      : (is_compare ? 6 : 8)) + e.extra);

@@ -667,15 +667,17 @@ def test_the_shell_plays_a_mirror_match_over_a_real_socket(sh, app):
         clock = native.RtcState(1, *shell.Shell.MIRROR_CLOCK)
         for m in (far_local, far_peer):
             if cfg.cart_wait_states(sh._settings):
-                m.set_cart_wait(cfg.CART_FETCH_WAIT)
-                m.set_cart_data_wait(cfg.CART_DATA_WAIT)
-                m.set_ldir_cost(cfg.CART_LDIR_COST)
                 # ⚠️ THIS PAIR IS A REPLICA OF `Shell._begin_mirror`, so a knob added
-                # there and not here quietly stops it being one. The test still passes
-                # either way -- both far consoles get the same treatment -- which is
-                # exactly why the drift is invisible: what it stops proving is that the
-                # far pair runs the code at the speed a real session does.
-                m.set_ldirw_cost(cfg.CART_LDIRW_COST)
+                # there and not here quietly stops it being one.
+                #
+                # ✅ AND THAT WARNING PAID OFF, 2026-08-21. This block used to spell out
+                # four setters by hand; the shell moved to `set_timing_silicon`, which
+                # arms eight things at once, and the two PCs ended up running DIFFERENT
+                # machines. They desynced inside two frames and the test said so --
+                # loudly, not silently, which is better than the comment feared.
+                #
+                # ⇒ Call the same one thing the shell calls. Never re-spell it.
+                m.set_timing_silicon(cfg.CART_FETCH_WAIT, cfg.CART_BIOS_WAIT)
             m.set_rtc(clock)
             m.serial_set_enabled(True)
             m.reset(bios_handoff=True)
@@ -1232,3 +1234,57 @@ def test_a_cartridge_that_arrives_different_from_its_announcement_is_refused(sh,
             try: s.close()
             except OSError: pass
         sh.play.stop()
+
+
+
+# ⛔ DEUX JOUEURS SUR LE MEME BUILD PEUVENT SIMULER DEUX MACHINES DIFFERENTES.
+#
+# `core_version` hache la DLL, mais le commutateur `--timing` est en PYTHON : depuis le
+# 23/08/2026 le modele silicium est le defaut et `--timing legacy` reste disponible pour
+# attribuer une regression. Deux PC avec la meme cartouche, le meme BIOS et le meme build
+# s'annonçaient donc exactement la meme chose en tournant a des vitesses differentes -- le
+# desync invisible au branchement, qui tue le match en derive. Meme forme que la faute deja
+# payee sur `lang` et `mono`, a une difference pres : ce n'est pas un reglage par joueur
+# qu'on peut refleter, il faut REFUSER.
+def _timed_handshake(timing):
+    return Handshake(rom_hash="r", bios_hash="b", core_version="c", timing=timing)
+
+
+def test_the_same_timing_model_is_accepted():
+    a, b = _timed_handshake("silicon"), _timed_handshake("silicon")
+    assert a.check(b.payload()) is None
+
+
+def test_a_different_timing_model_is_refused():
+    a, b = _timed_handshake("silicon"), _timed_handshake("legacy")
+    assert a.check(b.payload()) == "timing_model"
+    assert b.check(a.payload()) == "timing_model"
+
+
+def test_a_peer_from_before_the_switch_is_refused():
+    """Un hello sans le champ vient d'un build dont le defaut ETAIT l'ancien modele : le
+    lire comme `legacy` dit la verite sur ce qu'il simule, et aucune version de protocole
+    n'a besoin de bouger."""
+    import json
+    a = _timed_handshake("silicon")
+    vieux = json.loads(a.payload().decode())
+    vieux.pop("timing")
+    assert a.check(json.dumps(vieux).encode()) == "timing_model"
+    assert _timed_handshake("legacy").check(json.dumps(vieux).encode()) is None
+
+
+def test_the_handshake_follows_the_environment_when_not_told(monkeypatch):
+    """⚠️ Le DEFAUT a change deux fois le 23/08/2026 (silicium, puis retour a l'ancien).
+    Ce test ne pique donc pas une valeur : il verifie que la poignee de main dit la MEME
+    chose que la machine, quel que soit le defaut du jour."""
+    from core.native import active_timing_model
+
+    def annonce():
+        return Handshake(rom_hash="r", bios_hash="b", core_version="c").timing
+
+    for choix in ("legacy", "silicon"):
+        monkeypatch.setenv("NGPCRAFT_TIMING", choix)
+        assert active_timing_model() == choix
+        assert annonce() == choix
+    monkeypatch.delenv("NGPCRAFT_TIMING")
+    assert annonce() == active_timing_model()

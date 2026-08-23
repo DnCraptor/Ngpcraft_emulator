@@ -61,6 +61,9 @@ from core.execute import (
     LD_IMM16_CYCLES,
     LD_IMM32_CYCLES,
     LD_IMM8_CYCLES,
+    LD_R_IMM16_CYCLES,
+    LD_R_IMM32_CYCLES,
+    LD_R_IMM8_CYCLES,
     LDX_CYCLES,
     LD_REG_REG_CYCLES,
     LD_SMALL_IMM_CYCLES,
@@ -185,7 +188,7 @@ class ExecutionResultCyclesTests(unittest.TestCase):
             )
             result = build_execute_next(view, cpu_state=cpu)
             self.assertEqual(result.status, "executed")
-            self.assertEqual(result.cycles_consumed, LD_IMM8_CYCLES + _addressing_mode_cycle_extra(b"\x21\x34"))
+            self.assertEqual(result.cycles_consumed, LD_R_IMM8_CYCLES + _addressing_mode_cycle_extra(b"\x21\x34"))
 
     def test_ld_r16_imm16_consumes_real_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -198,7 +201,7 @@ class ExecutionResultCyclesTests(unittest.TestCase):
             )
             result = build_execute_next(view, cpu_state=cpu)
             self.assertEqual(result.status, "executed")
-            self.assertEqual(result.cycles_consumed, LD_IMM16_CYCLES + _addressing_mode_cycle_extra(b"\x30\x34\x12"))
+            self.assertEqual(result.cycles_consumed, LD_R_IMM16_CYCLES + _addressing_mode_cycle_extra(b"\x30\x34\x12"))
 
     def test_ld_r32_imm32_consumes_real_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -207,7 +210,31 @@ class ExecutionResultCyclesTests(unittest.TestCase):
             view = load_fetch_view(rom_path)
             result = build_execute_next(view, cpu_state=_seeded_cpu(view))
             self.assertEqual(result.status, "executed")
-            self.assertEqual(result.cycles_consumed, LD_IMM32_CYCLES + _addressing_mode_cycle_extra(b"\x47\x00\x60\x00\x00"))
+            self.assertEqual(result.cycles_consumed, LD_R_IMM32_CYCLES + _addressing_mode_cycle_extra(b"\x47\x00\x60\x00\x00"))
+
+    def test_ld_r_imm_and_ld_r_code_imm_are_priced_apart(self) -> None:
+        """`LD R, #` and `LD r, #` are TWO families at TWO prices. Do not merge them.
+
+        Appendix B of the TLCS-900/L1 CPU manual (the 900/H shares its column in
+        Table 1 "CPU Core Different Points"):
+
+            LD R, #   "20 + zz + R : #"        2. 3. 5
+            LD r, #   "C8 + zz + r : 03 : #"   3. 4. 6
+
+        One constant used to serve both, so the R family was billed the r family's
+        figures -- one cycle too many on ALL THREE sizes. It survived for as long as
+        it did because nothing asserted that the two differ, only that each matched
+        the shared constant. This is that assertion.
+        """
+        self.assertEqual(
+            (LD_R_IMM8_CYCLES, LD_R_IMM16_CYCLES, LD_R_IMM32_CYCLES), (2, 3, 5),
+            "LD R, # is 2.3.5 states (Appendix B)")
+        self.assertEqual(
+            (LD_IMM8_CYCLES, LD_IMM16_CYCLES, LD_IMM32_CYCLES), (3, 4, 6),
+            "LD r, # is 3.4.6 states (Appendix B)")
+        self.assertNotEqual(
+            LD_R_IMM8_CYCLES, LD_IMM8_CYCLES,
+            "the two families are priced apart -- see the docstring before equalising them")
 
     def test_lda_abs24_consumes_real_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

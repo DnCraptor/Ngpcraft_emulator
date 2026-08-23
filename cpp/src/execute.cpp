@@ -212,33 +212,34 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
             return NGPC_OK;
         }
 
-        /* ld R8, #imm8  — 2 bytes, 3 cycles */
+        /* ld R8, #imm8  — 2 bytes, 2 states. Appendix B "LD R,# = 20+zz+R : #",
+         * 2.3.5 -- this family charged 3/4/6, one too many on ALL THREE sizes. */
         case 0x20: case 0x21: case 0x22: case 0x23:
         case 0x24: case 0x25: case 0x26: case 0x27: {
             const unsigned r = op & 0x07;
             set_r8(c, r, m.read8(pc + 1));
-            finish(rec, m, pc, 2, 3, 1u << (r >> 1));
+            finish(rec, m, pc, 2, 2, 1u << (r >> 1));
             c.pc = (pc + 2) & kAddrMask;
             return NGPC_OK;
         }
 
-        /* ld R16, #imm16 — 3 bytes, 4 cycles */
+        /* ld R16, #imm16 — 3 bytes, 3 states (Appendix B). */
         case 0x30: case 0x31: case 0x32: case 0x33:
         case 0x34: case 0x35: case 0x36: case 0x37: {
             const unsigned r = op & 0x07;
             set_r16(c, r, fetch16(m, pc + 1));
-            finish(rec, m, pc, 3, 4, 1u << r);
+            finish(rec, m, pc, 3, 3, 1u << r);
             c.pc = (pc + 3) & kAddrMask;
             return NGPC_OK;
         }
 
-        /* ld R32, #imm32 — 5 bytes, 6 cycles */
+        /* ld R32, #imm32 — 5 bytes, 5 states (Appendix B). */
         case 0x40: case 0x41: case 0x42: case 0x43:
         case 0x44: case 0x45: case 0x46: case 0x47: {
             const unsigned r = op & 0x07;
             set_r32(c, r, fetch32(m, pc + 1));
             c.pc = (pc + 5) & kAddrMask;
-            finish(rec, m, pc, 5, 6, 1u << r);
+            finish(rec, m, pc, 5, 5, 1u << r);
             return NGPC_OK;
         }
 
@@ -575,7 +576,12 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
             return NGPC_OK;
         }
         case 0x1D: {
-            const uint32_t target = fetch32(m, pc + 1) & 0x00FFFFFFu;
+            /* THREE bytes, not four. fetch32 here read one byte PAST the
+             * instruction: harmless to the value (it was masked off) but a real
+             * extra cart access, billed at cart_wait like any other fetch. */
+            const uint32_t target = uint32_t(m.read8(pc + 1))
+                                  | (uint32_t(m.read8(pc + 2)) << 8)
+                                  | (uint32_t(m.read8(pc + 3)) << 16);
             const uint32_t ret_addr = (pc + 4) & kAddrMask;
             c.pc = target;
             push32(m, rec, ret_addr);

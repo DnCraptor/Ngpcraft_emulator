@@ -259,7 +259,7 @@ class Handshake:
 
     def __init__(self, *, rom_hash: str, bios_hash: str, core_version: str,
                  delay: int = DEFAULT_DELAY, host: bool = False,
-                 console: dict | None = None) -> None:
+                 console: dict | None = None, timing: str | None = None) -> None:
         # Our own cartridge fingerprint: announced, never compared for equality. The
         # receiving side checks the image it was SENT against it, which catches a
         # truncated or corrupted transfer -- the failure that would otherwise show up
@@ -267,6 +267,22 @@ class Handshake:
         self.rom_hash = rom_hash
         self.bios_hash = bios_hash
         self.core_version = core_version
+        # ⛔ LE MODELE DE TEMPS, ET IL EST COMPARE -- pas seulement annonce.
+        #
+        # `core_version` hache la DLL, mais le commutateur `--timing` est en PYTHON :
+        # deux joueurs sur le MEME build, l'un lance en `--timing legacy`, s'annoncent
+        # exactement la meme chose et simulent deux machines de vitesses differentes.
+        # C'est le desync qui ne se voit pas au branchement et tue le match en derive,
+        # celui-la meme que `lang` et `mono` ont deja coute une fois.
+        #
+        # ⚡ Et contrairement a `lang`/`mono`, ce n'est PAS un reglage par joueur : on ne
+        # peut pas construire la console du pair a partir de la sienne, il faut refuser.
+        if timing is None:
+            # Import tardif : `core.native` charge la DLL, et ce module s'importe aussi
+            # la ou elle n'est pas necessaire.
+            from core.native import active_timing_model
+            timing = active_timing_model()
+        self.timing = timing
         # ⚡ SETTINGS THAT SHAPE THE SENDER'S OWN CONSOLE -- announced, like the
         # cartridge, and for the same reason.
         #
@@ -291,6 +307,7 @@ class Handshake:
         return json.dumps({
             "v": PROTOCOL_VERSION, "rom": self.rom_hash, "bios": self.bios_hash,
             "core": self.core_version, "delay": self.delay, "cons": self.console,
+            "timing": self.timing,
         }, sort_keys=True).encode("utf-8")
 
     def check(self, raw: bytes) -> str | None:
@@ -309,6 +326,11 @@ class Handshake:
             return "bios"
         if them.get("core") != self.core_version:
             return "core_version"
+        # ⓘ Absent = un build d'avant le 23/08/2026, dont le defaut ETAIT l'ancien
+        # modele. Le defaut de lecture dit donc la verite sur ce que ce pair simule,
+        # et aucune version de protocole n'a besoin de bouger pour le refuser.
+        if str(them.get("timing", "legacy")) != self.timing:
+            return "timing_model"
         # Both sides schedule their own input the SAME number of frames ahead, so a
         # different delay means the two PCs play different input streams from frame
         # zero.

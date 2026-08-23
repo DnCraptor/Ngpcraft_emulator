@@ -492,8 +492,20 @@ def cart_wait_states(s: QSettings) -> bool:
 # read (CRND) costs exactly the same as a RAM read (RRND), so data = 0. (An earlier
 # data=5 was a curve-fit to Cool Boarders and the v2 ROM refuted it.) See
 # cart_wait_states().
-CART_FETCH_WAIT = 3
+# ⚠️ RE-DERIVED 2026-08-21. These are no longer "cycles per BYTE of fetch": the whole
+# timing model was rebuilt (Toshiba states are TWO cycles, the bus is 16 bits so a fetch
+# costs one wait per WORD, and the bus interface unit runs AHEAD of execution behind a
+# 4-byte queue). `ngpc_set_timing_silicon` arms all of it; these are the only two
+# CALIBRATED numbers left. Provenance and what still misses: OPEN_ITEMS.md.
+CART_FETCH_WAIT = 10        # cycles per 16-bit instruction fetch, cart
+CART_BIOS_WAIT = 8          # the same for the BIOS -- it is on the same bus
 CART_DATA_WAIT = 0
+# ⚠️ CES DEUX-LA SONT EN CYCLES, PAS EN ETATS, et c'est ce qui les distingue de tout le
+# reste du modele de temps. Ils ont ete mesures contre du materiel : 14 ramene Cool
+# Boarders a ses 30 fps reels, 18 vient du copieur raster de Bomberman (a 17 comme a 19
+# l'image se dechire -- une fenetre d'UN cycle). Les avoir doubles, comme les couts en
+# etats, a fait dechirer les HUD en split raster.
+# ⛔ Ne jamais les mettre a l'echelle. `ngpc_set_timing_silicon` les applique tels quels.
 # LDIR/LDDR block-copy cost per byte. Datasheet 7 leaves self-timed games ~20% too fast;
 # 14 puts Cool Boarders at its hardware 30fps and leaves Fatal Fury at 60. Strongly
 # evidenced (one fix, both games; datasheet was a floor for MUL/DIV too) but not yet

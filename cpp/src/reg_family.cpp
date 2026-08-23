@@ -829,6 +829,10 @@ bool exec_reg_family(Machine& m, ngpc_record_t* rec, uint8_t op, uint32_t pc,
              * old 301 (under-costed); word 23->37 makes the emulator read 265. The datasheet
              * 15/23 is a floor -- real DIV is variable-latency and slower. MUL word 14->19
              * likewise matches silicon's 444 (was 481). Byte/signed scaled by the same ratio. */
+            /* ⛔ DEJA EN CYCLES -- voir Machine::cycles_already_measured. Ces quatre
+             * nombres sortent de `cpu_calib_v2` sur silicium, pas d'une table d'etats,
+             * donc le modele ne doit PAS les doubler. */
+            m.cycles_already_measured = true;
             out_cycles = uint16_t(is_signed ? (sz == 0 ? 29 : 42) : (sz == 0 ? 24 : 37));
         } else {
             const uint32_t a = wide & hmask;

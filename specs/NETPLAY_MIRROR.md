@@ -141,6 +141,27 @@ Two consequences in the same place:
   `LobbyClient.owed` / `LobbyPipe.pending` report how far behind the relay is; without
   it the client's queue is unbounded.
 
+## 3c. The pair is stepped by the CORE (2026-08-15)
+
+`run_two_consoles_interleaved` now calls `ngpc_run_linked`, so a mirror session's two
+consoles are interleaved inside the emulation core on the cable's own clock rather than by
+a host-side instruction slice. See `specs/LINK_CABLE.md` §3.3.
+
+Three things about it matter here specifically:
+
+- **Determinism is unchanged and still load-bearing.** Ties break towards the first
+  console, the step size comes from the machines' own registers, and no wall clock is
+  read. Measured: the same pair run three times gives the same CRC over both consoles'
+  work RAM.
+- **Player 1 still goes first, on both PCs, and it still decides the outcome.** Swapping
+  the order changes the CRC — so §4's rule is not decoration, and a test now pins it.
+- **The relay rule changed for mirror sessions**: the core pushes bytes unconditionally
+  where `InProcessLink._relay` gated on the receiver's RTS. That was measured before the
+  switch rather than inherited (probe ROM, 300 frames, identical byte counts either way);
+  the limits of that measurement are stated in `specs/LINK_CABLE.md` §3.3.
+
+An armed link monitor keeps the host-side relay, as does `NGPCRAFT_HOST_RELAY=1`.
+
 ## 4. The rules that are NOT optional
 
 Each was a measured desync before it was a rule.

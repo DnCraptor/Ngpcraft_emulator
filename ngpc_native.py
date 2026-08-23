@@ -49,8 +49,7 @@ SHELL_MEM_LEN = 0x00C000
 # here -- keep it equal to CART_FETCH_WAIT / CART_DATA_WAIT / CART_LDIR_COST /
 # CART_LDIRW_COST in ngpc_settings.py. Without them cart code runs ~2.9x too fast and any
 # optimisation that only shortens the code measures as exactly zero.
-SILICON_TIMING = {"cart_wait": 3, "cart_data_wait": 0,
-                  "ldir_cost": 14, "ldirw_cost": 18}
+SILICON_TIMING = {"word_wait": 10, "bios_wait": 8}
 
 # The controller, as the hardware reports it at 0x00B0.
 BUTTONS = {
@@ -136,10 +135,8 @@ def apply_timing(machine: native.NativeMachine, mode: str) -> None:
     """
     if mode != "silicon":
         return
-    machine.set_cart_wait(SILICON_TIMING["cart_wait"])
-    machine.set_cart_data_wait(SILICON_TIMING["cart_data_wait"])
-    machine.set_ldir_cost(SILICON_TIMING["ldir_cost"])
-    machine.set_ldirw_cost(SILICON_TIMING["ldirw_cost"])
+    machine.set_timing_silicon(SILICON_TIMING["word_wait"],
+                               SILICON_TIMING["bios_wait"])
 
 
 def hw_report(machine: native.NativeMachine, limit: int = 8) -> dict:
@@ -195,7 +192,14 @@ def cmd_run(args: argparse.Namespace) -> dict:
         "frame_count": summary.frame_count if summary else 0,
         # Say which timing model produced these numbers, so a cycle figure is never
         # quoted without knowing whether the cart bus was billed.
-        "timing": args.timing,
+        #
+        # ⛔ CE QUI A TOURNE, PAS CE QU'ON A DEMANDE. `--timing silicon` passe par
+        # `set_timing_silicon`, que `NGPCRAFT_TIMING=legacy` detourne vers l'ancien
+        # modele : imprimer le drapeau ferait dire au rapport « silicon » sous des
+        # chiffres produits par l'autre machine. Un rapport qui se trompe de machine est
+        # pire que pas de rapport -- c'est celui qu'on cite six mois plus tard.
+        "timing": (native.active_timing_model() if args.timing == "silicon"
+                   else args.timing),
         "hw_safety": hw_report(machine),
     }
     if args.peek:

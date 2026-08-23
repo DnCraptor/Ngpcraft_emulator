@@ -375,7 +375,7 @@ class NativeSession:
         # oscillator's own phase, and two coin cells do not share one.
         #
         # It is not only a fidelity point, it is REACHABLE. A game that seeds its RNG from
-        # the clock gets the same stream on both consoles -- Ahchay's HEADTOHEAD does
+        # the clock gets the same stream on both consoles -- a two-console homebrew does
         # exactly that (`RandomNumberCounter = Second << 5`) and its host/client election
         # then has nothing left to break a tie. Attaching the cable power-cycles both
         # consoles at once (`_power_cycle_for_link`, deliberate and correct), so they also

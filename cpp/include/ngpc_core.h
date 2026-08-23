@@ -335,6 +335,33 @@ NGPC_API int  ngpc_flash_restore(ngpc_t*, uint32_t address,
  * The shipping values live with the CALLER, not here: the desktop's
  * cfg.CART_FETCH_WAIT = 3, CART_DATA_WAIT = 0, CART_LDIR_COST = 14,
  * CART_LDIRW_COST = 18. `vram_wait` stays 0 until a calibration ROM pins it. */
+/* Instruction fetch out of the on-chip BIOS ROM. Zero (free) is the default and
+ * the only value anything ships with -- see Machine::bios_wait, where a uniform
+ * fetch wait is recorded as TESTED AND RULED OUT against silicon. */
+/* Cycles charged for accepting an interrupt; 0 = the built-in default. The
+ * datasheet gives four legal values (28/24/22/18, by bus width) -- see
+ * Machine::irq_entry_cycles. Debugging aid, not a tuning parameter. */
+/* Arms the whole silicon timing model in one call. word_wait / bios are the two
+ * calibrated numbers (10 / 8 as shipped); everything else is documented or derived.
+ * See the definition in core.cpp for the provenance of each piece. */
+NGPC_API void ngpc_set_timing_silicon(ngpc_t*, uint32_t word_wait, uint32_t bios);
+NGPC_API void ngpc_set_byte_extra(ngpc_t*, uint32_t pct);
+NGPC_API void ngpc_set_uart_unplugged(ngpc_t*, int on);
+NGPC_API void ngpc_set_micro_dma_states(ngpc_t* h, uint32_t eighths);
+NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t*, uint32_t quarters);
+NGPC_API void ngpc_set_bios_data_wait(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_slack_by_region(ngpc_t*, int on);
+NGPC_API void ngpc_set_branch_flush(ngpc_t*, int on);
+NGPC_API void ngpc_set_rx_double(ngpc_t*, int on);
+NGPC_API void ngpc_set_tx_irq_early(ngpc_t*, int on);
+NGPC_API void ngpc_set_fetch_pipelined(ngpc_t*, int on, int slack);
+NGPC_API void ngpc_set_half_duplex(ngpc_t*, int on);
+NGPC_API void ngpc_set_relay_gate(ngpc_t*, int on);
+NGPC_API void ngpc_set_rx_single(ngpc_t*, int on);
+NGPC_API void ngpc_set_fetch_word(ngpc_t*, int on);
+NGPC_API void ngpc_set_base_scale(ngpc_t*, uint32_t k);
+NGPC_API void ngpc_set_irq_entry(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_bios_wait(ngpc_t*, uint32_t cycles_per_byte);
 NGPC_API void ngpc_set_cart_wait(ngpc_t*, uint32_t cycles_per_byte);
 NGPC_API void ngpc_set_cart_data_wait(ngpc_t*, uint32_t cycles_per_byte);
 NGPC_API void ngpc_set_vram_wait(ngpc_t*, uint32_t cycles_per_byte);
@@ -637,7 +664,7 @@ NGPC_API int  ngpc_set_aux_state(ngpc_t*, const ngpc_aux_state_t* in);
  *
  * `version`/`size` are written by the getter and CHECKED by the setter, exactly as for
  * the aux block: a blob from another build is REFUSED (-1), never half-applied. */
-#define NGPC_LINK_STATE_VERSION 1
+#define NGPC_LINK_STATE_VERSION 2
 /* ⚠️ A CAPACITY, AND THEREFORE A FAILURE MODE. The in-process bridge drains every pump
  * (measured depth 2-3 with the probe ROM), but a socket bridge hands over whatever a
  * network burst delivered, so the receive FIFO has no natural ceiling. Truncating here
@@ -659,6 +686,18 @@ typedef struct {
     uint8_t  rx_pending;          /* a byte is presented at SC0BUF     */
     uint8_t  rx_byte;
     uint8_t  overflow;            /* a FIFO was deeper than the cap    */
+
+    /* --- the SECOND stage of each channel (version 2).
+     * SC0BUF and the shift register are separate on this chip, and since the UART is
+     * modelled as running with no cable attached, an unplugged console can hold a byte
+     * in the buffer at snapshot time. Leaving these out made a restored state resume a
+     * DIFFERENT machine -- caught as "non-deterministic state after replay". */
+    uint8_t  tx_buf_full;
+    uint8_t  tx_buf_byte;
+    uint8_t  rx_shift_full;
+    uint8_t  rx_shift_byte;
+    uint8_t  rx_had_pending;
+    uint8_t  _pad_v2[3];
     int32_t  tx_cycles;           /* baud-time countdowns, SIGNED      */
     int32_t  rx_cycles;
     uint32_t tx_len;              /* bytes valid in tx_fifo / rx_fifo  */

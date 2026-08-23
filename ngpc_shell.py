@@ -3064,14 +3064,11 @@ class PlayPage(QWidget):
         # Silicon-calibrated cart-flash wait-states so self-timed games run at their
         # real 30fps instead of ~2x too fast. See cfg.cart_wait_states / project memo.
         if cfg.cart_wait_states(self._settings):
-            self.machine.set_cart_wait(cfg.CART_FETCH_WAIT)
-            self.machine.set_cart_data_wait(cfg.CART_DATA_WAIT)
-            # LDIR block-copy timing: the last, strongly-evidenced but not-yet-ROM-confirmed
-            # piece that takes self-timed games (Cool Boarders) to their hardware 30fps.
-            # Priced per width -- the word form moves two bytes an iteration and Bomberman's
-            # raster copier measures it at 18 (see cfg.CART_LDIRW_COST).
-            self.machine.set_ldir_cost(cfg.CART_LDIR_COST)
-            self.machine.set_ldirw_cost(cfg.CART_LDIRW_COST)
+            # ONE call arms the whole model -- states x2, per-word fetch, the pipelined
+            # bus interface unit and its 4-byte queue, the two-stage transmitter. Arming
+            # half of it measures a machine no player has, which is exactly why the eight
+            # separate setters were collapsed into this.
+            self.machine.set_timing_silicon(cfg.CART_FETCH_WAIT, cfg.CART_BIOS_WAIT)
         self.watches.rearm()
         self.apply_debug()                 # arm breakpoints + write-log for this ROM
         self._rebuild_rewind_buffer()      # pick up any rewind-length change
@@ -4275,9 +4272,9 @@ class PlayPage(QWidget):
         # exists so a crash can be re-run under the timing that produced it, and `ldirw`
         # is now a SEPARATE answer from `ldir` (a word iteration moves two bytes -- see
         # cfg.CART_LDIRW_COST). Reporting one and not the other reproduces another run.
-        L.append(f"timing    : cart_wait={cfg.CART_FETCH_WAIT} data={cfg.CART_DATA_WAIT}"
-                 f" ldir={cfg.CART_LDIR_COST} ldirw={cfg.CART_LDIRW_COST}"
-                 f"   real_bios={self._real_bios}")
+        L.append(f"timing    : silicon word={cfg.CART_FETCH_WAIT} bios={cfg.CART_BIOS_WAIT}"
+                 f" data={cfg.CART_DATA_WAIT} (states x2, per-word fetch, pipelined BIU,"
+                 f" 4-byte queue, two-stage TX)   real_bios={self._real_bios}")
         L.append("")
         # registers
         L.append("registers (32-bit):")
@@ -6706,11 +6703,14 @@ class Shell(QMainWindow):
         # (silicon-calibrated cart wait-states); a mirror built without them executes
         # the same code at a different speed, which is a desync inside one frame --
         # measured, the two copies parted company on the very first one.
+        #
+        # ⛔ AND IT MUST BE THE SAME *CALL*, not the same intention. This block used to
+        # spell out four setters while PlayPage.start spelled out its own; when the
+        # timing model grew to eight settings behind `set_timing_silicon`, updating one
+        # site and not the other gave the two consoles of the SAME PC different
+        # machines. They desynced on frame 2, exactly as the paragraph above predicts.
         if cfg.cart_wait_states(self._settings):
-            peer.machine.set_cart_wait(cfg.CART_FETCH_WAIT)
-            peer.machine.set_cart_data_wait(cfg.CART_DATA_WAIT)
-            peer.machine.set_ldir_cost(cfg.CART_LDIR_COST)
-            peer.machine.set_ldirw_cost(cfg.CART_LDIRW_COST)
+            peer.machine.set_timing_silicon(cfg.CART_FETCH_WAIT, cfg.CART_BIOS_WAIT)
         clock = native.RtcState(1, *self.MIRROR_CLOCK)
         for m in (page.machine, peer.machine):
             m.set_rtc(clock)
@@ -7156,7 +7156,39 @@ def main() -> int:
     if APP_ICON.is_file():
         app.setWindowIcon(QIcon(str(APP_ICON)))
     _claim_windows_taskbar_identity()
-    rom = sys.argv[1] if len(sys.argv) > 1 else None
+
+    # --timing legacy  ->  the CPU timing this emulator shipped before 2026-08-21.
+    #
+    # ⚠️ A FLAG, NOT JUST AN ENVIRONMENT VARIABLE. The switch already existed as
+    # NGPCRAFT_TIMING, and telling someone to "run with NGPCRAFT_TIMING=legacy" is not an
+    # instruction on Windows -- it is not a command prefix here, and pasting it after the
+    # script name makes it a ROM path. An A/B switch nobody can work out how to flip is
+    # not a switch. This accepts either spelling and reports which one it took.
+    args = [a for a in sys.argv[1:]]
+    for i, a in enumerate(list(args)):
+        low = a.lower()
+        if low in ("--timing=silicon", "--timing=legacy", "--legacy-timing"):
+            os.environ["NGPCRAFT_TIMING"] = low.split("=")[-1].replace("--", "")
+            args.remove(a); break
+        if low == "--timing" and i + 1 < len(args):
+            # ⚠️ UNE VALEUR INCONNUE EST REFUSEE, PAS IGNOREE. Le defaut est desormais le
+            # modele silicium : une faute de frappe (`--timing legcy`) donnerait donc le
+            # silicium en silence, et on croirait comparer alors qu'on mesure deux fois
+            # la meme machine. C'est exactement le mode de panne que ce commutateur
+            # existe pour eviter -- il a deja coute une demi-journee sur un bisect ou les
+            # cinq essais testaient la meme chose.
+            choix = args[i + 1].lower()
+            if choix not in ("silicon", "legacy"):
+                raise SystemExit(f"--timing {args[i + 1]!r} inconnu : "
+                                 f"attendu 'silicon' ou 'legacy'.")
+            os.environ["NGPCRAFT_TIMING"] = choix
+            args.remove(args[i + 1]); args.remove(a); break
+    if os.environ.get("NGPCRAFT_TIMING", "").strip().lower() == "legacy":
+        print("[timing] ANCIEN modele (avant 2026-08-21), pour attribuer une regression.")
+    else:
+        print("[timing] modele silicium (defaut). --timing legacy pour comparer.")
+
+    rom = args[0] if args else None
     shell = Shell(rom)
     shell.show()
     # AFTER show(): the property store needs a real HWND, which winId only has once the

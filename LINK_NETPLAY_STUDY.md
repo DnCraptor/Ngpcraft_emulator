@@ -290,6 +290,24 @@ redirection — ou derriere du CGNAT, ou aucune redirection n'est possible — r
 arriver, quel que soit le bouton. Le mode direct est realistement du LAN/Tailscale ; le
 lobby-relais est la reponse au reste.
 
+### ✅ L3 — LES DEUX CONSOLES ET LE CABLE DANS LE CORE — FAIT le 2026-08-15
+
+La lecon centrale de cette etude (§5 L3) est livree : `ngpc_run_linked` (ABI 18) fait
+avancer la console EN RETARD EN CYCLES par pas bornes par une fraction du temps d'un octet
+sur le fil, et relaie des qu'une console signale que le cable a bouge. Le shell (2 joueurs
+local) et le miroir (`run_two_consoles_interleaved`) passent tous les deux par la.
+
+Ce que ca change, mesure : le relais tombe de <=256 pompes hote par trame a **6310 relais
+dans le core**, et l'ecart maximal entre les deux consoles a l'interieur d'une trame vaut
+**77 cycles** — contre une trame ENTIERE (102 487 cycles) quand le retard etait juge sur
+les compteurs de cycles DEPUIS L'ALLUMAGE plutot que depuis l'appel. Cette derniere ligne
+est une regression reelle, trouvee par le joueur et non par un test, et racontee dans
+`specs/LINK_CABLE.md` §3.3.
+
+⚠️ **L4 reste ouverte** : le pas est toujours global, derive du temps d'octet plutot que
+configure par jeu. Et **la mesure sur Card Fighters' Clash / The Last Blade reste a faire**
+— le banc a sonde ne peut pas departager un ordonnanceur, elle parle en permanence.
+
 ### Etape 1 — `CABLE_SLICE` par jeu
 Le sortir de la constante globale et le mettre dans `core/quirks.py`, sur le modele des
 seuils par peripherique de GBE+. Peu cher, deplace le probleme sans le resoudre, mais

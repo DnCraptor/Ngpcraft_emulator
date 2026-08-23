@@ -305,7 +305,7 @@ class SerialState(Structure):
         return {name: int(getattr(self, name)) for name, _ in self._fields_}
 
 
-LINK_STATE_VERSION = 1
+LINK_STATE_VERSION = 2   # v2: the second stage of each serial channel
 LINK_FIFO_MAX = 1024
 
 
@@ -337,6 +337,14 @@ class LinkState(Structure):
         ("cts_high", c_uint8), ("rx_pending", c_uint8),
         ("rx_byte", c_uint8), ("overflow", c_uint8),
         ("tx_cycles", c_int32), ("rx_cycles", c_int32),
+        # v2 -- SC0BUF and the shift register are SEPARATE stages on this chip, and the
+        # transmitter is modelled that way. ⛔ THIS MIRROR IS NOT DECORATION: the core
+        # memsets sizeof(ngpc_link_state_t) into whatever buffer it is handed, so a
+        # Python struct one field short is an out-of-bounds WRITE, not a wrong read.
+        # Any field added on the C side belongs here in the same commit.
+        ("tx_buf_full", c_uint8), ("tx_buf_byte", c_uint8),
+        ("rx_shift_full", c_uint8), ("rx_shift_byte", c_uint8),
+        ("rx_had_pending", c_uint8), ("_pad_v2", c_uint8 * 3),
         ("tx_len", c_uint32), ("rx_len", c_uint32),
         ("tx_count", c_uint32), ("wire_count", c_uint32),
         ("rx_queued_count", c_uint32), ("rx_read_count", c_uint32),
@@ -572,6 +580,42 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_rtc.restype = None
     lib.ngpc_rtc_advance.argtypes = [c_void_p, c_uint32]
     lib.ngpc_rtc_advance.restype = None
+    lib.ngpc_set_timing_silicon.argtypes = [c_void_p, c_uint32, c_uint32]
+    lib.ngpc_set_timing_silicon.restype = None
+    lib.ngpc_set_byte_extra.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_byte_extra.restype = None
+    lib.ngpc_set_uart_unplugged.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_uart_unplugged.restype = None
+    lib.ngpc_set_micro_dma_states.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_micro_dma_states.restype = None
+    lib.ngpc_set_fetch_wait_q4.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_fetch_wait_q4.restype = None
+    lib.ngpc_set_bios_data_wait.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_bios_data_wait.restype = None
+    lib.ngpc_set_slack_by_region.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_slack_by_region.restype = None
+    lib.ngpc_set_branch_flush.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_branch_flush.restype = None
+    lib.ngpc_set_rx_double.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_rx_double.restype = None
+    lib.ngpc_set_tx_irq_early.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_tx_irq_early.restype = None
+    lib.ngpc_set_fetch_pipelined.argtypes = [c_void_p, c_int, c_int]
+    lib.ngpc_set_fetch_pipelined.restype = None
+    lib.ngpc_set_half_duplex.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_half_duplex.restype = None
+    lib.ngpc_set_relay_gate.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_relay_gate.restype = None
+    lib.ngpc_set_rx_single.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_rx_single.restype = None
+    lib.ngpc_set_fetch_word.argtypes = [c_void_p, c_int]
+    lib.ngpc_set_fetch_word.restype = None
+    lib.ngpc_set_base_scale.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_base_scale.restype = None
+    lib.ngpc_set_irq_entry.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_irq_entry.restype = None
+    lib.ngpc_set_bios_wait.argtypes = [c_void_p, c_uint32]
+    lib.ngpc_set_bios_wait.restype = None
     lib.ngpc_set_cart_wait.argtypes = [c_void_p, c_uint32]
     lib.ngpc_set_cart_wait.restype = None
     lib.ngpc_set_cart_data_wait.argtypes = [c_void_p, c_uint32]
@@ -689,6 +733,21 @@ def available() -> bool:
         return False
 
 
+def active_timing_model() -> str:
+    """Le modele de temps que ce processus armera : `"silicon"` ou `"legacy"`.
+
+    ⚡ UN SEUL ENDROIT LE DECIDE. `set_timing_silicon` lit la variable d'environnement
+    pour choisir, et le netplay doit poser exactement la MEME question -- sinon deux PC
+    peuvent s'accorder sur tout ce qu'ils s'annoncent et simuler deux machines de vitesses
+    differentes, ce qui ne se voit pas au branchement mais tue le match en derive. Le
+    fingerprint du coeur ne les separe pas : il hache la DLL, et le commutateur est en
+    Python.
+    """
+    import os
+    return "legacy" if os.environ.get(
+        "NGPCRAFT_TIMING", "").strip().lower() == "legacy" else "silicon"
+
+
 def core_fingerprint(path: Path | None = None) -> str:
     """Identify THIS BUILD of the core, for anything that compares two of them.
 
@@ -741,6 +800,158 @@ class NativeMachine:
         """TOTAL writes aimed at the T6W28, ever. The log only keeps the last 4096."""
         return int(self._lib.ngpc_apu_write_count(self._h))
 
+    def set_timing_legacy(self) -> None:
+        """The timing this core shipped BEFORE 2026-08-21, for A/B comparison.
+
+        Not a supported configuration -- it is known to be wrong (a received byte cost
+        49 us against 96 measured on silicon). It exists so a suspected regression can
+        be attributed in seconds instead of argued about: set NGPCRAFT_TIMING=legacy
+        and see whether the symptom follows the model.
+        """
+        self.set_base_scale(1)
+        self.set_fetch_word(False)
+        self.set_fetch_pipelined(False, 0)
+        self.set_rx_single(False)
+        self.set_tx_irq_early(False)
+        self.set_uart_unplugged(False)
+        self.set_byte_extra(0)
+        self.set_cart_wait(3)
+        self.set_cart_data_wait(0)
+        self.set_ldir_cost(14)
+        self.set_ldirw_cost(18)
+        self.set_bios_wait(0)
+        # ⛔ And the experimental knobs too: "legacy" must DEFINE the machine, exactly
+        # like set_timing_silicon does. Leaving one armed would give the old model plus
+        # a refuted hypothesis, and no measurement would say so.
+        self.set_branch_flush(False)
+        self.set_slack_by_region(False)
+        self.set_bios_data_wait(0)
+        self.set_fetch_wait_q4(0)
+        self.set_relay_gate(False)
+        self.set_half_duplex(False)
+        self.set_rx_double(False)
+        self.set_irq_entry(0)
+
+    def set_timing_silicon(self, word_wait: int = 10, bios_wait: int = 8) -> None:
+        """Arm the whole silicon timing model in one call.
+
+        ⚠️ `NGPCRAFT_TIMING=legacy` in the environment makes this apply the PREVIOUS
+        model instead -- the A/B switch for attributing a suspected regression.
+
+        Prefer this over setting cart_wait / ldir_cost / ... by hand: those are eight
+        settings that must agree, and a bench that arms half of them measures a machine
+        no player has. `word_wait` and `bios_wait` are the two calibrated numbers;
+        everything else is documented or derived (see ngpc_set_timing_silicon in
+        core.cpp, and OPEN_ITEMS.md for what still misses).
+        """
+        # ⚖️ LE DEFAUT EST LE MODELE SILICIUM, ET TROIS MESURES MATERIELLES LE PORTENT.
+        #
+        # Il avait ete mis par defaut le 23/08 au matin, puis retire le meme jour sur un
+        # glitch de Cool Boarders, puis remis le soir quand les trois raisons du retrait
+        # sont tombees l'une apres l'autre. Ce qui a change entre-temps n'est pas un
+        # arbitrage, ce sont des MESURES :
+        #
+        #  - **CPU** : ROM `a_irq_calib_v8.ngp` flashee sur console (RASV=198, chiffres
+        #    stables). Silicium 261/218/249 lots, ce modele 262/218/251. Le cout d'une
+        #    interruption y est de 111 cycles ; ce modele en compte 113, l'ANCIEN 59 --
+        #    il sous-facturait de moitie, ce qui deplacait tous les splits rasteurs.
+        #  - **Serie** : campagne AUTO du 21/08 (temoins tous a zero, `ECHOED` = somme des
+        #    RT a l'unite). Allers-retours +0,3 / +0,2 / −0,2 %, part du temps passee a
+        #    recevoir 18,32 % contre 18,20 %.
+        #  - **Le glitch qui avait fait reculer** : Cool Boarders, trames ou le split
+        #    derape sur 600 -- ancien timing **122**, ce modele **62**. Le modele est
+        #    DEUX FOIS meilleur sur le defaut meme qui l'avait fait retirer.
+        #
+        # ⛔ Les deux « regressions » qui avaient motive le retrait n'en etaient pas :
+        # l'une venait d'une seule scene de jeu generalisee a tort, l'autre d'un banc qui
+        # pilotait mal la ROM sonde. Voir OPEN_ITEMS.md.
+        #
+        # `--timing legacy` garde l'ancien modele pour attribuer une regression en
+        # quelques secondes au lieu d'en discuter.
+        if active_timing_model() != "silicon":
+            self.set_timing_legacy()
+            return
+        self._lib.ngpc_set_timing_silicon(self._h, int(word_wait), int(bios_wait))
+
+    def set_byte_extra(self, pct: int) -> None:
+        """EXPERIMENT: add pct% to the derived serial byte time."""
+        self._lib.ngpc_set_byte_extra(self._h, int(pct))
+
+    def set_uart_unplugged(self, on: bool) -> None:
+        """EXPERIMENT: the UART transmits with no cable attached."""
+        self._lib.ngpc_set_uart_unplugged(self._h, 1 if on else 0)
+
+    def set_micro_dma_states(self, eighths: int) -> None:
+        """Le cout d'un transfert micro-DMA, en HUITIEMES du nominal de la datasheet.
+
+        8 = le nominal (8 etats par transfert octet/mot, 12 en 4 octets, 5 en mode
+        compteur -- TMP95C061). 0 = l'ancien comportement, qui n'en facturait AUCUN :
+        un jeu qui enchaine les transferts tournait alors trop vite. Le reglage existe
+        en huitiemes pour pouvoir l'etalonner sans toucher au code.
+        """
+        self._lib.ngpc_set_micro_dma_states(self._h, int(eighths))
+
+    def set_fetch_wait_q4(self, quarters: int) -> None:
+        """Per-word fetch wait in QUARTER cycles; 0 = use the integer cart_wait."""
+        self._lib.ngpc_set_fetch_wait_q4(self._h, int(quarters))
+
+    def set_bios_data_wait(self, cycles: int) -> None:
+        """EXPERIMENT: charge BIOS-region DATA reads, not just fetches."""
+        self._lib.ngpc_set_bios_data_wait(self._h, int(cycles))
+
+    def set_slack_by_region(self, on: bool) -> None:
+        """EXPERIMENT: the BIU's run-ahead follows the region being fetched."""
+        self._lib.ngpc_set_slack_by_region(self._h, 1 if on else 0)
+
+    def set_branch_flush(self, on: bool) -> None:
+        """EXPERIMENT: a taken branch empties the 4-byte instruction queue."""
+        self._lib.ngpc_set_branch_flush(self._h, 1 if on else 0)
+
+    def set_rx_double(self, on: bool) -> None:
+        """EXPERIMENT: two-stage receiver (shift register + SC0BUF)."""
+        self._lib.ngpc_set_rx_double(self._h, 1 if on else 0)
+
+    def set_tx_irq_early(self, on: bool) -> None:
+        """EXPERIMENT: raise INTTX0 when SC0BUF frees, not when the wire frees."""
+        self._lib.ngpc_set_tx_irq_early(self._h, 1 if on else 0)
+
+    def set_fetch_pipelined(self, on: bool, slack: int = 0) -> None:
+        """EXPERIMENT: overlap instruction fetch with execution (the BIU)."""
+        self._lib.ngpc_set_fetch_pipelined(self._h, 1 if on else 0, int(slack))
+
+    def set_half_duplex(self, on: bool) -> None:
+        """EXPERIMENT: do not present a byte while our transmitter is busy."""
+        self._lib.ngpc_set_half_duplex(self._h, 1 if on else 0)
+
+    def set_relay_gate(self, on: bool) -> None:
+        """EXPERIMENT: hold a byte while the receiver's RTS is high."""
+        self._lib.ngpc_set_relay_gate(self._h, 1 if on else 0)
+
+    def set_rx_single(self, on: bool) -> None:
+        """EXPERIMENT: charge a received byte's time ONCE."""
+        self._lib.ngpc_set_rx_single(self._h, 1 if on else 0)
+
+    def set_fetch_word(self, on: bool) -> None:
+        """EXPERIMENT: bill the fetch wait per 16-bit word, not per byte."""
+        self._lib.ngpc_set_fetch_word(self._h, 1 if on else 0)
+
+    def set_base_scale(self, k: int) -> None:
+        """EXPERIMENT: multiply each instruction's own cycles."""
+        self._lib.ngpc_set_base_scale(self._h, int(k))
+
+    def set_irq_entry(self, cycles: int) -> None:
+        """Cycles charged for accepting an interrupt; 0 = built-in default."""
+        self._lib.ngpc_set_irq_entry(self._h, int(cycles))
+
+    def set_bios_wait(self, cycles_per_byte: int) -> None:
+        """Cycles per byte of instruction fetch out of the on-chip BIOS ROM.
+
+        Zero (free) is what this core has always assumed. See Machine::bios_wait --
+        measured evidence says BIOS-heavy code runs 23-30% too fast while plain
+        cartridge code is only 7-9% out.
+        """
+        self._lib.ngpc_set_bios_wait(self._h, int(cycles_per_byte))
+
     def set_cart_wait(self, cycles_per_byte: int) -> None:
         """Wait-states per byte of instruction FETCH from cartridge flash. Silicon = 3.
 
@@ -749,7 +960,7 @@ class NativeMachine:
         (ngpc_settings.cart_wait_states() is True); code that builds a Machine itself gets
         the free-fetch machine and must ask for hardware timing explicitly:
 
-            m.set_cart_wait(3)        # cfg.CART_FETCH_WAIT -- instruction fetch
+            m.set_timing_silicon(10, 8)   # ⚠️ PREFER THIS -- it arms all eight
             m.set_cart_data_wait(0)   # cfg.CART_DATA_WAIT  -- cart data reads are free
             m.set_ldir_cost(14)       # cfg.CART_LDIR_COST  -- block copies, BYTE form
             m.set_ldirw_cost(18)      # cfg.CART_LDIRW_COST -- block copies, WORD form

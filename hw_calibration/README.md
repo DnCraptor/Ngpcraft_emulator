@@ -290,3 +290,56 @@ figures are not, until the unit is settled with them.
 > The ratio you read is the whole answer: it turns "the game feels too fast" into
 > an integer we can act on, and it becomes a non-regression test the emulator must
 > reproduce. This is the project's rule: **we don't tune by feel, we measure.**
+
+---
+
+## v8 — LE COÛT D'UNE INTERRUPTION (2026-08-23) — ⏳ attend la mesure silicium
+
+`a_irq_calib_v8.ngp` · md5 **`334e5cb56e26fe78194d913cee4029a3`** · source `cpu_calib_v8.c`
+
+**Pourquoi.** Toutes les ROM v1–v7 mesurent du code qui tourne **sans interruptions**. Or
+le défaut ouvert est un split rasteur : Cool Boarders coupe `INTT0` (niveau à 0 dans
+`0x0073`), fait son travail, le ré-autorise — et la ligne où son split tombe dépend du
+débit **dans cette fenêtre, interruptions comprises**. Notre modèle silicium facture
+l'entrée en interruption **36 cycles** (18 états × 2) là où l'ancien timing n'en compte que
+**18**. Ce nombre n'a **jamais** été mesuré sur silicium.
+
+**Ce que la ROM fait.** Le même lot de travail, trois fois : `WORK0` avec `INTT0` interdit,
+`WORK1` avec une interruption **par ligne** (`TREG0`=1, timer 0 en mode broche externe =
+le H-blank, exactement le montage de Cool Boarders), `WORK4` une ligne sur quatre.
+`LINE` et `RASV` sont des contrôles de longueur de trame.
+
+⚠️ **Aucun gestionnaire n'est installé, et c'est voulu** : deviner le vecteur utilisateur
+du BIOS ajouterait une inconnue. On mesure le coût **total d'une interruption prise**,
+stub du BIOS compris — ce que le jeu paie aussi.
+
+### Ce que nos deux modèles prédisent
+
+| | WORK0 | WORK1 | WORK4 | coût des IRQ |
+|---|---|---|---|---|
+| ancien timing (défaut actuel) | **263** | 240 | 258 | −23, soit **8,7 %** du débit |
+| modèle silicium (`--timing silicon`) | **214** | 181 | 208 | −33, soit **15,4 %** |
+
+⇒ le modèle facture les interruptions **presque deux fois plus cher en proportion**. Les
+deux jeux de chiffres sont assez éloignés pour que le silicium tranche sans ambiguïté.
+
+### Protocole
+
+1. Flasher, lancer, **noter les cinq nombres** (`WORK0`, `WORK1`, `WORK4`, `LINE`, `RASV`)
+   et **le md5 ci-dessus** — sans le md5 la mesure n'est rattachable à rien.
+2. `RASV` doit valoir **198**. Sinon la console n'est pas dans l'état attendu : rejeter le tir.
+3. Laisser tourner quelques secondes : les nombres se réaffichent en boucle et doivent être
+   **stables**. Un chiffre qui saute d'un tour à l'autre invalide le tir.
+
+### Comment on lira le résultat
+
+- `WORK0` est le **contrôle** : il ne fait intervenir aucune interruption et doit tomber
+  près de la valeur du modèle déjà validé par v1/v2.
+- `(WORK0 − WORK1) / (WORK0 − WORK4)` doit valoir **~4** sur silicium. Si non, le coût
+  n'est pas linéaire en nombre d'interruptions et notre modèle est faux **dans sa forme**,
+  pas seulement dans sa valeur — ce serait le résultat le plus important des trois.
+- Le rapport `(WORK0 − WORK1)` silicium / émulateur donne **directement** le facteur
+  d'erreur sur le coût d'une interruption, et donc quoi mettre dans `kIrqDeliveryCycles`.
+
+⛔ **Ne pas ajuster la constante sur Cool Boarders.** C'est ce que cette ROM existe pour
+éviter : la v2 avait déjà attrapé un `cart_data_wait=5` réglé à l'oreille sur ce même jeu.

@@ -494,6 +494,17 @@ static bool deliver_irq(ngpc::Machine& m) {
         }
     }
 
+    /* Le bus a servi le transfert : cette duree existe pour la machine entiere, pas
+     * seulement pour le CPU. On l'avance comme l'entree en interruption juste apres. */
+    if (m.dma_cost_cycles) {
+        const uint32_t c = m.dma_cost_cycles;
+        m.dma_cost_cycles = 0;
+        advance_raster(m, uint16_t(c));
+        m.adc_tick(c); m.rtc_step(c); m.timer_tick(c);
+        m.serial_tick(c); z80_tick(m, c); m.apu.tick(c);
+        m.total_cycles += c;
+    }
+
     unsigned best_index = 0;
     uint8_t  best_level = 0;
     bool     found = false;
@@ -721,11 +732,56 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         ++s.executed;
         if (want_record) ++s.emitted;
 
-        /* THE CART FLASH IS SLOW: fold in the wait-states this instruction paid reading
-         * the cart bus (fetch + data), accumulated in read8(). This is what makes cart
-         * code run at silicon speed instead of ~3.4x too fast (Machine::cart_wait,
-         * measured by cpu_calib_v1.ngc). Default cart_wait=0 leaves access_wait at 0. */
-        rec->cycles = uint16_t(rec->cycles + m->access_wait);
+        /* WHERE AN INSTRUCTION'S COST IS FINALLY SETTLED: its own cycles, scaled, plus
+         * whatever the bus made it wait -- `access_wait`, accumulated in read8().
+         *
+         * ⚡ AND THE BUS DOES NOT SIMPLY ADD. "The instruction execution unit and the bus
+         * interface unit of this CPU operate independently" (TMP95C061B 3.3.1 notes), so
+         * a fetch OVERLAPS execution: the CPU stalls only when the 4-byte instruction
+         * queue has run dry. That is the `fetch_pipelined` branch, and it is what lets a
+         * short-instruction loop and a BIOS-call loop agree at the same time -- adding
+         * the two costs could never satisfy both. `biu_slack` is how far ahead the bus
+         * may run, i.e. one queue: two 16-bit words.
+         *
+         * ⚠️ `base_scale` is here because Toshiba's per-instruction figures are STATES
+         * and a state is two of these cycles. See PERF_TIMING_POLICY.md §9ter for the
+         * whole model and the provenance of every piece.
+         *
+         * The else branch is the pre-2026-08-21 behaviour, kept because
+         * `NGPCRAFT_TIMING=legacy` and `cart_wait=0` (a fresh Machine) both need it. */
+        if (m->fetch_pipelined && m->flush_queue_on_branch &&
+            m->cpu.pc != ((pc_before + rec->raw_len) & ngpc::kAddrMask)) {
+            /* The PC did not fall through: the queue held the wrong bytes and is
+             * discarded, so whatever run-ahead the BIU had built up is lost. */
+            m->biu_debt = 0;
+        }
+        if (m->access_wait_q4) {
+            /* Quarts -> cycles entiers, la retenue passant a l'instruction suivante :
+             * c'est ce report qui rend un cout moyen fractionnaire possible sur une boucle. */
+            const uint32_t total = m->access_wait_q4 + m->fetch_wait_carry;
+            m->access_wait += total / 4u;
+            m->fetch_wait_carry = total % 4u;
+            m->access_wait_q4 = 0;
+        }
+        if (m->fetch_pipelined) {
+            /* The BIU works through `access_wait` while the CPU works through the
+             * instruction's own cycles; only the shortfall stalls the CPU. */
+            const int32_t base = int32_t(rec->cycles) *
+                (m->cycles_already_measured ? 1 : int32_t(m->base_scale));
+            m->biu_debt += int32_t(m->access_wait) - base;
+            int32_t stall = 0;
+            if (m->biu_debt > 0) { stall = m->biu_debt; m->biu_debt = 0; }
+            const int32_t slack =
+                (m->biu_slack_follows_region && pc_before >= 0xFF0000u)
+                    ? int32_t(2u * m->bios_wait) : m->biu_slack;
+            if (m->biu_debt < -slack) m->biu_debt = -slack;
+            rec->cycles = uint16_t(base + stall);
+        } else {
+            rec->cycles = uint16_t(
+                rec->cycles * (m->cycles_already_measured ? 1u : m->base_scale)
+                + m->access_wait);
+        }
+        m->cycles_already_measured = false;
         m->access_wait = 0;
         m->fetch_window = 0xFFFFFFFFu;   // next step re-arms it before its own fetch
 
@@ -747,22 +803,36 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         /* ...and so does interrupt delivery, BETWEEN instructions. */
         if (m->irq_pending && deliver_irq(*m)) {
             ++s.irq_deliveries;
-            s.total_cycles += kIrqDeliveryCycles;
-            m->total_cycles += kIrqDeliveryCycles;
-            /* The 13 cycles of an interrupt entry are cycles LIKE ANY OTHERS:
+            /* ⚠️ SCALED LIKE EVERY OTHER COST. kIrqDeliveryCycles is 18 STATES
+             * (datasheet 3.3.1, confirmed by Appendix B table (11)), so if the
+             * instruction table is being read as states it must be too -- leaving it
+             * unscaled would make an interrupt entry half price relative to the code
+             * around it. Worth ~18 cycles on every received byte, which is squarely
+             * inside the receive path's remaining shortfall. */
+            const uint32_t irq_cost = m->base_scale *
+                (m->irq_entry_cycles ? m->irq_entry_cycles : uint32_t(kIrqDeliveryCycles));
+            /* ⚡ UNE INTERRUPTION VIDE LA FILE D'INSTRUCTIONS. Le PC part au vecteur :
+             * les quatre octets deja lus ne servent plus, et l'avance que l'unite de bus
+             * avait prise est perdue. La garder decale le timing APRES chaque ISR, et un
+             * split raster ne vit que de ca -- il ne demande pas « plus vite », il demande
+             * de tomber au bon endroit. */
+            m->biu_debt = 0;
+            s.total_cycles += irq_cost;
+            m->total_cycles += irq_cost;
+            /* The cycles of an interrupt entry are cycles LIKE ANY OTHERS:
              * every peripheral clock runs through them. Only the raster used
              * to -- so each delivery slid the timers' (and the APU's, and the
-             * Z80's) clock 13 cycles against the raster. At 10-15 deliveries a
+             * Z80's) clock that far against the raster. At 10-15 deliveries a
              * frame that swept a whole 515-cycle line every few frames, and
              * Metal Slug's raster split beat up and down one line with it. */
-            advance_raster(*m, kIrqDeliveryCycles);
-            m->adc_tick(kIrqDeliveryCycles);
-            m->rtc_step(kIrqDeliveryCycles);
-            m->timer_tick(kIrqDeliveryCycles);
-            m->serial_tick(kIrqDeliveryCycles);
-            z80_tick(*m, kIrqDeliveryCycles);
-            m->apu.tick(kIrqDeliveryCycles);
-            if (m->watchdog_tick(kIrqDeliveryCycles)
+            advance_raster(*m, irq_cost);
+            m->adc_tick(irq_cost);
+            m->rtc_step(irq_cost);
+            m->timer_tick(irq_cost);
+            m->serial_tick(irq_cost);
+            z80_tick(*m, irq_cost);
+            m->apu.tick(irq_cost);
+            if (m->watchdog_tick(irq_cost)
                 && note_watchdog(*m, s, pc_before)) break;
         }
 
@@ -925,15 +995,21 @@ void relay_pair(Machine& a, Machine& b) {
     ++b.serial_relay_count;
     const bool a_ready = (a.mem[0x0000B2] & 0x01) == 0;
     const bool b_ready = (b.mem[0x0000B2] & 0x01) == 0;
-    a.serial_cts_high = !b_ready;
-    b.serial_cts_high = !a_ready;
+    a.serial_cts_high = !b_ready;  a.serial_cts_seen = true;
+    b.serial_cts_high = !a_ready;  b.serial_cts_seen = true;
 
-    if (!a.serial_tx.empty()) {
+    /* The byte stays in the SENDER's queue while the receiver says "not ready", and
+     * pays a fresh byte time when it is finally released -- an RTS edge already marks
+     * the cable as moved, so the release is picked up at once. Off by default. */
+    const bool gate = a.relay_gates_on_rts || b.relay_gates_on_rts;
+    if (!a.serial_tx.empty() && (!gate || b_ready)) {
+        if (gate) b.serial_rx_cycles = b.serial_byte_cycles();
         b.serial_rx_queued_count += uint32_t(a.serial_tx.size());
         b.serial_rx.insert(b.serial_rx.end(), a.serial_tx.begin(), a.serial_tx.end());
         a.serial_tx.clear();
     }
-    if (!b.serial_tx.empty()) {
+    if (!b.serial_tx.empty() && (!gate || a_ready)) {
+        if (gate) a.serial_rx_cycles = a.serial_byte_cycles();
         a.serial_rx_queued_count += uint32_t(b.serial_tx.size());
         a.serial_rx.insert(a.serial_rx.end(), b.serial_tx.begin(), b.serial_tx.end());
         b.serial_tx.clear();
@@ -1363,6 +1439,247 @@ NGPC_API void ngpc_set_timer_base(ngpc_t* h, uint32_t cycles_per_phi_t1) {
 
 /* Wait-states per byte fetched from cartridge flash. 0 = free (the old, ~3.4x-too-fast
  * behaviour). Calibrated by hw_calibration/cpu_calib_v1.ngc. See Machine::cart_wait. */
+/* ONE call that arms the whole silicon timing model, so no caller has to remember
+ * eight settings and no caller can arm half of them.
+ *
+ * The model, and where each piece comes from:
+ *   base x2        Toshiba's instruction costs are STATES; a state is two periods of
+ *                  fc (900/L1 manual; TMP95C061B prices a state at 80 ns at 25 MHz
+ *                  while 4.3 gives tosc = 40 ns). DOCUMENTED.
+ *   fetch per word the external bus is 16 bits. DOCUMENTED.
+ *   pipelined      "the instruction execution unit and the bus interface unit of this
+ *                  CPU operate independently" (3.3.1 notes). DOCUMENTED.
+ *   slack 2 x word the instruction queue is 4 bytes = 2 words (900/L1 Table 1, the
+ *                  feature list, and the LDC note -- three places). DERIVED.
+ *   irq x scale    kIrqDeliveryCycles is 18 STATES, so it scales like everything else.
+ *   BIOS bus       the BIOS is on the same 16-bit bus; billing the cart and letting
+ *                  the BIOS fetch free was an asymmetry nothing justified.
+ *   two-stage TX   SC0BUF and the shift register are separate, so INTTX0 fires when
+ *                  the BUFFER frees -- at the START of a byte (3.11). DOCUMENTED.
+ *   rx single      the receiver charged the byte time twice. A defect, now released.
+ *
+ * ⚠️ `word_wait` and `bios_wait` are the only CALIBRATED numbers. Against the silicon
+ * campaign (10 / 8): a received byte costs 96.0 us against 96.2 measured, the four CPU
+ * regimes land within 6%, throughput -4% and the round trip -8%. See OPEN_ITEMS.md. */
+/* 33 quarts = 8,25 cycles par mot de 16 bits. Voir le bloc au point d'usage. */
+static constexpr uint32_t kSiliconFetchWaitQ4 = 33;
+
+NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bios) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->base_scale         = 2;
+    m->cart_wait          = word_wait;   /* la voie entiere ; fetch_wait_q4 la remplace */
+    m->cart_data_wait     = 0;
+    m->bios_wait          = bios;
+    /* ⚡ AND DATA READS FROM THE BIOS COST THE SAME AS FETCHES FROM IT -- the same
+     * number, not a new one. It is one chip on one bus; a read is a read.
+     *
+     * It matters because a BIOS service is reached by an indirect `call xix` whose
+     * vector is pulled out of the table at 0xFFFE00 -- four bytes, two words, on every
+     * single call. Billing that at zero made BIOS-CALL code cheap while BIOS-INTERRUPT
+     * code was right, which is precisely the shape of the gap it closes: the probe's
+     * polling loop went from +7% to +3% against silicon while the cart-only loops moved
+     * by two counts in six thousand (they never read BIOS data) and the cost of a
+     * received byte stayed inside 1%.
+     *
+     * ⚠️ `cart_data_wait` stays 0 for a different and MEASURED reason -- cpu_calib_v2
+     * showed a cart data read costs the same as a RAM read. That was about the CART. It
+     * never said anything about this chip. */
+    m->bios_data_wait     = bios;
+    /* ⚡ EN QUARTS DE CYCLE, PARCE QUE L'ENTIER NE SUFFIT PAS. Contre les boucles du
+     * test 6 -- code cartouche pur, aucun appel COM, donc comparables -- l'optimum tombe
+     * entre 9 et 10 : a 10 on est 4 % trop LENT, a 9 on est 7 % trop RAPIDE. A 9,75 :
+     * REG -2 %, ROM -1 %, RAM 0 %.
+     *
+     * Ces 4 % n'etaient pas cosmetiques : un HUD en split raster n'a qu'une ligne de
+     * marge, et un CPU legerement lent le rate quand la scene se charge -- le HUD de
+     * Cool Boarders clignotait « parfois plus, parfois moins selon les circonstances »,
+     * ce qui est la forme d'une marge trop juste, pas d'un defaut franc. */
+    /* ⛔ REMIS A 0 (donc `cart_wait` entier), ET C'EST UNE MESURE QUI L'A DECIDE.
+     *
+     * 9,75 rapproche les boucles cartouche du silicium (REG -4 % -> -2 %, RAM -3 % -> 0),
+     * et j'en attendais aussi plus de MARGE pour les splits raster. C'est l'inverse : sur
+     * le savestate de Cool Boarders ou le perso heurte un mur en continu, le HUD saute
+     * d'une trame **13 fois sur 900** a 9,75 et **0 fois** a 10. Le detecteur est
+     * `scratchpad/cb5.py` : il compte, ligne par ligne, les trames qui different de leurs
+     * deux voisines -- et les 13 tombent toutes sur la ligne 8, la frontiere du split.
+     *
+     * ⇒ Un split raster ne demande pas « plus vite », il demande de tomber au bon endroit.
+     * Deux pour cent de precision sur un banc ne valent pas un HUD qui clignote. */
+    /* ⚖️ LE QUART DE CYCLE EST MESURE, PAS DEVINE (ROM a_irq_calib_v8, silicium,
+     * 2026-08-23). L'attente entiere ne peut pas encadrer le silicium : mot=9 donne
+     * 238 lots, mot=8 en donne 269, et la console en fait **261**. Les trois grandeurs
+     * de la ROM concordent sur ~8,3 (8,26 / 8,42 / 8,34), et 8,25 les reproduit a moins
+     * de 2 % : 262/222/251 contre 261/218/249 mesures.
+     *
+     * ⛔ Un quart avait deja ete essaye le 22/08 (9,75) et RETIRE, parce qu'il aggravait
+     * le HUD de Cool Boarders. C'etait un reglage a l'oreille sur un jeu ; celui-ci vient
+     * d'un tir silicium avec RASV=198 et des chiffres stables. La difference n'est pas la
+     * valeur, c'est d'ou elle vient. */
+    m->fetch_wait_q4      = kSiliconFetchWaitQ4;
+    /* ⛔ 0, ET C'EST DELIBERE. Le mecanisme de facturation du micro-DMA existe
+     * maintenant (8 etats par transfert octet/mot, 12 en 4 octets, 5 en compteur --
+     * datasheet TMP95C061), mais SA VALEUR N'EST PAS MESUREE sur silicium. L'armer a 8
+     * ralentit Fatal Fury de 4,3 % -- or les testeurs signalent deja des jeux autour de
+     * 95 % de la vitesse attendue : je risquerais d'aggraver ce qu'on cherche a corriger.
+     * Le relevé le disait deja : « a mesurer avant de corriger : le micro-DMA touche
+     * beaucoup de jeux. »
+     *
+     * ⇒ `ngpc_set_micro_dma_states(8)` l'arme pour qui veut le mesurer, et une ROM de
+     * calibration devra trancher avant qu'il devienne le defaut. */
+    m->micro_dma_states   = 0;
+    m->access_wait_q4     = 0;
+    m->fetch_wait_carry   = 0;
+    m->fetch_wait_per_word = true;
+    m->fetch_pipelined    = true;
+    m->biu_debt           = 0;
+    /* ⚠️ LA MARGE SUIT LE COUT REEL DU MOT, PAS LE PARAMETRE ENTIER. La file fait
+     * 4 octets = 2 mots ; sa valeur en cycles est donc 2 x le cout d'un mot, et depuis
+     * le recalage silicium ce cout est `fetch_wait_q4 / 4` (8,25), pas `word_wait` (10).
+     * Garder l'entier laissait la file croire qu'elle pouvait prendre 20 cycles d'avance
+     * la ou elle n'en a que 16 -- une incoherence introduite par le recalage lui-meme. */
+    m->biu_slack          = int32_t((2u * kSiliconFetchWaitQ4) / 4u);
+    /* ⛔ CES DEUX-LA NE SONT PAS DOUBLES, ET LES DOUBLER ETAIT UNE VRAIE FAUTE.
+     *
+     * Le reste du modele double les chiffres de Toshiba parce que ce sont des ETATS.
+     * Ceux-ci n'en sont pas : ils ont ete MESURES en cycles d'emulateur, contre du
+     * materiel. 14 vient de Cool Boarders ramene a ses 30 fps reels ; 18 vient du
+     * copieur en boucle ouverte de l'ecran-titre de Bomberman, qui doit depenser
+     * exactement 8 lignes par bloc -- a 17 comme a 19 l'image se dechire. Une fenetre
+     * d'UN cycle.
+     *
+     * ⚡ Les avoir doubles facturait chaque copie de bloc au double, et c'est
+     * precisement ce qui fait dechirer un HUD en split raster : le HUD de Cool Boarders
+     * et le fond de KOF R-2 glitchaient en jeu, observes manette en main. Aucun banc ne
+     * l'a vu -- le corpus ne regarde que des ecrans d'intro. */
+    m->ldir_cost          = 14;
+    m->ldirw_cost         = 18;
+    m->tx_irq_on_buffer_free = true;
+    m->rx_single_charge   = true;
+
+    /* ⛔ AND EVERY EXPERIMENTAL KNOB IS CLEARED, not left as it was found.
+     *
+     * "One call arms the model" is a lie if a knob somebody set earlier survives it: the
+     * caller would get the model PLUS a refuted hypothesis, and no measurement would say
+     * so. This function must fully DEFINE the machine's timing, not merely add to it --
+     * which is the same discipline that the eight-setters-in-three-places bugs cost a
+     * day to learn. Anything added below must be cleared here too. */
+    m->flush_queue_on_branch = false;
+    m->biu_slack_follows_region = false;
+    m->relay_gates_on_rts    = false;
+    m->rx_blocked_by_tx      = false;
+    m->rx_double_buffered    = false;
+    m->serial_byte_extra_pct = 0;
+    m->irq_entry_cycles      = 0;     /* 0 = the documented kIrqDeliveryCycles */
+    /* ⛔ NOT ARMED, and the reason is discipline rather than doubt.
+     *
+     * The behaviour is almost certainly right: TxD is a pin, nothing on the chip knows
+     * what is plugged into it, and without this an unplugged console runs its BIOS-call
+     * loop 15% FASTER (1250 -> 1436) purely because the transmitter stops existing.
+     *
+     * But its only NUMERIC justification was the probe's LOOP figure from the 2026-08-19
+     * shoot -- a reference later disqualified because no ROM identity was recorded and
+     * the ROM had changed since. So the benefit is unproven against any shoot that can
+     * defend itself, while the cost is measured: with it armed, a serialised state no
+     * longer replays identically (libretro smoke, "non-deterministic state after
+     * replay"), because an unplugged console can hold a byte mid-transmit and not every
+     * piece of that survives the round trip.
+     *
+     * ⇒ Unproven benefit does not buy a proven regression. Re-arm it when a shoot with
+     * a recorded md5 measures test 6, and finish tracing the state it needs. */
+    m->uart_runs_unplugged = false;
+}
+
+NGPC_API void ngpc_set_byte_extra(ngpc_t* h, uint32_t pct) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->serial_byte_extra_pct = pct;
+}
+
+NGPC_API void ngpc_set_uart_unplugged(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->uart_runs_unplugged = on != 0;
+}
+
+NGPC_API void ngpc_set_micro_dma_states(ngpc_t* h, uint32_t eighths) {
+    if (h) reinterpret_cast<Machine*>(h)->micro_dma_states = eighths;
+}
+
+NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t* h, uint32_t quarters) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->fetch_wait_q4 = quarters;
+    m->access_wait_q4 = 0;
+    m->fetch_wait_carry = 0;
+}
+
+NGPC_API void ngpc_set_bios_data_wait(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->bios_data_wait = cycles;
+}
+
+NGPC_API void ngpc_set_slack_by_region(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->biu_slack_follows_region = on != 0;
+}
+
+NGPC_API void ngpc_set_branch_flush(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->flush_queue_on_branch = on != 0;
+}
+
+NGPC_API void ngpc_set_rx_double(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_double_buffered = on != 0;
+}
+
+NGPC_API void ngpc_set_tx_irq_early(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->tx_irq_on_buffer_free = on != 0;
+}
+
+NGPC_API void ngpc_set_fetch_pipelined(ngpc_t* h, int on, int slack) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->fetch_pipelined = on != 0;
+    m->biu_debt = 0;
+    m->biu_slack = slack;
+}
+
+NGPC_API void ngpc_set_half_duplex(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_blocked_by_tx = on != 0;
+}
+
+NGPC_API void ngpc_set_relay_gate(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->relay_gates_on_rts = on != 0;
+}
+
+NGPC_API void ngpc_set_rx_single(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->rx_single_charge = on != 0;
+}
+
+NGPC_API void ngpc_set_fetch_word(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->fetch_wait_per_word = on != 0;
+}
+
+NGPC_API void ngpc_set_base_scale(ngpc_t* h, uint32_t k) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->base_scale = k ? k : 1;
+}
+
+NGPC_API void ngpc_set_irq_entry(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_entry_cycles = cycles;
+}
+
+NGPC_API void ngpc_set_bios_wait(ngpc_t* h, uint32_t cycles_per_byte) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->bios_wait = cycles_per_byte;
+}
+
 NGPC_API void ngpc_set_cart_wait(ngpc_t* h, uint32_t cycles_per_byte) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->cart_wait = cycles_per_byte;
@@ -1505,7 +1822,9 @@ NGPC_API int ngpc_serial_rts(ngpc_t* h) {
  * machines calls this each pump with the peer's RTS state. See Machine::serial_tick. */
 NGPC_API void ngpc_serial_set_cts(ngpc_t* h, int high) {
     if (!h) return;
-    reinterpret_cast<Machine*>(h)->serial_cts_high = (high != 0);
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->serial_cts_high = (high != 0);
+    m->serial_cts_seen = true;
 }
 
 /* Read-only snapshot of the whole channel for the debugger's Link tab. Every
@@ -1700,6 +2019,24 @@ NGPC_API void ngpc_get_aux_state(ngpc_t* h, ngpc_aux_state_t* out) {
 }
 
 NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
+    /* ⛔ A RESTORED STATE RESUMES WITH AN EMPTY INSTRUCTION QUEUE, and the two serial
+     * buffer stages empty with it.
+     *
+     * These are timing state that no public struct carries, so leaving them alone made
+     * a replay diverge from the run it replayed -- caught by the libretro smoke test as
+     * "non-deterministic state after replay". Clearing them is not a fudge: a snapshot
+     * is exactly the kind of boundary at which a pipeline may be considered flushed,
+     * and the error it can introduce is bounded by the queue -- four bytes, i.e. two
+     * word fetches. Reproducibility is worth more than those.
+     *
+     * ⚠️ ANYTHING ELSE ADDED TO Machine THAT INFLUENCES TIMING BELONGS HERE TOO, or in
+     * a serialised struct. There is no third option that stays deterministic. */
+    if (h) {
+        auto* mm = reinterpret_cast<Machine*>(h);
+        mm->biu_debt = 0;
+        mm->access_wait_q4 = 0;      /* la retenue du quart de cycle est de l'etat */
+        mm->fetch_wait_carry = 0;
+    }
     if (!h || !in) return -1;
     /* A blob from another build is REFUSED, not half-applied: a savestate written by
      * an older core carries a different layout, and reading one field of it as
@@ -1791,6 +2128,11 @@ NGPC_API void ngpc_get_link_state(ngpc_t* h, ngpc_link_state_t* out) {
     out->rx_byte      = m->serial_rx_byte;
     out->tx_cycles    = m->serial_tx_cycles;
     out->rx_cycles    = m->serial_rx_cycles;
+    out->tx_buf_full    = m->serial_tx_buf_full ? 1 : 0;
+    out->tx_buf_byte    = m->serial_tx_buf_byte;
+    out->rx_shift_full  = m->serial_rx_shift_full ? 1 : 0;
+    out->rx_shift_byte  = m->serial_rx_shift_byte;
+    out->rx_had_pending = m->serial_rx_had_pending ? 1 : 0;
 
     /* Clamp rather than truncate in silence: a snapshot that quietly dropped cable
      * bytes would be the very bug this block closes, wearing a green hat. */
@@ -1828,6 +2170,11 @@ NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
     m->serial_tx_byte      = in->tx_byte;
     m->serial_cts_high     = in->cts_high != 0;
     m->serial_rx_pending   = in->rx_pending != 0;
+    m->serial_tx_buf_full    = in->tx_buf_full != 0;
+    m->serial_tx_buf_byte    = in->tx_buf_byte;
+    m->serial_rx_shift_full  = in->rx_shift_full != 0;
+    m->serial_rx_shift_byte  = in->rx_shift_byte;
+    m->serial_rx_had_pending = in->rx_had_pending != 0;
     m->serial_rx_byte      = in->rx_byte;
     m->serial_tx_cycles    = in->tx_cycles;
     m->serial_rx_cycles    = in->rx_cycles;
