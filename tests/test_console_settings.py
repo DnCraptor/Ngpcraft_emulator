@@ -304,7 +304,11 @@ class ManualClock(unittest.TestCase):
 
 
 @unittest.skipUnless(native.available(), "native core not built")
-@unittest.skipUnless(_images(), "no BIOS image to test against")
+# ⚠️ `_images()` est le MAUVAIS garde ici : il est vrai des que l'image HLE existe,
+# alors que ces tests ouvrent `REAL_BIOS` en dur (voir `_session`). Sur une machine
+# sans `bios.bin` -- la CI -- ils ne skippaient pas, ils tombaient en
+# FileNotFoundError. Un test qui exige un fichier doit se garder sur CE fichier.
+@unittest.skipUnless(REAL_BIOS.is_file(), "needs a real BIOS image")
 class TwoConsolesTwoCoinCells(unittest.TestCase):
     """⛔ LOCAL 2-PLAYER GAVE BOTH CONSOLES ONE COIN CELL.
 

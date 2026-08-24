@@ -388,7 +388,29 @@ def pair(app):
     p1, p2 = shell.PlayPage(s, None), shell.PlayPage(s, None)
     p1.machine = p2.machine = object()
     p1._link_peer, p2._link_peer = p2, p1
-    return p1, p2
+    yield p1, p2
+    # ⛔ CES DEUX PAGES TUAIENT LA SUITE, ET PAS ICI.
+    #
+    # Reprendre (`_toggle_pause` deux fois) rearme `self.timer` a 4 ms. Le test rend
+    # la main, mais les deux pages RESTENT VIVANTES : `p1._link_peer is p2` et
+    # l'inverse forment un CYCLE, que seul le ramasse-miettes defait, a un moment
+    # qu'on ne choisit pas. En attendant, elles tiquent des que quelqu'un fait
+    # tourner la boucle d'evenements -- et le premier a le faire longuement est
+    # `test_lobby`, qui pompe 5 secondes. La `machine` etant un `object()` postiche,
+    # `_tick` leve un AttributeError DANS UN SLOT Qt, ce que PyQt traite par
+    # `qFatal()` : SIGABRT sur Linux, 0xC0000409 sur Windows.
+    #
+    # 🔑 LE PROCESSUS MOURAIT DANS UN TEST QUI N'Y ETAIT POUR RIEN, sans resume, sans
+    # nom de test, et seulement quand la suite ENTIERE tourne -- le ramasse-miettes
+    # nettoyait le cycle avant la bombe sur tout sous-ensemble plus court.
+    #
+    # Arreter le minuteur suffit a desamorcer ; couper `_link_peer` rend en plus les
+    # deux pages liberables tout de suite. Aucune teardown Qt a la main (pas de
+    # `deleteLater()` + `processEvents()`) : voir le docstring de `conftest.py`.
+    for page in (p1, p2):
+        page.timer.stop()
+        page._link_peer = None
+        page.machine = None
 
 
 def test_pausing_one_console_pauses_the_other(pair):
@@ -475,9 +497,12 @@ def test_a_lone_console_is_unaffected(app):
     s = cfg.make_settings()
     solo = shell.PlayPage(s, None)
     solo.machine = object()
-    solo._toggle_pause()
-    solo.cycle_speed(True)
-    assert solo.paused and solo._speed == 2.0
+    try:
+        solo._toggle_pause()
+        solo.cycle_speed(True)
+        assert solo.paused and solo._speed == 2.0
+    finally:
+        solo.timer.stop(); solo.machine = None   # voir la fixture `pair`
 
 
 def test_mirror_play_is_left_alone(app):
@@ -488,5 +513,9 @@ def test_mirror_play_is_left_alone(app):
     page = shell.PlayPage(s, None)
     page.machine = object()
     page._mirror = object()
-    page.cycle_speed(True)                   # must not raise, must not look for a peer
-    assert page._speed == 2.0
+    try:
+        page.cycle_speed(True)               # must not raise, must not look for a peer
+        assert page._speed == 2.0
+    finally:
+        page.timer.stop()                    # voir la fixture `pair`
+        page.machine = page._mirror = None

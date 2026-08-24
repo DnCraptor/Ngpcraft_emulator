@@ -50,10 +50,18 @@ class CtypesMirrorsMatchTheCore(unittest.TestCase):
             self.assertIn(f, fields, f"LinkState lost {f} -- see ngpc_link_state_t v2")
         self.assertEqual(native.LINK_STATE_VERSION, 2)
 
+    @unittest.skipUnless(native.available() and ROM.is_file(),
+                         "native core not built")
     def test_the_core_agrees_on_the_link_state_size(self) -> None:
         """The core REFUSES a blob whose `size` is not its own sizeof, so a round trip
         through it is a size check the C compiler signs."""
-        m = NativeSession(ROM, bios_path=BIOS, autosave=False).machine
+        # ⚡ SANS BIOS PLUTOT QUE SKIPPE SI LE BIOS MANQUE. Rien ici ne depend du
+        # BIOS -- la taille est celle que le compilateur C a signee. Le skipper sur
+        # une machine sans `bios.bin` eteindrait ce garde exactement la ou le coeur
+        # vient d'etre recompile (la CI Linux/Mac), donc la ou les tailles peuvent
+        # reellement diverger. Il tombait en FileNotFoundError jusqu'ici.
+        bios = BIOS if BIOS.is_file() else None
+        m = NativeSession(ROM, bios_path=bios, autosave=False).machine
         st = m.link_state()
         self.assertEqual(int(st.size), ctypes.sizeof(native.LinkState))
         self.assertEqual(int(st.version), native.LINK_STATE_VERSION)
