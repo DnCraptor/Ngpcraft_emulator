@@ -825,15 +825,29 @@ bool exec_reg_family(Machine& m, ngpc_record_t* rec, uint8_t op, uint32_t pc,
             const uint32_t packed = ((rem & hmask) << half) | (q & hmask);
             dst = (sz == 0) ? ((dst & 0xFFFF0000u) | packed) : packed;
             c.flags = uint8_t(overflow ? (c.flags | RF_V) : (c.flags & ~RF_V));
-            /* Cost calibrated to silicon: cpu_calib_v2 on hardware read DIV word 265 vs our
-             * old 301 (under-costed); word 23->37 makes the emulator read 265. The datasheet
-             * 15/23 is a floor -- real DIV is variable-latency and slower. MUL word 14->19
-             * likewise matches silicon's 444 (was 481). Byte/signed scaled by the same ratio. */
+            /* ⚖️ RE-CALIBRE LE 23/08/2026, ET IL LE FALLAIT : ces nombres avaient ete
+             * cales quand le cout de LECTURE autour valait autre chose. Le tir v8 a
+             * epingle l'attente de fetch a 8,25 cycles/mot (elle valait 10), ce qui a
+             * rendu toute la machine plus rapide -- et `DIV` s'est retrouve a **+29,4 %**
+             * contre la campagne silicium v2/v3, quand les sept autres classes tenaient
+             * a +/-6 %. Un nombre cale par-dessus un autre nombre faux ne survit pas a
+             * la correction du second.
+             *
+             * ⛔ ET ON NE LE CALE PAS A ZERO. `DIV` = 64 ferait tomber l'ecart a −1,1 %,
+             * mais les autres classes portent un **+5 % commun** : DIV serait alors la
+             * seule exacte au milieu d'un biais general, c'est-a-dire un chiffre ajuste
+             * pour masquer ce biais. `DIV` = 56 le ramene a **+6,4 %**, dans la bande des
+             * autres -- BASE +4,3, ADD +6,2, MUL +6,3, CSEQ +3,7, CRND +3,6, RRND +4,4.
+             * Le +5 % commun reste a expliquer, et c'est LUI le prochain sujet.
+             *
+             * Physiquement : 56 cycles = 28 etats contre un plancher datasheet de 23.
+             * Coherent avec « DIV est a latence variable, et plus lent que la table ».
+             * Les trois autres formes suivent le meme rapport (x1,514). */
             /* ⛔ DEJA EN CYCLES -- voir Machine::cycles_already_measured. Ces quatre
              * nombres sortent de `cpu_calib_v2` sur silicium, pas d'une table d'etats,
              * donc le modele ne doit PAS les doubler. */
             m.cycles_already_measured = true;
-            out_cycles = uint16_t(is_signed ? (sz == 0 ? 29 : 42) : (sz == 0 ? 24 : 37));
+            out_cycles = uint16_t(is_signed ? (sz == 0 ? 44 : 64) : (sz == 0 ? 36 : 56));
         } else {
             const uint32_t a = wide & hmask;
             uint32_t res;

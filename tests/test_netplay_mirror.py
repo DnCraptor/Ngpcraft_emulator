@@ -1267,6 +1267,7 @@ def test_a_peer_from_before_the_switch_is_refused():
     n'a besoin de bouger."""
     import json
     a = _timed_handshake("silicon")
+    import json
     vieux = json.loads(a.payload().decode())
     vieux.pop("timing")
     assert a.check(json.dumps(vieux).encode()) == "timing_model"
@@ -1288,3 +1289,43 @@ def test_the_handshake_follows_the_environment_when_not_told(monkeypatch):
         assert annonce() == choix
     monkeypatch.delenv("NGPCRAFT_TIMING")
     assert annonce() == active_timing_model()
+
+
+# ⚡ L'ALLER-RETOUR EST MESURE, ET IL NE L'ETAIT NULLE PART.
+#
+# Avant ceci le delai se TAPAIT A LA MAIN par les deux joueurs (« ping en ms / 17, plus
+# un ») et `DEFAULT_DELAY = 3` s'appliquait quelle que soit la ligne. Sans mesure on ne
+# peut pas distinguer « le link est instable » de « la ligne de ce joueur est mauvaise »,
+# donc aucun rapport de bug n'est interpretable -- LINK_NETPLAY_STUDY §2.2, prerequis de
+# tout diagnostic.
+#
+# Le porteur est le message d'empreinte, qui partait deja : + horodatage de l'emetteur et
+# ECHO du dernier recu. Quand l'echo revient, la difference est l'aller ET le retour --
+# aucune horloge commune a supposer entre les deux PC, et 8 octets par empreinte.
+def _mirror_pair():
+    a, b = _trade(delay_a=3, delay_b=3)
+    return (MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), a.pipe, a.hs),
+            MirrorSession(FakeMachine(), FakeMachine(), FakeLink(), b.pipe, b.hs))
+
+
+def test_the_round_trip_is_measured_once_the_echo_comes_back():
+    sa, sb = _mirror_pair()
+    # il faut assez de trames pour qu'une empreinte parte, revienne, et que l'echo
+    # nous revienne a son tour : trois passages de CHECK_EVERY suffisent largement.
+    for _ in range(netplay.CHECK_EVERY * 3 + 4):
+        sa.step(0)
+        sb.step(0)
+    assert sa.rtt_ms is not None, "aucun aller-retour mesure apres trois empreintes"
+    assert sa.rtt_ms < 60000
+    assert sa.rtt_max_ms >= sa.rtt_ms or sa.rtt_max_ms > 0
+
+
+def test_a_peer_from_before_the_measurement_is_refused_not_misread():
+    """⚠️ La taille du message d'empreinte a change. Un pair d'ancienne version le lirait
+    a la mauvaise longueur et desynchroniserait sa PROPRE lecture du flux -- bien pire
+    qu'un refus. La version du protocole doit donc l'arreter avant."""
+    a = Handshake(rom_hash="r", bios_hash="b", core_version="c")
+    import json
+    vieux = json.loads(a.payload().decode())
+    vieux["v"] = netplay.PROTOCOL_VERSION - 1
+    assert a.check(json.dumps(vieux).encode()) == "protocol_version"

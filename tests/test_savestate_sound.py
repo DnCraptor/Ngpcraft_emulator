@@ -221,20 +221,24 @@ class ShellSavestateReaderTests(unittest.TestCase):
     MARKER_ADDR = 0x004242
     MARKER = 0x5A
     # Newest first. `ngpc_shell.STATE_MAGIC` must be the head of this list.
-    MAGICS = (b"NGPCST03", b"NGPCST02", b"NGPCST01")
+    MAGICS = (b"NGPCST04", b"NGPCST03", b"NGPCST02", b"NGPCST01")
 
     def _blob(self, magic: bytes) -> bytes:
         from core.native import AuxState, CpuState, LinkState
 
+        from core.native import RtcState
+
         cpu = CpuState()
         cpu.pc = 0x00201234
-        body = bytes(cpu)
-        if magic in (b"NGPCST03", b"NGPCST02"):
+        # v4 : l'horloge vient EN TETE, avant le CPU.
+        body = bytes(RtcState()) if magic == b"NGPCST04" else b""
+        body += bytes(cpu)
+        if magic in (b"NGPCST04", b"NGPCST03", b"NGPCST02"):
             aux = AuxState()
             aux.version = native.AUX_STATE_VERSION
             aux.size = ctypes.sizeof(AuxState)
             body += bytes(aux)
-        if magic == b"NGPCST03":
+        if magic in (b"NGPCST04", b"NGPCST03"):
             link = LinkState()
             link.version = native.LINK_STATE_VERSION
             link.size = ctypes.sizeof(LinkState)
@@ -282,6 +286,11 @@ class ShellSavestateReaderTests(unittest.TestCase):
             def set_link_state(self, st):
                 pass
 
+            def set_rtc(self, st):
+                # v4 : l'horloge fait partie de l'etat restaure. Ce double doit suivre
+                # le format, sinon le test passerait en n'exerçant pas le chemin.
+                self.restored_rtc = bytes(st)
+
         rec = Recorder()
         try:
             ngpc_native.load_state(rec, path)
@@ -296,6 +305,11 @@ class ShellSavestateReaderTests(unittest.TestCase):
         self.assertEqual(image[self.MARKER_ADDR], self.MARKER,
                          f"{magic.decode()}: headless reader read the image at the "
                          f"wrong offset -- it does not know about a block")
+
+    def test_it_reads_a_v4_state_at_the_right_offset(self) -> None:
+        """v4 ajoute l'horloge calendaire en tete du corps : un lecteur qui l'ignore
+        decale l'image entiere."""
+        self._check(b"NGPCST04")
 
     def test_it_reads_a_v3_state_at_the_right_offset(self) -> None:
         self._check(b"NGPCST03")

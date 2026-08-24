@@ -202,12 +202,12 @@ qui donne une machine que personne n'a. **Appeler ce que le shell appelle.**
 | etats Toshiba **x2** | manuel CPU 900/L1 ; fiche TMP95C061B (un etat = 80 ns a 25 MHz, `tosc` = 40 ns) |
 | fetch par **mot 16 bits** | le bus externe est 16 bits |
 | fetch **pipeline** (dette du BIU) | fiche 3.3.1 : *l'unite d'execution et l'unite de bus fonctionnent independamment* |
-| avance du BIU = **2 x cout/mot** | file de **4 octets**, dite trois fois dans le manuel 900/L1 |
+| avance du BIU = **2 x cout REEL du mot** | file de **4 octets**, dite trois fois dans le manuel 900/L1. ⚠️ le cout reel, pas le parametre entier -- l'y avoir laisse a coute 2 lots au banc v8 |
 | entree d'interruption **x2** | 18 **etats** (3.3.1 + annexe B table (11)) |
 | le **BIOS paie le meme bus** | il est sur le meme bus 16 bits |
 | **transmetteur a deux etages** | fiche 3.11 : `SC0BUF` et le registre a decalage sont distincts |
 | retrait du **double comptage** a la reception | defaut reel, condition de sortie remplie |
-| `word = 10`, `bios = 8` | ⚠️ **les deux seuls chiffres CALIBRES** |
+| `word = 8,25` (`fetch_wait_q4 = 33`), `bios = 8` | ⚠️ **les deux seuls chiffres CALIBRES**, et le premier a ete RECALE sur silicium le 23/08 (ROM v8) : il valait 10, l'entier ne peut pas encadrer la console. Voir plus bas. |
 
 ### Contre le silicium (tir du 21/08, recoupe en interne)
 
@@ -229,26 +229,70 @@ libretro : *non-deterministic state after replay*). `ngpc_link_state_t` est pass
 
 ---
 
-### ⚖️ C'EST LE DEFAUT DEPUIS LE 23/08/2026 (bureau, libretro, Android)
+### ⚖️ DEFAUT SUR LES TROIS FACADES, ET RECALE SUR SILICIUM LE 23/08/2026
 
-`--timing legacy` (ou `NGPCRAFT_TIMING=legacy`) garde l'ancien modele, et sert a
-attribuer une regression en secondes au lieu d'en discuter. ⚠️ Le shell **refuse** une
-valeur inconnue : le defaut etant desormais le silicium, une faute de frappe donnerait le
-silicium en silence et on croirait comparer deux machines alors qu'on en mesure une seule.
+`--timing legacy` (ou `NGPCRAFT_TIMING=legacy`) garde l'ancien modele, pour attribuer une
+regression en secondes au lieu d'en discuter. ⚠️ Le shell **refuse** une valeur inconnue :
+le defaut etant le silicium, une faute de frappe le donnerait en silence et on croirait
+comparer deux machines alors qu'on en mesure une seule.
 
-Ce qui bloquait la bascule, et ce que ca valait :
+#### Les deux nombres calibres ont CHANGE — et c'est un tir sur console qui l'a impose
 
-| defaut vu en jeu | verdict |
-|---|---|
-| KOF R-2, fond et chrono qui glitchent | **c'etait nous** : `MUL`/`DIV` et `LDIR` sont etalonnes en CYCLES, pas en etats -- le modele les doublait |
-| Cool Boarders, HUD qui clignote | **ce n'etait pas nous** : l'ancien timing lache les memes trames, le jeu est auto-time a 30 fps, et « reparer » pousse son horloge a 41 -- ⛔ confirme sur console reelle |
+ROM `hw_calibration/a_irq_calib_v8.ngp` (md5 `334e5cb56e26fe78194d913cee4029a3`), la
+premiere a mesurer le **cout d'une interruption** : les sept precedentes ne mesurent que
+du code sans interruptions.
 
-Validation : corpus A/B 83 ROMs / 46 empreintes deplacees / **0 perte soutenue** · suite
-**2098 passed** sous ce defaut · KOF R-2 en combat depuis un savestate partage, **572
-trames identiques au pixel AVEC du mouvement** · libretro 5/5.
+| | WORK0 | WORK1 | WORK4 | cout d'une IRQ |
+|---|---|---|---|---|
+| **SILICIUM** | 261 | 218 | 249 | **111 cycles** |
+| ce modele | 260 | 218 | 250 | 113 |
+| ancien timing | 263 | 240 | 258 | **59** |
+
+- ✅ **l'entree en interruption a 36 cycles (18 etats x 2) est CONFIRMEE** ; l'ancien
+  timing sous-facture de moitie, ce qui deplace tous les splits rasteurs ;
+- ⚡ **l'attente de lecture vaut 8,25 cycles par mot**, pas 10. L'entier ne peut pas
+  encadrer le silicium (mot=9 -> 238 lots, mot=8 -> 269, console **261**). Arme par
+  `fetch_wait_q4 = 33` ;
+- ⚡ **`biu_slack` suit le cout REEL du mot** (2 x 8,25), plus le parametre entier. Cette
+  seconde correction a amene `WORK1` de 220 a **218 pile**.
+
+⛔ **Un quart de cycle avait deja ete essaye la veille (9,75) puis retire** parce qu'il
+aggravait un jeu. C'etait un reglage a l'oreille ; celui-ci vient d'un tir avec RASV=198 et
+des chiffres stables. **La difference n'est pas la valeur, c'est d'ou elle vient.**
+
+⚠️ **ET IL A FALLU LE RENDRE SANS ETAT.** Le quart etait obtenu en REPORTANT une retenue
+d'une instruction a l'autre -- donc de l'etat, qu'un chemin lisant hors du pas
+d'instruction decalait, et le test de rejeu libretro est tombe dessus immediatement. Le
+motif vient desormais de l'ADRESSE : sur quatre mots consecutifs, `q4 & 3` coutent un
+cycle de plus. Meme moyenne, reproductible, aucune retenue a sauver.
+
+#### Le serie, contre la campagne AUTO du 21/08
+
+Allers-retours **+0,3 / +0,2 / −0,2 %**, part du temps passee a recevoir **18,32 % contre
+18,20 %**. ⛔ L'« ecart serie » poursuivi pendant des heures n'existait pas : c'etait
+`verify_bench` qui pilotait mal la ROM sonde (roles imposes alors qu'AUTO les elit, et
+appui simultane que la ROM refuse). La batterie compare desormais AUTO **directement au
+silicium** plutot qu'a des references d'emulateur -- ⚡ **une reference d'emulateur ne
+mesure pas la fidelite, elle detecte le mouvement.**
+
+#### Ce qui a bloque l'armement sur les facades
+
+`libretro_smoke_external_bios_priority` : « non-deterministic state after replay ».
+Cause -- **`biu_debt` etait EFFACE a la restauration**. Effacer un etat a la restauration
+parait prudent et ne l'est pas : la premiere passe continue avec sa valeur vivante, le
+rejeu repart de zero, et les deux divergent. ⇒ il voyage maintenant DANS le bloc aux (a la
+place de `_pad2`, taille inchangee, aucun savestate invalide).
+🚨 **Tout etat qui influence le temps se SERIALISE.**
+
+#### Validation
+
+corpus A/B 83 ROMs / **0 perte soutenue** · suite **2108 passed** · banc du cable
+**0 echec** · libretro 5/5 · deux APK · coeurs en phase.
 
 ⛔ **Non prouve** : le glitch KOF d'origine n'a jamais ete reproduit sans tete, ni sous
-l'ancien timing ni sous le modele. On ne peut donc pas ecrire « repare ».
+l'ancien timing ni sous le modele. On ne peut donc pas ecrire « repare » -- seulement
+« introuvable, et les deux timings rendent 572 trames identiques au pixel avec du
+mouvement ».
 
 ---
 

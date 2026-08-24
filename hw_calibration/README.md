@@ -343,3 +343,288 @@ deux jeux de chiffres sont assez éloignés pour que le silicium tranche sans am
 
 ⛔ **Ne pas ajuster la constante sur Cool Boarders.** C'est ce que cette ROM existe pour
 éviter : la v2 avait déjà attrapé un `cart_data_wait=5` réglé à l'oreille sur ce même jeu.
+
+---
+
+## v9 — LE COÛT D'UN TRANSFERT MICRO-DMA (2026-08-24) — ⏳ attend la mesure silicium
+
+`a_dma_calib_v9.ngp` · md5 **`541dffc2937504bb66a7abc9594b7b16`** · source `cpu_calib_v9.c`
+
+**Pourquoi.** Notre `micro_dma_service` facture **zéro**. La datasheet donne 8 états par
+transfert octet/mot, 12 en 4 octets, 5 en mode compteur — mais ces chiffres n'ont jamais
+été vérifiés sur silicium, et les armer à l'aveugle ralentit Fatal Fury de **4,3 %** alors
+que des jeux sont déjà signalés trop lents. Le mécanisme existe (`ngpc_set_micro_dma_states`,
+en huitièmes du nominal) et reste **désarmé** tant que cette ROM n'a pas parlé.
+
+**Montage.** Timer 0 sur la broche externe TI0 (le H-blank du K2GE), `TREG0` = 1 : une
+source d'interruption **par ligne**, ~152 par trame. Le canal 0 du micro-DMA est armé sur
+ce vecteur, donc chaque impulsion déclenche **un transfert au lieu de vectoriser le
+processeur**. Le seul coût restant est le temps de **bus** — séparé du coût d'entrée en
+interruption, déjà mesuré à 111 cycles par la v8.
+
+### Ce que nos réglages prédisent
+
+| coût armé dans l'émulateur | WORK0 | **WORKD** | WORKC |
+|---|---|---|---|
+| **0** — notre défaut actuel | 260 | **261** | 260 |
+| **8** — le nominal datasheet | 260 | **255** | 256 |
+| **32** — 4× le nominal | 260 | **236** | 245 |
+
+⇒ la valeur de `WORKD` lue sur console désigne directement la bonne.
+
+### Protocole
+
+1. Flasher, lancer, **noter les cinq nombres** (`WORK0`, `WORKD`, `WORKC`, `DMAC`, `RASV`)
+   et **le md5 ci-dessus**.
+2. `RASV` doit valoir **198**, sinon rejeter le tir.
+3. ⚠️ **`DMAC` EST LE CONTRÔLE QUI VAUT LE DÉPLACEMENT.** Il part de 65535 et doit avoir
+   **beaucoup baissé** (~9134 transferts en 60 trames dans l'émulateur, soit ~152 par
+   trame). **Si `DMAC` est resté à 65535, le canal ne s'est jamais armé** — et alors un
+   `WORKD` égal à `WORK0` ne dit PAS « le transfert est gratuit », il dit « la mesure n'a
+   pas eu lieu ». Ce serait d'ailleurs un résultat en soi : notre cœur compare `DMA0V` à
+   l'**indice** du vecteur (16), et si le matériel y attend autre chose, ce chiffre le
+   révèle.
+4. Les nombres se réaffichent en boucle : ils doivent être **stables**.
+
+⛔ **Ne pas armer `micro_dma_states` sans ce tir.** C'est exactement ce que la v2 avait
+attrapé sur `cart_data_wait = 5`, réglé à l'oreille sur un jeu et réfuté par la mesure.
+
+---
+
+## v10 — LE PONT ENTRE DEUX CAMPAGNES (2026-08-24) — ⏳ attend la mesure silicium
+
+`a_pont_calib_v10.ngp` · md5 **`ceb06f4d05592faf15b232f8552b65b8`** · source `cpu_calib_v10.c`
+
+**Le problème qu'elle règle.** Les classes d'instructions mesurées par `cpu_calib_v3`
+(campagne de **juillet**) donnent aujourd'hui sept classes **du même côté**, +4 à +7 %.
+Tentant d'y voir un biais du modèle. ⛔ **Mais le modèle est calé sur le tir v8 d'août** :
+autre ROM, autre session. Soustraire deux tirs non comparables est la faute que
+`OPEN_ITEMS §4bis` documente — *« une référence silicium n'est pas datable »* — et qui a
+déjà coûté une passe entière ici.
+
+**Ce qu'elle fait.** Elle mesure **dans le même tir** la boucle de référence **exacte de la
+v8** (`REF`) *et* les classes de la v3. Plus rien à soustraire entre deux dates.
+
+### Ce que notre modèle donne
+
+| | valeur | rapport à `REF` |
+|---|---|---|
+| `REF` | 262 | 1,000 |
+| `BASE` | 715 | **2,729** |
+| `SHIFT` | 520 | 1,985 |
+| `ADD` | 614 | 2,344 |
+| `MUL` | 472 | 1,802 |
+| `DIV` | 282 | 1,076 |
+| `MEM` | 529 | 2,019 |
+
+### Comment lire le tir — et c'est le RAPPORT qui décide, pas la valeur absolue
+
+- **si les rapports mesurés collent aux nôtres** (à ~1 %), notre tarification *relative*
+  des instructions est juste, et l'écart de +5 % vu contre juillet est un **artefact de
+  campagne** : il n'y a pas de biais à corriger, et cette question se ferme ;
+- **si un rapport diffère**, c'est cette classe-là qui est mal facturée, et l'écart se lit
+  directement sans jamais comparer deux dates.
+
+⚠️ Regarder aussi `REF` seul : le tir v8 avait donné **261** pour cette boucle. Un `REF`
+proche de 261 confirme que les deux tirs sont dans les mêmes conditions ; un `REF` très
+différent dirait que quelque chose a changé côté console, et invaliderait la comparaison
+avec juillet — ce qui serait déjà la réponse.
+
+### Protocole
+
+Flasher, lancer, **noter les huit nombres** et **le md5**. `RASV` doit valoir **198**.
+Les valeurs se réaffichent en boucle : elles doivent être stables, ou noter la plage.
+
+### ✅ v10 — TIR SILICIUM DU 24/08, et ce qu'il dit
+
+`REF 261 · BASE 281 · SHIFT 538 · ADD 578 · MUL 444 · DIV 266 · MEM 471 · RASV 198`
+(± 1 point d'oscillation, note du testeur)
+
+**Le pont tient** : `REF` = **261**, exactement ce que la ROM v8 avait donné pour la même
+boucle. Les deux tirs sont donc dans les mêmes conditions, et la comparaison avec la
+campagne de juillet redevient licite.
+
+⇒ **le « +5 % » n'était PAS un artefact de campagne.** Il est réel.
+
+| | silicium | nous | rapport |
+|---|---|---|---|
+| **REF** | 117,8 cy/itér | 117,3 | **×1,00** |
+| SHIFT | 57,1 | 59,1 | ×0,97 |
+| ADD | 53,2 | 50,1 | ×1,06 |
+| MUL | 69,2 | 65,1 | ×1,06 |
+| DIV | 115,6 | 109,0 | ×1,06 |
+| MEM | 65,3 | 58,1 | ×1,12 |
+| **BASE** | **109,4** | **43,0** | **×2,54** |
+
+#### ⚠️ Et `BASE` est une anomalie que rien n'explique encore
+
+Désassemblée (`_m_base` à `0x2016AE`), sa boucle interne est **quatre instructions
+registre, dix octets, aucun accès mémoire** :
+`ld WA,BC` · `inc 1,DE` · `cp DE,0x00C8` · `jr C` (branche **prise** à chaque tour).
+
+⛔ **L'hypothèse « c'est le vidage de file à la branche » ne tient pas**, et il faut le
+dire : `REF` fait **quatre** opérations par tour pour 117,8 cy, `BASE` en fait **une** pour
+109,4 — sur silicium les trois opérations supplémentaires coûtent donc ~8 cycles en tout,
+alors que chez nous elles en coûtent 74. Une branche identique dans les deux boucles ne
+peut pas produire cet écart-là.
+
+⇒ **Prochaine étape : désassembler `_m_ref` (`0x201668`) avant toute théorie.** Le plus
+probable est que les deux boucles ne compilent pas pareil — l'une gardant ses variables en
+registres et l'autre non — auquel cas `BASE` et `REF` ne mesurent pas la même chose, et
+c'est ÇA le résultat.
+
+🚨 **Leçon déjà acquise aujourd'hui, re-appliquée** : ne pas nommer un mécanisme avant
+d'avoir regardé le code. Le premier réflexe a été « la branche », et le tableau le réfute
+en trois lignes.
+
+#### 💥 `_m_ref` désassemblé — et le modèle a le coût AU MAUVAIS ENDROIT
+
+| | instructions | octets | **mots** | silicium |
+|---|---|---|---|---|
+| `BASE` (`0x2016C0`) | 4 | 10 | **5** | 109,4 cy/itér |
+| `REF` (`0x20167A`) | 13 | 28 | **14** | 117,8 cy/itér |
+
+Neuf instructions et neuf mots de plus ne coûtent que **8,4 cycles**. Résolution linéaire
+sur les deux points du **même tir** :
+
+> **coût = 104,7 cycles FIXES par itération + 0,93 cycle par mot lu**
+
+⇒ sur cette console, une itération de boucle coûte ~105 cycles fixes, et la **lecture des
+instructions est quasi gratuite** — entièrement masquée par le prefetch.
+
+⛔ **Notre modèle dit l'inverse** : 8,25 cycles par mot, aucun coût fixe. Il tombe juste sur
+`REF` **par compensation** (14 × 8,25 ≈ 115 ≈ 118) et s'effondre sur `BASE`, qui n'a que
+5 mots à facturer (43 contre 109).
+
+⚠️ **Ce que ça NE dit pas encore** : ce que sont ces 105 cycles. Ils couvrent l'exécution
+de `inc` + `cp` + `jr` **et** la pénalité de branche prise, sans qu'on puisse encore les
+séparer avec deux points seulement. Une ROM à trois tailles de boucle (par ex. 5, 14 et 30
+mots) les séparerait — et confirmerait ou non la linéarité.
+
+🚨 **Et ça recadre TOUT le reste** : `mot = 8,25` a été calé sur la ROM v8, dont la boucle
+fait justement ~14 mots. Il compense donc un coût fixe qu'on ne modélise pas. Les classes
+à +6 % et `MEM` à +12 % sont probablement le même effet, vu sous des tailles de boucle
+différentes. ⛔ **Ne rien réajuster tant que la forme n'est pas corrigée** : ajuster une
+constante qui compense une erreur de structure, c'est ce qui a déjà fait dériver `DIV`.
+
+---
+
+## v11 — LA DROITE : séparer le coût fixe du coût par mot (2026-08-24) — ⏳ attend le tir
+
+`a_droite_calib_v11.ngp` · md5 **`78bd48dc869020f6cf52fc4d2dd9054f`** · source `cpu_calib_v11.c`
+
+**Ce que la v10 a établi** : deux boucles du même tir donnent
+`coût = 104,7 cycles FIXES par itération + 0,93 cycle par mot lu`. Notre modèle dit
+l'inverse (8,25 par mot, aucun coût fixe) : il tombe juste sur une boucle de 14 mots **par
+compensation** et s'effondre sur une de 5 mots.
+
+**Ce que deux points ne peuvent pas dire** : si la relation est linéaire, et ce que sont
+ces 105 cycles.
+
+**Cette ROM mesure quatre tailles de boucle**, même structure, même compteur, même branche
+— seule la quantité de travail registre change. Tailles **relevées au désassemblage**, pas
+supposées : `L1` = **5 mots**, `L2` = **14**, `L3` = **35**, `L4` = **53**.
+
+### Les deux prédictions sont incompatibles — c'est ce qui rend le tir décisif
+
+| boucle | notre modèle | si la droite de la v10 tient |
+|---|---|---|
+| L1 (5 mots) | **720** | **281** |
+| L2 (14 mots) | 263 | 261 |
+| L3 (35 mots) | **105** | **224** |
+| L4 (53 mots) | **70** | **200** |
+
+⇒ les deux ne se croisent qu'à `L2` — la boucle sur laquelle notre constante a été calée.
+Partout ailleurs elles divergent d'un facteur 2 à 3.
+
+**Comment lire le tir**
+
+- **valeurs proches de 281/261/224/200** ⇒ la droite tient, le coût est **fixe par
+  itération** et la lecture d'instructions quasi gratuite. Notre modèle a le coût au
+  mauvais endroit et il faut en changer la **forme**, pas les constantes.
+- **valeurs proches de 720/263/105/70** ⇒ notre modèle est bon et c'est la mesure `BASE` de
+  la v10 qui était trompeuse.
+- **valeurs entre les deux, ou non alignées** ⇒ ni l'un ni l'autre : reporter les quatre
+  nombres, la droite se recalcule dessus.
+
+### Protocole
+
+Flasher, noter les **cinq nombres** (`L1`..`L4`, `RASV`) et le **md5**. `RASV` doit valoir
+**198**. Noter la plage si ça oscille.
+
+⛔ **Ne réajuster aucune constante avant ce tir.** `mot = 8,25` a été calé sur une boucle
+de ~14 mots — exactement le seul point où les deux modèles s'accordent. Ajuster une
+constante qui compense une erreur de structure est ce qui a déjà fait dériver `DIV`.
+
+### 🚨 TIR DU 24/08 — LA DROITE EST RÉFUTÉE, ET NOTRE MODÈLE CONFIRMÉ
+
+`L1 678/679 · L2 261 · L3 107 · L4 71 · RASV 198`
+
+| boucle | silicium | notre modèle | écart | « droite v10 » |
+|---|---|---|---|---|
+| L1 (5 mots) | **678** | 720 | **−5,8 %** | 281 ❌ |
+| L2 (14 mots) | **261** | 263 | **−0,8 %** | 261 |
+| L3 (35 mots) | **107** | 105 | **+1,9 %** | 224 ❌ |
+| L4 (53 mots) | **71** | 70 | **+1,4 %** | 200 ❌ |
+
+⛔ **IL N'Y A PAS DE COÛT FIXE DE 105 CYCLES PAR ITÉRATION.** Le modèle a le coût au bon
+endroit — proportionnel aux mots lus — et la lecture d'instructions n'est pas gratuite.
+La « droite » tirée de la v10 se trompait d'un facteur 3 sur trois points sur quatre.
+
+**D'où venait l'erreur** : le `BASE = 281` de la v10 est une anomalie **de cette ROM-là**.
+`L1` mesure exactement la même chose (`v = w` dans la même macro) et donne **678**. Deux
+ROMs, deux résultats incompatibles pour un code identique en apparence — c'est le
+désassemblage comparé des deux `m_base`/`m_l1` qui dira pourquoi, et c'est une question
+ouverte à part entière.
+
+🚨 **LA LEÇON, ET ELLE EST CHÈRE.** À partir de DEUX points j'ai tiré une droite, nommé un
+mécanisme (« coût fixe par itération, fetch gratuit »), et écrit dans trois documents que
+la **forme** du modèle était fausse. Quatre points ont suffi à tout démolir.
+⇒ **Deux points font toujours une droite.** Ils ne prouvent jamais qu'il y en a une.
+
+### Ce qui reste, et c'est petit
+
+Un écart de **−5,8 % sur la boucle la plus courte**, qui tombe à ±2 % dès 14 mots. Nous
+sommes donc légèrement trop rapides sur le code très serré, et justes ailleurs. C'est
+probablement la même chose que le « +5 % » vu sur les classes de la v3 — un effet borné,
+qui s'atténue quand les boucles s'allongent, **pas** une erreur de structure.
+
+---
+
+## v12 — L'ALIGNEMENT : RÉFUTÉ (2026-08-24)
+
+`a_align_calib_v12.ngp` · md5 `7c03a308e289aa2c13f475a617dd18dc` · source `cpu_calib_v12.c`
+
+La **même boucle de dix octets**, quatre fois, à quatre adresses (restes mod 4 : **3, 1,
+0, 0** — deux impairs, deux alignés sur la file de 4 octets).
+
+**Tir du 24/08** : `A1 682 · A2 682 · A3 683 · A4 682 · RASV 198`
+
+⛔ **L'adresse n'a AUCUN effet.** Les quatre sont identiques à ±1.
+
+### Ce que ça ferme, et c'est plus que l'alignement
+
+`682` est **exactement** ce que la campagne de juillet donnait pour `BASE`, et la v11 avait
+donné 678 pour la même boucle. Quatre ROM indépendantes s'accordent sur ~680.
+
+⇒ **le `BASE = 281` de la v10 était une anomalie isolée**, et c'est d'elle SEULE que venait
+la théorie du « coût fixe de 105 cycles par itération, fetch gratuit » — écrite dans trois
+documents avant d'être démolie par la v11.
+
+🚨 **LA LEÇON COMPLÈTE, en trois temps** :
+1. j'ai nommé un mécanisme (« la branche ») avant de lire le code — réfuté en trois lignes ;
+2. j'ai tiré une droite de **deux** points et conclu que la **forme** du modèle était fausse
+   — quatre points l'ont démolie ;
+3. le point aberrant qui avait tout déclenché ne s'est jamais reproduit sur aucune des
+   trois ROM suivantes.
+⇒ **Un point isolé qui contredit le modèle est d'abord suspect, pas révélateur.** Le
+reproduire coûte une ROM ; le croire a coûté trois documents à corriger.
+
+### Ce qui reste, chiffré et borné
+
+Sur cette boucle de 5 mots : silicium **682**, notre modèle **~730** ⇒ nous sommes
+**~7 % trop rapides**. Sur 14 mots l'écart tombe à −0,8 %, sur 35 à +1,9 %, sur 53 à +1,4 %.
+
+⇒ **le modèle est trop rapide sur le code TRÈS serré, et juste dès que les boucles
+s'allongent.** C'est le même phénomène que le « +5 % » des classes de juillet, mesuré
+maintenant sur quatre tailles. Effet borné, pas erreur de structure.

@@ -625,7 +625,19 @@ typedef struct {
     uint32_t scanline;
     uint32_t frame_count;
     uint32_t cycle_residue;
-    uint32_t _pad2;
+    /* ⚡ LA DETTE DE L'UNITE DE BUS, ET IL FAUT LA SAUVER, PAS L'EFFACER.
+     *
+     * Le modele de temps pipeline garde une avance/retard de la file d'instructions
+     * entre deux instructions. On la remettait a zero a la RESTAURATION -- ce qui parait
+     * prudent et ne l'est pas : la premiere passe continue avec sa valeur vivante, le
+     * rejeu repart de zero, et les deux divergent. **Effacer un etat a la restauration
+     * ne le rend pas deterministe, ca fait diverger le rejeu de ce qu'il rejoue.**
+     * `libretro_smoke_external_bios_priority` tombait exactement la-dessus.
+     *
+     * ⚠️ Elle prend la place de `_pad2` : la taille du bloc NE CHANGE PAS, donc aucun
+     * savestate existant n'est invalide -- ils portent 0, c'est-a-dire l'ancien
+     * comportement. Signee a l'usage, transportee telle quelle. */
+    uint32_t biu_debt;
 } ngpc_aux_state_t;
 
 NGPC_API void ngpc_get_aux_state(ngpc_t*, ngpc_aux_state_t* out);

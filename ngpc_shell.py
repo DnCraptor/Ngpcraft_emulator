@@ -389,7 +389,16 @@ STATE_SLOTS = 8
 # for its own reason). v3 adds core.native.LinkState. v1 and v2 files still load, each
 # without the blocks it predates. See LINK_NETPLAY_STUDY.md.
 STATE_MEM_LEN = 0x00C000
-STATE_MAGIC = b"NGPCST03"
+# v4 : + l'horloge calendaire. ⚡ ELLE MANQUAIT, ET CA CASSAIT LE DETERMINISME.
+# L'horloge est de l'etat MACHINE, pas de la memoire : restaurer l'image remet bien ses
+# registres 0x90-0x97, mais son compteur interne continue d'ou il en etait et les
+# reecrit au tick suivant. Mesure : sauver / jouer 90 trames / restaurer / rejouer
+# 90 trames donnait un octet different a **0x000096**, sur Fatal Fury comme sur Metal
+# Slug, sous les DEUX modeles de temps. Restaurer l'horloge rend le rejeu exact.
+# ⇒ prerequis de tout diagnostic de desync : un netplay ne peut pas etre plus
+# deterministe que le rejeu local.
+STATE_MAGIC = b"NGPCST04"
+STATE_MAGIC_V3 = b"NGPCST03"
 STATE_MAGIC_V2 = b"NGPCST02"
 STATE_MAGIC_V1 = b"NGPCST01"
 CRASH_DIR = REPO / "crashes"
@@ -3944,16 +3953,22 @@ class PlayPage(QWidget):
     # (I/O + RAM + VRAM). The rewind ring and the save-state slots share it; slots just
     # add a magic + go to disk.
     def _capture_state(self) -> bytes:
-        return (bytes(self.machine.cpu())
+        return (bytes(self.machine.rtc())
+                + bytes(self.machine.cpu())
                 + bytes(self.machine.aux_state())
                 + bytes(self.machine.link_state())
                 + self.machine.read(0, STATE_MEM_LEN))
 
-    def _apply_state(self, body: bytes, aux: bool = True, link: bool = True) -> None:
+    def _apply_state(self, body: bytes, aux: bool = True, link: bool = True,
+                     rtc: bool = True) -> None:
         # Frames a link peer ran ahead for us describe the console we are about to
         # overwrite; collecting them after the load would report work this timeline
         # never did (and rewind calls this for every step).
         self._prerun.clear()
+        if rtc:
+            rtc_len = ctypes.sizeof(native.RtcState)
+            self.machine.set_rtc(native.RtcState.from_buffer_copy(body[:rtc_len]))
+            body = body[rtc_len:]
         cpu_len = ctypes.sizeof(type(self.machine.cpu()))
         aux_len = ctypes.sizeof(native.AuxState) if aux else 0
         link_len = ctypes.sizeof(native.LinkState) if link else 0
@@ -4006,10 +4021,13 @@ class PlayPage(QWidget):
         # did, so nothing gets worse by loading one).
         if blob.startswith(STATE_MAGIC):
             self._apply_state(blob[len(STATE_MAGIC):])
+        elif blob.startswith(STATE_MAGIC_V3):
+            self._apply_state(blob[len(STATE_MAGIC_V3):], rtc=False)
         elif blob.startswith(STATE_MAGIC_V2):
-            self._apply_state(blob[len(STATE_MAGIC_V2):], link=False)
+            self._apply_state(blob[len(STATE_MAGIC_V2):], link=False, rtc=False)
         elif blob.startswith(STATE_MAGIC_V1):
-            self._apply_state(blob[len(STATE_MAGIC_V1):], aux=False, link=False)
+            self._apply_state(blob[len(STATE_MAGIC_V1):], aux=False, link=False,
+                              rtc=False)
         else:
             self._flash("bad state"); return
         self._rewind.clear(); self._rw_pos = None      # a loaded state starts a new timeline
@@ -6732,10 +6750,23 @@ class Shell(QMainWindow):
         session = MirrorSession(page.machine, peer.machine, link, pipe, hs, prime)
         page.attach_mirror(session, peer)
         self._net_status = QTimer(self)
-        self._net_status.timeout.connect(
-            lambda: self.setWindowTitle(
-                f"NgpCraft — mirror ⇄  {session.frames_run} frames, "
-                f"{session.stalls} waits"))
+        # ⚡ L'ALLER-RETOUR EST AFFICHE, SINON IL N'EXISTE PAS POUR LE JOUEUR.
+        #
+        # Le mesurer sans le montrer ne sert a rien : c'est le testeur qui rapporte, et
+        # jusqu'ici il ne pouvait dire que « ca a lache ». Avec le pire aller-retour a
+        # l'ecran, un rapport devient « ca a lache, pointe a 340 ms » -- et la on sait
+        # si le probleme est le link ou la ligne (LINK_NETPLAY_STUDY §2.2 et §2.5).
+        def _titre():
+            bout = ""
+            if session.rtt_ms is not None:
+                bout = (f", aller-retour {session.rtt_ms} ms"
+                        f" (moy {session.rtt_avg_ms:.0f}, pire {session.rtt_max_ms})")
+            if session.desync_at is not None:
+                bout += f"  ⚠ desync trame {session.desync_at}"
+            self.setWindowTitle(f"NgpCraft — mirror ⇄  {session.frames_run} frames, "
+                                f"{session.stalls} waits{bout}")
+
+        self._net_status.timeout.connect(_titre)
         self._net_status.start(500)
 
     def _on_mirror_ended(self, why: str) -> None:

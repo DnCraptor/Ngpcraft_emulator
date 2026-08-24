@@ -52,19 +52,36 @@ from __future__ import annotations
 
 import json
 import struct
+import time
 import zlib
 from collections import deque
 from typing import Protocol
 
 from core.link import run_two_consoles_interleaved
 
-PROTOCOL_VERSION = 1
+# 2 : le message d'empreinte porte desormais l'horodatage et l'echo (mesure de
+# l'aller-retour). Sa taille change, donc un pair d'avant ne peut pas le lire -- et la
+# version le lui dit proprement au lieu de le laisser desynchroniser sa lecture.
+PROTOCOL_VERSION = 2
 
 # Wire: [type:1][frame:4 LE][payload]. Fixed headers, so a partial read never has to
 # be guessed at -- the reader keeps whatever it cannot complete yet.
 _T_HELLO = 1        # payload = 2-byte length + JSON: what session this is
 _T_INPUT = 2        # payload = 1 byte: the pad for that frame
-_T_CHECK = 3        # payload = 4 bytes: a checksum of both consoles at that frame
+_T_CHECK = 3        # payload = 12 bytes: empreinte + horodatage + echo (voir plus bas)
+# ⚡ L'ALLER-RETOUR SE MESURE ICI, ET IL N'ETAIT MESURE NULLE PART.
+#
+# Avant ceci, `DEFAULT_DELAY = 3` s'appliquait quelle que soit la ligne et le delai se
+# TAPAIT A LA MAIN par les deux joueurs (« ping en ms / 17, plus un »). Sans mesure, on ne
+# peut pas distinguer « le link est instable » de « la ligne de ce joueur est mauvaise »,
+# donc **aucun rapport de bug n'est interpretable** -- c'est le §2.2 de LINK_NETPLAY_STUDY,
+# et c'est le prerequis de tout diagnostic.
+#
+# Le porteur est le message d'empreinte, qui part deja periodiquement : on lui ajoute
+# l'horodatage de l'emetteur et l'ECHO du dernier horodatage recu. Quand l'echo revient,
+# la difference est l'aller-retour complet. Aucun message nouveau, aucun trafic en plus
+# que 8 octets par empreinte.
+_CHECK_BODY = struct.Struct("<III")     # empreinte, horodatage emetteur, echo
 # The cartridge trade that runs BEFORE the session (see CartExchange). Its records
 # reuse this header with the LENGTH in the second field rather than a frame number.
 _T_CART = 4         # payload = none; the field is the peer's compressed image length
@@ -562,6 +579,14 @@ class MirrorSession:
         self._rx = bytearray(prime)
         self._checks: dict[int, int] = {}       # frame -> the peer's checksum
         self._mine: dict[int, int] = {}         # frame -> ours, until the peer's lands
+        # Mesure de l'aller-retour (§2.2 de LINK_NETPLAY_STUDY). `rtt_ms` est la
+        # derniere valeur, `rtt_avg_ms` la moyenne de la session, `rtt_max_ms` le pire --
+        # c'est le pire qui explique un a-coup, pas la moyenne.
+        self.rtt_ms: int | None = None
+        self.rtt_avg_ms = 0.0
+        self.rtt_max_ms = 0
+        self._rtt_n = 0
+        self._peer_ts = 0
         self.desync_at: int | None = None
         self.rejected: str | None = None        # why the handshake failed, if it did
         self.greeted = False
@@ -604,7 +629,7 @@ class MirrorSession:
             self.bytes_in += len(chunk)
         while len(self._rx) >= _HDR.size:
             kind, frame = _HDR.unpack_from(self._rx, 0)
-            need = {_T_INPUT: 1, _T_CHECK: 4}.get(kind)
+            need = {_T_INPUT: 1, _T_CHECK: _CHECK_BODY.size}.get(kind)
             if kind in (_T_HELLO, _T_BYE):
                 if len(self._rx) < _HDR.size + 2:
                     return
@@ -623,7 +648,18 @@ class MirrorSession:
             if kind == _T_INPUT:
                 self.peer_inputs[frame] = body[0]
             elif kind == _T_CHECK:
-                self._checks[frame] = struct.unpack("<I", body)[0]
+                somme, leur_ts, echo = _CHECK_BODY.unpack(body)
+                self._checks[frame] = somme
+                self._peer_ts = leur_ts          # a renvoyer dans notre prochain envoi
+                if echo:
+                    # L'echo est NOTRE horodatage revenu : la difference est l'aller
+                    # ET le retour, sans horloge commune a supposer entre les deux PC.
+                    aller_retour = (self._now_ms() - echo) & 0xFFFFFFFF
+                    if aller_retour < 60000:      # au-dela, c'est un compteur qui a boucle
+                        self.rtt_ms = aller_retour
+                        n = self._rtt_n = self._rtt_n + 1
+                        self.rtt_avg_ms = (self.rtt_avg_ms * (n - 1) + aller_retour) / n
+                        self.rtt_max_ms = max(self.rtt_max_ms, aller_retour)
             elif kind == _T_BYE:
                 # The peer refused, and said so instead of just dropping the socket.
                 self.rejected = self.rejected or (
@@ -647,6 +683,12 @@ class MirrorSession:
         return zlib.crc32(p2.read(0x4000, 0x2C00), crc) & 0xFFFFFFFF
 
     # --- the frame ------------------------------------------------------------
+    @staticmethod
+    def _now_ms() -> int:
+        """Une horloge MONOTONE, jamais l'heure du mur : un ajustement NTP en pleine
+        partie ferait sauter l'aller-retour mesure, ou le rendrait negatif."""
+        return int(time.monotonic() * 1000) & 0xFFFFFFFF
+
     def step(self, pad: int) -> str:
         """Advance one frame if the peer's input for it has arrived.
 
@@ -703,7 +745,9 @@ class MirrorSession:
             # and kept until the peer's copy for that same frame turns up -- it will
             # arrive a round trip later, not now.
             self._mine[self.frame] = self.checksum()
-            self._send(_T_CHECK, self.frame, struct.pack("<I", self._mine[self.frame]))
+            self._send(_T_CHECK, self.frame,
+                       _CHECK_BODY.pack(self._mine[self.frame], self._now_ms(),
+                                        self._peer_ts))
         for f in sorted(set(self._mine) & set(self._checks)):
             if self._mine.pop(f) != self._checks.pop(f) and self.desync_at is None:
                 self.desync_at = f

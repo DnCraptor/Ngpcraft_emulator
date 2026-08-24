@@ -1309,7 +1309,12 @@ bool Machine::micro_dma_service(unsigned vector_index) {
                 dma_cost_cycles += 2u * ((size == 4) ? 12u : 8u) * micro_dma_states / 8u;
         } else if (kind == 5) {
             ++src;                                   /* counter mode: nothing moves */
-            if (micro_dma_states) dma_cost_cycles += 2u * 5u * micro_dma_states / 8u;
+            /* ⚖️ LE MODE COMPTEUR N'EST PAS DOUBLE, ET C'EST MESURE (ROM v9, tir
+             * silicium du 24/08) : la console facture **5,2 cycles** par passage en
+             * mode compteur contre 12,9 pour un transfert d'octet. Doubler les 5 etats
+             * de la datasheet comme on double le reste donnait 10,4 -- deux fois trop.
+             * Le transfert d'octet, lui, tombe pile sur le nominal double (13,0). */
+            if (micro_dma_states) dma_cost_cycles += 5u * micro_dma_states / 8u;
         } else {
             return false;                            /* not a mode the chip defines */
         }

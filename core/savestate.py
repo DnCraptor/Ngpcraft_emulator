@@ -68,8 +68,13 @@ SAVESTATE_BACKWARD_COMPAT_VERSIONS = (
 SHELL_SAVESTATE_MAGIC = b"NGPCST01"
 SHELL_SAVESTATE_MAGIC_V2 = b"NGPCST02"
 SHELL_SAVESTATE_MAGIC_V3 = b"NGPCST03"
+# ⚡ `NGPCST04` met l'horloge calendaire EN TETE. Elle est de l'etat machine, pas de la
+# memoire : sans elle, restaurer un etat laissait le compteur interne de la pendule
+# continuer d'ou il en etait et reecrire ses registres au tick suivant -- un rejeu
+# divergeait d'un octet a 0x000096. Voir tests/test_link_savestate_roundtrip.py.
+SHELL_SAVESTATE_MAGIC_V4 = b"NGPCST04"
 SHELL_SAVESTATE_MAGICS = (SHELL_SAVESTATE_MAGIC, SHELL_SAVESTATE_MAGIC_V2,
-                          SHELL_SAVESTATE_MAGIC_V3)
+                          SHELL_SAVESTATE_MAGIC_V3, SHELL_SAVESTATE_MAGIC_V4)
 SHELL_SAVESTATE_MEM_LEN = 0x00C000
 
 
@@ -390,7 +395,7 @@ def load_shell_savestate(
     reported as empty rather than invented -- a caller that needs certainty must ask
     the person which game it came from.
     """
-    from core.native import AuxState, CpuState, LinkState  # ctypes declarations only; no DLL needed
+    from core.native import AuxState, CpuState, LinkState, RtcState  # ctypes declarations only; no DLL needed
 
     blob = path.read_bytes()
     magic = blob[: len(SHELL_SAVESTATE_MAGIC)]
@@ -398,9 +403,14 @@ def load_shell_savestate(
         raise ValueError(f"{path} carries no known save-state magic: {magic!r}")
     cpu_size = ctypes.sizeof(CpuState)
     aux_size = ctypes.sizeof(AuxState) if magic in (
-        SHELL_SAVESTATE_MAGIC_V2, SHELL_SAVESTATE_MAGIC_V3) else 0
-    link_size = ctypes.sizeof(LinkState) if magic == SHELL_SAVESTATE_MAGIC_V3 else 0
-    header = len(magic) + cpu_size + aux_size + link_size
+        SHELL_SAVESTATE_MAGIC_V2, SHELL_SAVESTATE_MAGIC_V3,
+        SHELL_SAVESTATE_MAGIC_V4) else 0
+    link_size = ctypes.sizeof(LinkState) if magic in (
+        SHELL_SAVESTATE_MAGIC_V3, SHELL_SAVESTATE_MAGIC_V4) else 0
+    # L'horloge est en TETE du corps, avant le CPU (v4 seulement) : elle est SAUTEE ici,
+    # comme le bloc son, pour que l'image soit trouvee la ou elle commence.
+    rtc_size = ctypes.sizeof(RtcState) if magic == SHELL_SAVESTATE_MAGIC_V4 else 0
+    header = len(magic) + rtc_size + cpu_size + aux_size + link_size
     expected = header + SHELL_SAVESTATE_MEM_LEN
     if len(blob) != expected:
         raise ValueError(
@@ -409,8 +419,9 @@ def load_shell_savestate(
             f"{aux_size} of sound/timer state + {link_size} of link-cable state + "
             f"{SHELL_SAVESTATE_MEM_LEN} of memory), got {len(blob)}"
         )
+    # v4 : l'horloge precede le CPU dans le corps.
 
-    cpu_at = len(magic)
+    cpu_at = len(magic) + rtc_size
     raw_cpu = CpuState.from_buffer_copy(blob[cpu_at : cpu_at + cpu_size])
     memory = blob[header:]
 

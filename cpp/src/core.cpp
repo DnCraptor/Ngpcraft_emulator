@@ -1517,17 +1517,16 @@ NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bi
      * d'un tir silicium avec RASV=198 et des chiffres stables. La difference n'est pas la
      * valeur, c'est d'ou elle vient. */
     m->fetch_wait_q4      = kSiliconFetchWaitQ4;
-    /* ⛔ 0, ET C'EST DELIBERE. Le mecanisme de facturation du micro-DMA existe
-     * maintenant (8 etats par transfert octet/mot, 12 en 4 octets, 5 en compteur --
-     * datasheet TMP95C061), mais SA VALEUR N'EST PAS MESUREE sur silicium. L'armer a 8
-     * ralentit Fatal Fury de 4,3 % -- or les testeurs signalent deja des jeux autour de
-     * 95 % de la vitesse attendue : je risquerais d'aggraver ce qu'on cherche a corriger.
-     * Le relevé le disait deja : « a mesurer avant de corriger : le micro-DMA touche
-     * beaucoup de jeux. »
+    /* ⚖️ ARME AU NOMINAL, ET LE SILICIUM L'A CONFIRME (ROM a_dma_calib_v9, tir du
+     * 24/08 : DMAC descendu de 9120, soit 152 transferts par trame, RASV=198).
      *
-     * ⇒ `ngpc_set_micro_dma_states(8)` l'arme pour qui veut le mesurer, et une ROM de
-     * calibration devra trancher avant qu'il devienne le defaut. */
-    m->micro_dma_states   = 0;
+     *   transfert d'octet -- silicium **12,9 cycles**, nous **13,0** au nominal ✅
+     *   mode compteur     -- silicium **5,2**, nous 10,4 : le x2 etait de trop, retire.
+     *
+     * Il etait reste a 0 le 23/08 faute de mesure, et c'etait la bonne decision : a
+     * l'aveugle il ralentissait Fatal Fury de 4,3 % alors que des jeux etaient deja
+     * signales trop lents. Une journee d'attente contre un chiffre invente. */
+    m->micro_dma_states   = 8;
     m->access_wait_q4     = 0;
     m->fetch_wait_carry   = 0;
     m->fetch_wait_per_word = true;
@@ -2016,6 +2015,7 @@ NGPC_API void ngpc_get_aux_state(ngpc_t* h, ngpc_aux_state_t* out) {
     out->scanline           = m->scanline;
     out->frame_count        = m->frame_count;
     out->cycle_residue      = m->cycle_residue;
+    out->biu_debt           = uint32_t(m->biu_debt);
 }
 
 NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
@@ -2031,10 +2031,13 @@ NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
      *
      * ⚠️ ANYTHING ELSE ADDED TO Machine THAT INFLUENCES TIMING BELONGS HERE TOO, or in
      * a serialised struct. There is no third option that stays deterministic. */
+    /* ⛔ ON N'EFFACE PLUS `biu_debt` ICI -- il est desormais DANS le blob (voir
+     * ngpc_core.h). L'effacer faisait diverger le rejeu de ce qu'il rejoue. Les deux
+     * accumulateurs de quart de cycle, eux, sont sans etat depuis le motif tire de
+     * l'adresse ; on les remet a zero par prudence, ils valent deja 0. */
     if (h) {
         auto* mm = reinterpret_cast<Machine*>(h);
-        mm->biu_debt = 0;
-        mm->access_wait_q4 = 0;      /* la retenue du quart de cycle est de l'etat */
+        mm->access_wait_q4 = 0;
         mm->fetch_wait_carry = 0;
     }
     if (!h || !in) return -1;
@@ -2106,6 +2109,7 @@ NGPC_API int ngpc_set_aux_state(ngpc_t* h, const ngpc_aux_state_t* in) {
     m->scanline           = in->scanline;
     m->frame_count        = in->frame_count;
     m->cycle_residue      = in->cycle_residue;
+    m->biu_debt           = int32_t(in->biu_debt);
     return 0;
 }
 

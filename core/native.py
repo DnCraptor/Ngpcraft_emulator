@@ -278,7 +278,8 @@ class AuxState(Structure):
         ("scanline", c_uint32),
         ("frame_count", c_uint32),
         ("cycle_residue", c_uint32),
-        ("_pad2", c_uint32),
+        # La dette de l'unite de bus : SAUVEE, pas effacee. Voir ngpc_core.h.
+        ("biu_debt", c_uint32),
     ]
 
 

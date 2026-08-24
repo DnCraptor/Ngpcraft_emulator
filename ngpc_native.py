@@ -37,10 +37,11 @@ from core import native, rom_loader
 # already stopped writing v2. A generation added at one end and not the other is not a
 # degraded read, it is a door that closes. Whatever the shell's STATE_MAGIC becomes, it
 # must appear below on the same day.
-SHELL_MAGIC = b"NGPCST03"       # v3: + the link cable (FIFOs, shifter, CTS/RTS pins)
+SHELL_MAGIC = b"NGPCST04"       # v4: + l'horloge calendaire (etat machine, pas memoire)
+SHELL_MAGIC_V3 = b"NGPCST03"    # v3: + the link cable (FIFOs, shifter, CTS/RTS pins)
 SHELL_MAGIC_V2 = b"NGPCST02"    # v2: carries the sound CPU, the T6W28 and the timers
 SHELL_MAGIC_V1 = b"NGPCST01"    # v1: CPU + memory only -- loads, but the sound will not
-SHELL_MAGICS = (SHELL_MAGIC, SHELL_MAGIC_V2, SHELL_MAGIC_V1)
+SHELL_MAGICS = (SHELL_MAGIC, SHELL_MAGIC_V3, SHELL_MAGIC_V2, SHELL_MAGIC_V1)
 SHELL_MEM_LEN = 0x00C000
 
 # SILICON TIMING. The core's fields default to free cart fetch (back-compat, see
@@ -84,9 +85,12 @@ def load_state(machine: native.NativeMachine, path: Path) -> None:
     cpu_t = type(machine.cpu())
     cpu_len = ctypes.sizeof(cpu_t)
     aux_len = (ctypes.sizeof(native.AuxState)
-               if magic in (SHELL_MAGIC, SHELL_MAGIC_V2) else 0)
-    link_len = ctypes.sizeof(native.LinkState) if magic == SHELL_MAGIC else 0
-    head = cpu_len + aux_len + link_len
+               if magic in (SHELL_MAGIC, SHELL_MAGIC_V3, SHELL_MAGIC_V2) else 0)
+    link_len = (ctypes.sizeof(native.LinkState)
+                if magic in (SHELL_MAGIC, SHELL_MAGIC_V3) else 0)
+    # ⚡ v4 : l'horloge, en TETE. Sans elle le rejeu diverge d'un octet a 0x000096.
+    rtc_len = ctypes.sizeof(native.RtcState) if magic == SHELL_MAGIC else 0
+    head = rtc_len + cpu_len + aux_len + link_len
     if len(body) != head + SHELL_MEM_LEN:
         raise SystemExit(
             f"{path}: expected {head + SHELL_MEM_LEN} bytes after the magic "
@@ -94,6 +98,9 @@ def load_state(machine: native.NativeMachine, path: Path) -> None:
             f"+ {SHELL_MEM_LEN} of memory), got {len(body)}"
         )
     machine.write(0, body[head:])
+    if rtc_len:
+        machine.set_rtc(native.RtcState.from_buffer_copy(body[:rtc_len]))
+    body = body[rtc_len:]
     machine.set_cpu(cpu_t.from_buffer_copy(body[:cpu_len]))
     # AFTER the image: writing it goes through the control registers, and 0x00BA is a
     # door ("fire one NMI at the sound CPU"), not storage. This is what cancels that.

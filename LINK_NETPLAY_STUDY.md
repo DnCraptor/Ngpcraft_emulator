@@ -313,7 +313,28 @@ Le sortir de la constante globale et le mettre dans `core/quirks.py`, sur le mod
 seuils par peripherique de GBE+. Peu cher, deplace le probleme sans le resoudre, mais
 supprime le risque « un jeu exige moins de 400 ».
 
-### Etape 2 — mesure du RTT + perfmon
+### ✅ Etape 2 — mesure du RTT — FAITE le 2026-08-23
+
+L'horodatage est piggyback sur `_T_CHECK`, exactement comme prevu ici : le message
+d'empreinte porte desormais l'empreinte, l'horodatage de l'emetteur, et **l'ECHO du
+dernier horodatage recu**. Quand l'echo revient, la difference est l'aller ET le retour --
+**aucune horloge commune a supposer entre les deux PC**. Cout : 8 octets par empreinte,
+soit une par seconde.
+
+`MirrorSession` expose `rtt_ms` (la derniere), `rtt_avg_ms` (la moyenne de session) et
+`rtt_max_ms` (le pire). ⚡ **C'est le PIRE qui explique un a-coup, pas la moyenne** -- et
+c'est lui qui est affiche. Horloge **monotone**, jamais l'heure du mur : un ajustement
+d'horloge en pleine partie rendrait la mesure negative.
+
+⚠️ La taille du message change ⇒ `PROTOCOL_VERSION` passe a **2**. Un pair d'ancienne
+version est refuse proprement au lieu de desynchroniser sa propre lecture du flux, et un
+test le verifie.
+
+✅ **Et c'est AFFICHE** (titre de la fenetre mirror), avec la trame de desync s'il y en a
+une. Mesurer sans montrer ne sert a rien : c'est le testeur qui rapporte, et jusqu'ici il
+ne pouvait dire que « ca a lache ». Il peut maintenant dire « ca a lache, pointe a 340 ms ».
+
+### (perime) Etape 2 — mesure du RTT + perfmon
 Timestamp piggyback sur `_T_CHECK`. Puis surfacer ce qui existe deja (`stalls`,
 `bytes_in/out`, `frames_run`) plus le RTT. ⚡ Prerequis de tout diagnostic, et de
 l'etape 3.
@@ -322,7 +343,42 @@ l'etape 3.
 Chaque cote annonce son numero de frame ; celui qui est en AVANCE saute volontairement
 une frame. Lisse le jitter au lieu de le concentrer sur le retardataire.
 
-### Etape 4 — synctest continu
+### ✅ Etape 4 — SYNCTEST CONTINU LIVRE (2026-08-23) : `tools/synctest.py`
+
+Pour **chaque trame** : sauver, jouer, garder, **restaurer**, rejouer la MEME trame,
+comparer. Toute difference est un etat qui echappe a la serialisation -- c'est-a-dire
+exactement ce qui fait desynchroniser un netplay, **trouve en local, sans deuxieme PC et
+sans testeur**.
+
+**Resultat du premier balayage : 12 jeux, 150 trames chacun avec commandes, 0 divergence.**
+Le prerequis du netplay est donc reellement rempli, et pas seulement sur les deux jeux
+corriges a la main.
+
+Trois details qui en font un outil plutot qu'un compteur :
+
+- il **nomme la zone** du premier octet divergent (RTC / CPU / AUX / LINK / adresse
+  memoire) -- un offset brut ne designe rien ;
+- il **repart de la premiere passe**, jamais de la seconde : sinon une divergence a la
+  trame *n* contamine tout ce qui suit et on ne sait plus laquelle est la vraie ;
+- ⚠️ il **sort en erreur s'il n'a rien teste**. « 0 divergence sur 0 jeu » ressemble a un
+  succes ; les ROMs absentes sont nommees, jamais ignorees en silence. Corpus via
+  `NGPCRAFT_ROMS`.
+
+### (perime) Etape 4 — le prerequis
+
+Le rejeu est deterministe : `test_a_replay_from_a_restored_state_is_bit_identical` (une
+console) et `test_a_replay_of_the_whole_pair_is_bit_identical` (la paire) passent.
+
+⛔ **Deux trous ont du etre fermes pour ca**, et le second est une faute de raisonnement :
+l'horloge calendaire manquait au savestate, et **la dette de l'unite de bus etait EFFACEE
+a la restauration** -- ce qui fait diverger le rejeu de ce qu'il rejoue au lieu de le
+rendre reproductible. Tout etat qui influence le temps se SERIALISE.
+
+⚠️ Et le §2.6 ci-dessus (etat du cable cote hote) **n'etait pas le verrou** qu'on croyait :
+un rejeu de paire qui ne restaure QU'UNE console diverge forcement, la seconde continuant
+sa vie. C'etait le harnais, pas le coeur.
+
+### (perime) Etape 4 — synctest continu
 Sauver / restaurer / rejouer chaque frame en local et comparer, a la `ggpo_start_synctest`.
 Nos desyncs connus ont ete trouves au raisonnement et par un test a quatre consoles ;
 ceci les sort automatiquement. **Le meilleur emprunt de toute l'etude.** ⚡ L'etape 0
@@ -374,6 +430,45 @@ garder en reserve — mais ca ne repond pas a la question posee.
   3 et 5 perdent l'essentiel de leur interet.
 - **Si un jeu exige un `CABLE_SLICE` sous 400** avant l'etape 1 : l'etape 1 passe en
   urgence.
+
+
+## 9. La SECONDE COUCHE sur le cable TCP — concu, pas livre (2026-08-23)
+
+Le miroir a desormais ses deux couches : reglages a la connexion (ROM, BIOS, coeur,
+langue, mono, **modele de temps**), empreinte periodique, et **aller-retour mesure**. Le
+**cable TCP** (crossplay bureau <-> libretro) n'a toujours que la couche basse.
+
+### Pourquoi le cable est brut, et doit le rester
+
+`cable_link.hpp` le dit : *« no framing, no handshake, no version field »*. Ce n'est pas
+de la negligence : un jeu ecrit un octet et attend qu'il arrive tel quel, au bon moment.
+Encadrer le flux casserait la fidelite mesuree a 0,3 % du silicium. ⇒ **la seconde couche
+ne va pas DANS le cable.**
+
+### Le trou que ca laisse, et il s'est agrandi le 23/08
+
+Rien ne verifie que les deux bouts simulent la meme machine. Le bureau, libretro et
+Android sont aujourd'hui sur le meme modele -- mais rien ne l'IMPOSE, et pendant quelques
+heures ce jour-la ils ne l'etaient pas, sans qu'aucun des deux puisse le savoir.
+
+### La forme retenue
+
+Une **poignee de main unique a la connexion**, AVANT que le moindre octet de jeu circule ;
+la socket redevient ensuite le tuyau brut pour toute la partie. Elle porterait ce que
+porte deja celle du miroir : version du protocole, empreinte du coeur, **modele de temps**,
+hachages ROM et BIOS, reglages console. Refus propre en cas de desaccord.
+
+### ⛔ CE QUI INTERDIT DE LA LIVRER A MOITIE
+
+Elle doit etre posee **des DEUX cotes dans la meme livraison** -- shell Python et
+`cable_link.hpp`. Un seul cote suffit a tout casser : si le bureau envoie un preambule
+qu'un libretro plus ancien ne reconnait pas, celui-ci le prend pour des octets de jeu et
+corrompt le flux des la premiere trame. **Une demi-poignee de main est pire que pas de
+poignee de main.**
+
+⇒ Prevoir un mecanisme de transition : soit un octet de preambule qu'un ancien pair
+ignorerait sans dommage (a verifier -- rien ne le garantit), soit un port distinct, soit
+un drapeau de compatibilite le temps d'une version.
 
 ## 8. Sources
 

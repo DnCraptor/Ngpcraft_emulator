@@ -64,12 +64,15 @@ def _capture(m) -> bytes:
     has to run headless. If the shell's layout changes this must follow it -- that is
     the point of the test, not an accident of it.
     """
-    return (bytes(m.cpu()) + bytes(m.aux_state()) + bytes(m.link_state())
-            + m.read(0, STATE_MEM_LEN))
+    return (bytes(m.rtc()) + bytes(m.cpu()) + bytes(m.aux_state())
+            + bytes(m.link_state()) + m.read(0, STATE_MEM_LEN))
 
 
 def _restore(m, body: bytes) -> None:
     """Exactly what PlayPage._apply_state does: image, then CPU, then aux, then link."""
+    rtc_len = ctypes.sizeof(native.RtcState)
+    m.set_rtc(native.RtcState.from_buffer_copy(body[:rtc_len]))
+    body = body[rtc_len:]
     cpu_len = ctypes.sizeof(type(m.cpu()))
     aux_len = ctypes.sizeof(native.AuxState)
     link_len = ctypes.sizeof(native.LinkState)
@@ -204,3 +207,87 @@ def test_a_savestate_from_a_console_with_no_cable_still_round_trips():
     s.run_frames(20)
     _restore(s.machine, body)
     assert _serial(s.machine) == before
+
+
+# ⚡ L'HORLOGE CALENDAIRE MANQUAIT, ET C'EST LE DETERMINISME QUI EN PAYAIT LE PRIX.
+#
+# Meme forme de trou que le cable ci-dessus : l'horloge est de l'etat MACHINE, pas de la
+# memoire. Restaurer l'image remet bien ses registres 0x90-0x97, mais son compteur
+# interne continue d'ou il en etait et les reecrit au tick suivant.
+#
+# ⛔ CE QUE CA CASSAIT. Sauver / jouer 90 trames / restaurer / rejouer 90 trames donnait
+# un octet DIFFERENT a **0x000096**, sur Fatal Fury comme sur Metal Slug, sous les DEUX
+# modeles de temps. Or c'est exactement ce que fait un netplay miroir : **un netplay ne
+# peut pas etre plus deterministe que le rejeu local**. Un desync en ligne serait reste
+# inexplicable tant que ce trou existait.
+#
+# ✅ Ferme le 2026-08-23 : le format passe en `NGPCST04` = horloge + cpu + aux + cable +
+# image, avec compatibilite arriere sur v3 / v2 / v1.
+@pytest.mark.skipif(not ROM.exists() or not BIOS.exists(), reason="rom/bios absents")
+def test_a_replay_from_a_restored_state_is_bit_identical():
+    # ⚠️ UNE SEULE CONSOLE, SANS CABLE, ET C'EST DELIBERE. Avec la paire cablee le rejeu
+    # diverge encore de trois octets -- mais pour une AUTRE raison, deja documentee
+    # (LINK_NETPLAY_STUDY §2.6) : une partie de l'etat du cable vit cote hote, hors de
+    # toute serialisation, donc le harnais lui-meme n'est pas rejouable. Melanger les
+    # deux causes dans un seul test donnerait un rouge qui ne nomme rien.
+    a, _, _ = _boot_pair()
+    a.run_frames(60)
+    point = _capture(a.machine)
+
+    a.run_frames(90)
+    premier = _capture(a.machine)
+
+    _restore(a.machine, point)
+    a.run_frames(90)
+    second = _capture(a.machine)
+
+    if premier != second:
+        i = next(k for k, (x, y) in enumerate(zip(premier, second)) if x != y)
+        pytest.fail(f"le rejeu diverge : {sum(1 for x, y in zip(premier, second) if x != y)}"
+                    f" octets, premier a l'offset {i}")
+
+
+@pytest.mark.skipif(not ROM.exists() or not BIOS.exists(), reason="rom/bios absents")
+def test_the_capture_carries_the_calendar_clock():
+    """Le test ci-dessus echouerait aussi pour d'autres raisons : celui-ci nomme la
+    cause, pour qu'une regression dise LAQUELLE des deux est revenue."""
+    a, _, _ = _boot_pair()
+    m = a.machine
+    avant = bytes(m.rtc())
+    corps = _capture(m)
+    m.rtc_advance(3600 * 7)                     # la console a passe la nuit ailleurs
+    assert bytes(m.rtc()) != avant
+    _restore(m, corps)
+    assert bytes(m.rtc()) == avant, "la capture ne porte pas l'horloge"
+
+
+# ⚡ ET LA PAIRE ENTIERE, CE QUI EST LA VRAIE EXIGENCE DU NETPLAY.
+#
+# ⛔ Le premier jet de ce test ne restaurait QUE la console A et divergeait de trois
+# octets -- j'ai cru un instant que c'etait l'etat du cable reste cote hote
+# (LINK_NETPLAY_STUDY §2.6). C'etait plus simple et plus bete : **la console B n'etait
+# pas rembobinee**, elle continuait sa vie et renvoyait a A des octets d'une autre
+# timeline. Un rejeu de paire restaure LES DEUX, sinon il ne rejoue rien.
+#
+# C'est la forme exacte que demande un rollback, et le prerequis du synctest continu
+# (etape 4 de l'etude) : sauver / restaurer / rejouer chaque trame et comparer.
+@pytest.mark.skipif(not ROM.exists() or not BIOS.exists(), reason="rom/bios absents")
+def test_a_replay_of_the_whole_pair_is_bit_identical():
+    a, b, link = _boot_pair()
+    _run_frames(a, b, link, 60)
+    point_a, point_b = _capture(a.machine), _capture(b.machine)
+
+    _run_frames(a, b, link, 90)
+    premier = (_capture(a.machine), _capture(b.machine))
+
+    _restore(a.machine, point_a)
+    _restore(b.machine, point_b)
+    _run_frames(a, b, link, 90)
+    second = (_capture(a.machine), _capture(b.machine))
+
+    for nom, x, y in (("A", premier[0], second[0]), ("B", premier[1], second[1])):
+        if x != y:
+            i = next(k for k, (p, q) in enumerate(zip(x, y)) if p != q)
+            pytest.fail(f"console {nom} : le rejeu de la paire diverge de "
+                        f"{sum(1 for p, q in zip(x, y) if p != q)} octets, "
+                        f"premier a l'offset {i}")
