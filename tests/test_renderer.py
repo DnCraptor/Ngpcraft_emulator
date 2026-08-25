@@ -983,19 +983,24 @@ class SpriteVsSpritePriorityTests(unittest.TestCase):
         pixel = render_frame(memory).pixels[22][22]
         self.assertEqual((pixel.r, pixel.g, pixel.b), (0, 15, 0))
 
-    def test_lower_index_wins_even_against_a_nearer_priority(self) -> None:
-        """One line buffer, not one per PR.C.
+    def test_a_nearer_pr_c_wins_across_groups(self) -> None:
+        """The OAM-index rule holds INSIDE a PR.C group; across groups PR.C wins.
 
-        Sprite 0 is "furthest" (PR.C=01) and sprite 1 is "front" (PR.C=11), and
-        they overlap. The chip has a SINGLE sprite line buffer -- that is the whole
-        premise of the Character Over section -- so sprite 0 claims the pixel first
-        and sprite 1 never gets it, no matter how near its priority. PR.C then only
-        decides where that pixel sits against the scroll planes; here no plane is
-        drawn, so sprite 0's colour reaches the screen.
+        Sprite 0 is "furthest" (PR.C=01) and sprite 1 is "front" (PR.C=11), and they
+        overlap. Sprite 1 must show: a group's line buffer is its own, and the three
+        groups are composited back to front (Figure 4).
 
-        (§ 4-3-3-1's Figure 3 is an image and not in the extractable text, so this
-        cross-priority case is read from the single-line-buffer description, not
-        from the figure. It is stated here so a HW test can contradict it.)
+        ⛔ THIS TEST USED TO ASSERT THE OPPOSITE, from a single shared line buffer --
+        an inference, flagged as one in its own docstring ("stated here so a HW test
+        can contradict it"). A GAME CONTRADICTED IT. Yahtzee (homebrew) puts its five
+        dice on sprites 0..19 at PR.C=2 and the RED "held" frame on sprites 20..27 at
+        PR.C=3, ON THE SAME PIXELS: with one buffer the dice claim everything and the
+        selection frame the player steers with is erased outright -- an unplayable
+        screen, and BizHawk draws the frame. Measured on the player's own save state
+        (savestates/yahtzee_08.s0).
+
+        The index rule itself is untouched: see the two tests above, where the
+        contesting sprites share a group -- as the Sonic frame that established it did.
         """
         memory: dict[int, int] = _new_memory()
         _set_tile_pixels(memory, 1, [(1,) * 8] * 8)
@@ -1003,6 +1008,27 @@ class SpriteVsSpritePriorityTests(unittest.TestCase):
         _set_sprite_palette_color(memory, 1, 1, 0x00F0)  # green
         _set_sprite(memory, 0, c_c=1, h_pos=20, v_pos=20, pr_c=1, cp_c=0)  # furthest
         _set_sprite(memory, 1, c_c=1, h_pos=20, v_pos=20, pr_c=3, cp_c=1)  # front
+
+        pixel = render_frame(memory).pixels[22][22]
+        self.assertEqual(
+            (pixel.r, pixel.g, pixel.b), (0, 15, 0),
+            "the PR.C=3 sprite must reach the screen over the PR.C=1 one; red here "
+            "means the three groups share one ownership buffer again.",
+        )
+
+    def test_lower_index_still_wins_inside_the_same_group(self) -> None:
+        """Per-group buffers must not become 'last sprite wins' inside a group.
+
+        Same overlap as the test above but BOTH sprites are PR.C=3, so the chip's
+        refusal to overwrite applies: sprite 0's colour stands. This is the Sonic
+        case (399 contested pixels) held down against the per-group change.
+        """
+        memory: dict[int, int] = _new_memory()
+        _set_tile_pixels(memory, 1, [(1,) * 8] * 8)
+        _set_sprite_palette_color(memory, 0, 1, 0x000F)  # red
+        _set_sprite_palette_color(memory, 1, 1, 0x00F0)  # green
+        _set_sprite(memory, 0, c_c=1, h_pos=20, v_pos=20, pr_c=3, cp_c=0)
+        _set_sprite(memory, 1, c_c=1, h_pos=20, v_pos=20, pr_c=3, cp_c=1)
 
         pixel = render_frame(memory).pixels[22][22]
         self.assertEqual((pixel.r, pixel.g, pixel.b), (15, 0, 0))

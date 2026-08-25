@@ -131,6 +131,36 @@ class RendererAgreementTests(unittest.TestCase):
         self.m.write(OAM + 4, bytes([1, 0x06 | (2 << 3), 8, 8]))  # chained to it
         self._assert_same("a hidden chain anchor")
 
+    def test_a_higher_pr_c_sprite_shows_over_a_lower_indexed_one(self) -> None:
+        """The Yahtzee shape, on the core itself -- and asserted ABSOLUTELY.
+
+        Every other test here only says "both renderers agree", which stays green if
+        they drift together. This one names the colour that must reach the screen.
+
+        Yahtzee (homebrew) draws its five dice as sprites 0..19 at PR.C=2 and the RED
+        "this die is held" frame as sprites 20..27 at PR.C=3, ON THE SAME PIXELS. Both
+        renderers used to share ONE ownership buffer across the three groups, so the
+        dice claimed every dot first and the selection frame -- the only thing telling
+        the player what is held -- was erased outright. Sprite 0 wins INSIDE its group;
+        across groups PR.C decides (Figure 4).
+        """
+        self.m.write(CHAR_RAM + 16, bytes([0x55] * 16))       # tile 1: solid, value 1
+        self.m.write(SPR_PAL + 0 * 8 + 2, bytes([0x0F, 0x00]))  # palette 0, value 1 = red
+        self.m.write(SPR_PAL + 1 * 8 + 2, bytes([0xF0, 0x00]))  # palette 1, value 1 = green
+        self.m.write(OAM + 0, bytes([1, 1 << 3, 40, 40]))     # sprite 0, PR.C = 1 (back)
+        self.m.write(OAM_CPC + 0, bytes([0]))                 # ...red
+        self.m.write(OAM + 4, bytes([1, 3 << 3, 40, 40]))     # sprite 1, PR.C = 3 (front)
+        self.m.write(OAM_CPC + 1, bytes([1]))                 # ...green
+        self._assert_same("a PR.C=3 sprite over a lower-indexed PR.C=1 one")
+
+        native_fb, _ = self._both()
+        self.assertEqual(
+            native_fb[42 * W + 42], 0x00F0,
+            "the PR.C=3 sprite must reach the screen; red (0x000F) here means the "
+            "three priority groups share one ownership buffer again, which is what "
+            "made Yahtzee's selection frame invisible.",
+        )
+
     def test_the_window_and_the_out_of_window_colour(self) -> None:
         self.test_scroll_planes_with_flips_and_palettes()
         self.m.write(0x8002, bytes([20, 15, 90, 60]))    # a sub-window

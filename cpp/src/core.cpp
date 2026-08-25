@@ -775,6 +775,9 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 (m->biu_slack_follows_region && pc_before >= 0xFF0000u)
                     ? int32_t(2u * m->bios_wait) : m->biu_slack;
             if (m->biu_debt < -slack) m->biu_debt = -slack;
+            /* A block transfer owned the bus for its whole run: nothing was prefetched
+             * behind it, so it leaves the queue EMPTY rather than a queue ahead. */
+            if (m->block_drains_queue && m->block_transfer_ran) m->biu_debt = 0;
             rec->cycles = uint16_t(base + stall);
         } else {
             rec->cycles = uint16_t(
@@ -782,6 +785,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 + m->access_wait);
         }
         m->cycles_already_measured = false;
+        m->block_transfer_ran = false;
         m->access_wait = 0;
         m->fetch_window = 0xFFFFFFFFu;   // next step re-arms it before its own fetch
 
@@ -1553,6 +1557,39 @@ NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bi
      * l'a vu -- le corpus ne regarde que des ecrans d'intro. */
     m->ldir_cost          = 14;
     m->ldirw_cost         = 18;
+    /* ⚡ ET LA FILE D'INSTRUCTIONS NE PREND AUCUNE AVANCE PENDANT UNE COPIE DE BLOC.
+     *
+     * Une copie repetee tient le bus pendant toute sa duree -- lecture et ecriture a
+     * chaque iteration -- donc l'unite de bus n'a pas un seul creneau pour precharger
+     * derriere elle. Sans ceci elle sortait du bloc avec une file PLEINE, et les
+     * instructions suivantes voyaient leur fetch offert (`biu_slack`, 16 cycles) autant
+     * de fois qu'il y avait de blocs.
+     *
+     * ⚖️ MESURE, sur l'instrument le plus fin que ce projet possede : le copieur raster
+     * en BOUCLE OUVERTE de BOMBERMAN (Thor, 2004). Il se synchronise UNE fois sur la
+     * ligne 0 puis enchaine 19 blocs de 224 mots sans jamais repoller, donc chaque bloc
+     * doit couter exactement une tranche de 8 lignes -- 8 x 515 = 4120 cycles :
+     *
+     *   sans ceci   4086 cycles/bloc (0,9917x) -- 34 cycles TROP RAPIDE par bloc
+     *   avec        4134 cycles/bloc (1,0034x) -- le plus proche jamais mesure
+     *   (l'ancien modele, `legacy`, donnait 4158 : 1,0092x)
+     *
+     * ⛔ ET CES 34 CYCLES SE VOIENT, parce qu'ils ne s'annulent pas : ils s'ACCUMULENT.
+     * L'ecriture part 34 cycles plus tot a chaque bloc et la marge de depart n'est que
+     * de 73 cycles, donc des le 4e bloc l'ecriture repasse dans la DERNIERE ligne de la
+     * bande precedente -- celle qui affiche encore la banque qu'on ecrase. Resultat :
+     * la ligne 8k+7 corrompue sur 15 bandes, et rien ailleurs. Une derive lente ne
+     * donne pas un defaut flou, elle donne un defaut NET a partir d'un seuil.
+     *
+     * ⚠️ Le sens de l'erreur compte : etre un peu LENT est sans effet (l'ecriture reste
+     * derriere le faisceau, le jeu a de la marge en fin de bloc), etre un peu RAPIDE est
+     * fatal. C'est pour ca que `legacy` sortait juste malgre +0,92 %.
+     *
+     * ⚖️ ET L'ORACLE QUI EXISTAIT DEJA A ETE INTERROGE AVANT DE SHIPPER : les ONZE ROM
+     * de `hw_calibration/` rendent un framebuffer IDENTIQUE AU BIT avec et sans -- aucun
+     * chiffre silicium ne bouge. Corpus 83 jeux : 80 identiques au bit, 3 deplaces d'UNE
+     * trame d'animation (regardes a l'ecran, rien de degrade), 0 erreur. */
+    m->block_drains_queue = true;
     m->tx_irq_on_buffer_free = true;
     m->rx_single_charge   = true;
 
@@ -1619,6 +1656,11 @@ NGPC_API void ngpc_set_bios_data_wait(ngpc_t* h, uint32_t cycles) {
 NGPC_API void ngpc_set_slack_by_region(ngpc_t* h, int on) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->biu_slack_follows_region = on != 0;
+}
+
+NGPC_API void ngpc_set_block_drains_queue(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->block_drains_queue = on != 0;
 }
 
 NGPC_API void ngpc_set_branch_flush(ngpc_t* h, int on) {

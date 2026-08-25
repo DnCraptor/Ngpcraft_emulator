@@ -597,6 +597,9 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_slack_by_region.restype = None
     lib.ngpc_set_branch_flush.argtypes = [c_void_p, c_int]
     lib.ngpc_set_branch_flush.restype = None
+    if hasattr(lib, "ngpc_set_block_drains_queue"):
+        lib.ngpc_set_block_drains_queue.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_block_drains_queue.restype = None
     lib.ngpc_set_rx_double.argtypes = [c_void_p, c_int]
     lib.ngpc_set_rx_double.restype = None
     lib.ngpc_set_tx_irq_early.argtypes = [c_void_p, c_int]
@@ -820,6 +823,10 @@ class NativeMachine:
         self.set_cart_data_wait(0)
         self.set_ldir_cost(14)
         self.set_ldirw_cost(18)
+        # ⛔ ET LE BLOC NE VIDE PAS LA FILE : c'est un morceau du modele silicium, donc
+        # « legacy » doit le RETIRER, sinon l'A/B compare l'ancien modele plus une piece
+        # du nouveau -- et n'attribue plus rien.
+        self.set_block_drains_queue(False)
         self.set_bios_wait(0)
         # ⛔ And the experimental knobs too: "legacy" must DEFINE the machine, exactly
         # like set_timing_silicon does. Leaving one armed would give the old model plus
@@ -903,6 +910,20 @@ class NativeMachine:
     def set_slack_by_region(self, on: bool) -> None:
         """EXPERIMENT: the BIU's run-ahead follows the region being fetched."""
         self._lib.ngpc_set_slack_by_region(self._h, 1 if on else 0)
+
+    def set_block_drains_queue(self, on: bool) -> None:
+        """A repeating block transfer leaves the instruction queue EMPTY.
+
+        It owns the bus for its whole run, so the BIU cannot prefetch behind it and
+        the following instructions pay their own fetch in full. Guarded by `hasattr`
+        like `set_ldirw_cost`: an older DLL must not take the whole core down for an
+        optional setting.
+        """
+        if not hasattr(self._lib, "ngpc_set_block_drains_queue"):
+            raise RuntimeError(
+                "this core has no ngpc_set_block_drains_queue -- rebuild cpp/build"
+            )
+        self._lib.ngpc_set_block_drains_queue(self._h, 1 if on else 0)
 
     def set_branch_flush(self, on: bool) -> None:
         """EXPERIMENT: a taken branch empties the 4-byte instruction queue."""

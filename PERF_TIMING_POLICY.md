@@ -195,7 +195,7 @@ fois le 21/08 -- `Shell._begin_mirror`, `test_netplay_mirror`, et le helper `sil
 banc de la sonde. Dans les trois cas une moitie du modele etait armee et l'autre non, ce
 qui donne une machine que personne n'a. **Appeler ce que le shell appelle.**
 
-### Les huit pieces
+### Les neuf pieces
 
 | piece | provenance |
 |---|---|
@@ -207,6 +207,7 @@ qui donne une machine que personne n'a. **Appeler ce que le shell appelle.**
 | le **BIOS paie le meme bus** | il est sur le meme bus 16 bits |
 | **transmetteur a deux etages** | fiche 3.11 : `SC0BUF` et le registre a decalage sont distincts |
 | retrait du **double comptage** a la reception | defaut reel, condition de sortie remplie |
+| **la file ne precharge PAS a travers une copie de bloc** | une copie repetee tient le bus (une lecture + une ecriture par iteration) : aucun creneau pour precharger derriere elle. ⚖️ **MESURE** sur le copieur raster en boucle ouverte de BOMBERMAN, qui doit depenser exactement 8 lignes par bloc : 4086 cy/bloc sans (0,9917x, image cassee), **4134 avec (1,0034x, image propre)**. Les 11 ROM de calibration : framebuffer IDENTIQUE AU BIT avec et sans. Voir DEVLOG 2026-08-25. |
 | `word = 8,25` (`fetch_wait_q4 = 33`), `bios = 8` | ⚠️ **les deux seuls chiffres CALIBRES**, et le premier a ete RECALE sur silicium le 23/08 (ROM v8) : il valait 10, l'entier ne peut pas encadrer la console. Voir plus bas. |
 
 ### Contre le silicium (tir du 21/08, recoupe en interne)

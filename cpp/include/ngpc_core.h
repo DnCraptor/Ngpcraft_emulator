@@ -352,6 +352,7 @@ NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t*, uint32_t quarters);
 NGPC_API void ngpc_set_bios_data_wait(ngpc_t*, uint32_t cycles);
 NGPC_API void ngpc_set_slack_by_region(ngpc_t*, int on);
 NGPC_API void ngpc_set_branch_flush(ngpc_t*, int on);
+NGPC_API void ngpc_set_block_drains_queue(ngpc_t*, int on);
 NGPC_API void ngpc_set_rx_double(ngpc_t*, int on);
 NGPC_API void ngpc_set_tx_irq_early(ngpc_t*, int on);
 NGPC_API void ngpc_set_fetch_pipelined(ngpc_t*, int on, int slack);

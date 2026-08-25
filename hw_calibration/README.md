@@ -23,6 +23,17 @@ that game writes VRAM in vblank. The residual is its per-frame **LDIR** block co
 what **v6** measures (`ldir_cost`, shipped at 14 pending that ROM). See `../DEVLOG.md` and
 memory `project_ngpc_emulator_fps_waitstates`.
 
+**Since (2026-08-25):** the same ROM caught the silicon recalibration. `ldirw_cost` was
+still 18 and still right, but the recalibrated model lets the bus interface unit run a
+queue ahead (`biu_slack`) — and it was crediting that queue **through** a block copy, which
+holds the bus for its whole run and cannot prefetch behind itself. Three block copies per
+block = 48 cycles a block given away: **4086 cycles/block against the hardware's 4120
+(0.9917×)**, the copier walked back into the beam and one line per band came out corrupt.
+With the queue drained: **4134 (1.0034×)**, the closest this project has measured, and the
+picture is pixel-clean. ⚖️ **All eleven ROMs here render a bit-identical framebuffer with
+and without it** — no silicon figure moves. See `DEVLOG.md` 2026-08-25 and
+`tests/test_bomberman_hicolor_phase.py`.
+
 **Since (2026-08-06):** that block cost turned out to be **two** numbers, not one — the byte
 form and the word form are different instructions and the loop is billed per iteration. The
 word form is now `ldirw_cost`, shipped at **18**, measured on a homebrew raster oracle to a
@@ -36,6 +47,7 @@ one-cycle tolerance. See [v7](#v7--the-word-block-copy-ldirw-and-why-v6-cannot-a
 | `cart_data_wait` | `0` | **0** (`cfg.CART_DATA_WAIT`) | ✅ silicon (v2): 0 is the answer, not "unset" — **re-confirmed 2026-08-06**, see below |
 | `ldir_cost` — **byte** LDIR/LDDR | `7` (datasheet) | **14** (`cfg.CART_LDIR_COST`) | ⚠️ strongly evidenced, ROM measurement still open (v6) |
 | `ldirw_cost` — **word** LDIRW/LDDRW | `0` = follow `ldir_cost` | **18** (`cfg.CART_LDIRW_COST`) | ⚠️ measured on a homebrew raster oracle (2026-08-06), no calib ROM yet — **v7 would settle it** |
+| `block_drains_queue` — the BIU cannot prefetch through a block copy | `false` | **on** (armed by `set_timing_silicon`) | ⚠️ measured on the same homebrew raster oracle (2026-08-25) — see below |
 | `vram_wait` | `0` | *not set* | ⚠️ effect confirmed (v3: VWR 452 < MEM 471), cost/byte not pinned — no guess shipped |
 
 ⚠️ **The two defaults differ on purpose, and it catches people.** The field default of `0` is

@@ -118,6 +118,11 @@ void Machine::reset_memory() {
      * ici a fait tomber le test de rejeu libretro dans la seconde. */
     access_wait_q4 = 0;
     fetch_wait_carry = 0;
+    /* ⚡ Le drapeau « une copie de bloc vient de tourner » est efface a la fin de CHAQUE
+     * instruction, donc il ne peut pas franchir une savestate (elles sont prises entre
+     * deux instructions) -- mais il est remis a zero ici pour la meme raison que les
+     * trois du dessus : rien de ce qui influence le temps ne survit a un reset. */
+    block_transfer_ran = false;
     serial_tx_buf_full = false;
     serial_tx_buf_byte = 0;
     serial_rx_shift_full = false;

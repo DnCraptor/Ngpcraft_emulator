@@ -1210,6 +1210,14 @@ struct Machine {
      * Whatever is missing makes the console FASTER than us, not slower. Kept at false;
      * revisit only once the emulator is on the fast side of silicon. */
     bool     flush_queue_on_branch = false;
+    /* EXPERIMENT (measured below): a REPEATING block transfer holds the bus for its
+     * whole run, so the instruction queue cannot run ahead during it. When set, the
+     * BIU's run-ahead is zeroed after LDIR/LDIRW/CPIR/... instead of being left at
+     * its full one-queue credit. */
+    bool     block_drains_queue = false;
+    /* Set by the block-transfer handler when the loop actually REPEATED, read and
+     * cleared by the run loop -- same shape as `cycles_already_measured`. */
+    bool     block_transfer_ran = false;
 
     bool     fetch_pipelined = false;
     int32_t  biu_debt = 0;

@@ -426,7 +426,7 @@ static bool exec_source(Machine& m, ngpc_record_t* rec, uint32_t pc,
          * `rec->cycles`, que la boucle d'execution met a l'echelle. Le drapeau est le seul
          * endroit qui le dit. La forme non repetee garde son cout d'annexe B (8 / 6 etats)
          * et reste donc mise a l'echelle. */
-        if (repeats) m.cycles_already_measured = true;
+        if (repeats) { m.cycles_already_measured = true; m.block_transfer_ran = true; }
         out_cycles = uint16_t(
             (repeats ? per * iterations + 1
                      : (is_compare ? 6 : 8)) + e.extra);
