@@ -443,3 +443,41 @@ def test_the_teardown_runs_even_when_the_loop_leaves_unexpectedly(app, monkeypat
     assert seen[0] == "boom", "and it must carry the real reason, not a placeholder"
     assert c._wake_r.fileno() == -1 and c._wake_w.fileno() == -1, \
         "the wake socketpair is closed, not leaked"
+
+
+# --------------------------------------------------------------------------
+# ⛔ LA FICHE D'ADRESSE N'AFFICHAIT QU'UNE SEULE ADRESSE, ET PAS FORCEMENT LA BONNE
+#
+# `_lan_ip()` rend l'adresse de l'interface qui sort vers internet -- le 192.168.x de
+# la box. Or la seule facon gratuite ET permanente de jouer a distance sans redirection
+# de port, c'est un reseau prive virtuel (Tailscale, ZeroTier): il ajoute une interface
+# avec sa propre adresse, hors route par defaut, que la fiche ne montrait donc pas. Le
+# joueur repartait avec l'adresse qui ne marche que chez lui.
+
+def test_the_host_card_lists_the_other_local_addresses():
+    from ngpc_lobby import _lan_ip, _other_local_ips
+    primary = _lan_ip()
+    others = _other_local_ips(primary)
+    assert primary not in others, "la principale est deja affichee sur sa propre ligne"
+    assert not any(ip.startswith("127.") for ip in others), "le bouclage n'est pas une adresse a donner"
+
+
+def test_a_virtual_network_address_is_offered_first():
+    """L'adresse d'un reseau prive virtuel est CELLE qu'il faut composer a distance, donc
+    elle passe devant les interfaces de machines virtuelles et autres cartes locales."""
+    import ngpc_lobby
+    import socket
+
+    fake = ["192.168.56.1", "100.101.102.103", "10.0.0.5"]
+
+    def fake_getaddrinfo(host, port, family=0, *a, **k):
+        return [(family, 0, 0, "", (ip, 0)) for ip in fake + ["127.0.0.1"]]
+
+    real = socket.getaddrinfo
+    socket.getaddrinfo = fake_getaddrinfo
+    try:
+        got = ngpc_lobby._other_local_ips("10.0.0.5")
+    finally:
+        socket.getaddrinfo = real
+    assert got[0] == "100.101.102.103", got
+    assert "10.0.0.5" not in got and not any(g.startswith("127.") for g in got)

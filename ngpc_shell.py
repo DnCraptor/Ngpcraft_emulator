@@ -109,7 +109,13 @@ RAIL_INDENT = "   "                   # the nav entries' hanging indent, on ever
 RAIL_AUTO_COLLAPSE_W = 760
 DEFAULT_ROM_DIR = REPO / "roms"          # drop your .ngc/.ngp files here (or pick a folder)
 DEFAULT_BIOS = REPO / "bios.bin"         # optional: a real NGPC BIOS enables "Boot BIOS"
-HLE_BIOS = REPO / "hle_bios" / "bios_hle.bin"  # clean-room fallback: runs games with no bios.bin
+# ⛔ BUNDLE, PAS REPO. C'est une ressource QU'ON EXPÉDIE, au même titre que l'icône,
+# pas une donnée de l'utilisateur. Cherchée à côté de l'.exe elle n'y était jamais :
+# le spec ne l'embarquait pas et le zip de CI ne la posait pas — donc la promesse
+# d'ouverture du README, « aucun BIOS nécessaire », était FAUSSE dans le binaire
+# distribué, et sans un mot : tout le code la garde derrière `.is_file()`, donc
+# l'application se contentait de se comporter comme si elle n'existait pas.
+HLE_BIOS = BUNDLE / "hle_bios" / "bios_hle.bin"  # clean-room fallback: runs games with no bios.bin
 # The ORIGINAL monochrome NGP's own BIOS, if the user dropped one next to the app.
 # Names people actually give that dump -- the extension says nothing about the file.
 DEFAULT_BIOS_MONO = [REPO / n for n in
@@ -5462,6 +5468,23 @@ def _net_error_text(lang: str, exc: Exception, mode: str) -> str:
             key = "net_err_in_use"
         elif exc.errno in (errno.EADDRNOTAVAIL, errno.EACCES):
             key = "net_err_denied"
+        # ⛔ SIGNALE PAR UN JOUEUR : « link failed [WinError 10051] une operation a ete
+        # tentee sur un reseau impossible a atteindre ». C'est WSAENETUNREACH, et il
+        # tombait dans le `str(exc)` que cette fonction existe justement pour eviter --
+        # le numero est la seule partie qui ne dit pas quoi faire.
+        #
+        # Cette famille-la a une cause tres precise et une seule: l'adresse composee
+        # n'est PAS JOIGNABLE depuis ce PC. En pratique c'est presque toujours une
+        # adresse de reseau local (192.168.x / 10.x) donnee par un joueur qui n'est pas
+        # sur le meme reseau -- l'autre joueur a lu l'IP que sa box lui donne au lieu de
+        # son IP publique. Un pare-feu ne donne pas ca (il donne un refus ou un delai).
+        else:
+            unreachable = {getattr(errno, n) for n in
+                           ("ENETUNREACH", "EHOSTUNREACH", "ENETDOWN",
+                            "WSAENETUNREACH", "WSAEHOSTUNREACH", "WSAENETDOWN")
+                           if getattr(errno, n, None) is not None}
+            if exc.errno in unreachable:
+                key = "net_err_unreachable"
     if key is None:
         return cfg.tr(lang, "link_failed").format(why=str(exc))
     return cfg.tr(lang, "link_failed").format(why=cfg.tr(lang, key))
@@ -5492,8 +5515,26 @@ class _NetConnect(QThread):
     connected = pyqtSignal(object)     # a connected socket.socket
     failed = pyqtSignal(str)           # already-translated, player-facing
 
-    HOST_TIMEOUT_S = 300.0    # five minutes of "waiting for player 2" is generous
-    JOIN_TIMEOUT_S = 120.0    # ...and two of "waiting for the host to click Host"
+    # ⛔ CINQ MINUTES N'ETAIENT PAS « GENEREUSES », C'ETAIT LA PANNE.
+    #
+    # Signale ainsi: « j'ai essaye de differentes facons, en LAN ou en ligne, les deux
+    # IP, rien ne change: en attente de connexion..... ». Constate en regardant les
+    # VRAIES sockets des deux instances qui tournaient (tools/watch_link_sockets.py):
+    # **aucune ecoute**, alors que l'ecran affichait toujours « en attente ». L'attente
+    # avait expire, et rien ne le disait.
+    #
+    # Deux joueurs qui montent une partie ne sont pas synchrones a la minute pres: on
+    # clique Heberger, on va sur l'autre PC, on charge la ROM, on se met d'accord sur
+    # Discord. Passe la 5e minute l'hote n'ecoute plus, et le pair qui arrive enfin
+    # recoit un refus de connexion pendant que l'hote, lui, montre encore « en attente ».
+    # Les deux joueurs voient alors deux pannes differentes de la meme non-panne.
+    #
+    # ⚡ Ce n'est pas une valeur a rallonger indefiniment: la tentative est ANNULABLE
+    # (menu 🔗 et fermeture du panneau d'accueil -> `_cancel_net_attempt`), donc la
+    # sortie est entre les mains du joueur, pas d'un chronometre. La demi-heure est ce
+    # qui reste pour qu'un fil oublie ne survive pas a la session.
+    HOST_TIMEOUT_S = 1800.0   # trente minutes -- et annulable a tout moment
+    JOIN_TIMEOUT_S = 1800.0   # idem: le rejoignant retente tant que l'hote n'ecoute pas
     POLL_S = 0.25             # how fast a cancel is noticed
 
     def __init__(self, mode: str, host: str, port: int, lang: str = "en") -> None:
@@ -5866,6 +5907,7 @@ class Shell(QMainWindow):
         self._net_thread = None            # background accept/connect, when linking online
         self._net_retiring = []            # cancelled workers, held until they really stop
         self._net_status = None            # online link diagnostic timer
+        self._net_clock = None             # « en attente » qui COMPTE, voir _start_net
         self._host_info = None             # the host connection-info dialog
         self.settings.changed.connect(self._on_settings_changed)
         self.settings.storage_changed.connect(self._on_storage_changed)
@@ -6326,7 +6368,40 @@ class Shell(QMainWindow):
                     == QMessageBox.StandardButton.Yes:
                 self._cancel_net_attempt()
             return False
-        self.play.overlay.setText(waiting)
+        # ⛔ UNE ATTENTE MUETTE NE SE DISTINGUE PAS D'UNE ATTENTE MORTE, et c'est ce
+        # qui a coute le plus cher dans le rapport « rien ne change, en attente de
+        # connexion..... »: le texte etait pose ici une fois pour toutes, donc il
+        # disait exactement la meme chose quand le fil ecoutait et quand il avait
+        # abandonne depuis dix minutes. Un compteur qui avance est la seule chose qui
+        # separe les deux SANS rien demander au joueur -- et s'il s'arrete, la
+        # tentative est finie.
+        self._stop_net_clock()
+        started = time.monotonic()
+
+        # ⛔ « 127.0.0.1 », C'EST CE PC -- ET RIEN NE LE DISAIT.
+        #
+        # Mesure sur la machine d'un joueur bloque « en attente »: une seule vraie
+        # instance de l'emulateur, en SYN_SENT vers 127.0.0.1:7789, pendant que le
+        # panneau d'adresse etait ouvert sur l'AUTRE PC. L'adresse de bouclage avait
+        # ete prise pour « l'adresse du serveur qu'on m'a donnee ». Elle est
+        # parfaitement legitime -- deux fenetres sur un seul PC s'en servent -- donc on
+        # ne la refuse pas: on rappelle ce qu'elle veut dire, et seulement une fois
+        # qu'il est clair que ca ne prend pas.
+        loopback = mode == "join" and host.strip().lower() in (
+            "127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+        def tick() -> None:
+            secs = int(time.monotonic() - started)
+            txt = cfg.tr(lang, "link_waiting_since").format(
+                msg=waiting, mmss=f"{secs // 60}:{secs % 60:02d}")
+            if loopback and secs >= 5:
+                txt += "  " + cfg.tr(lang, "net_hint_loopback")
+            self.play.overlay.setText(txt)
+
+        tick()
+        self._net_clock = QTimer(self)
+        self._net_clock.timeout.connect(tick)
+        self._net_clock.start(1000)
         th = _NetConnect(mode, host, port, lang)
         th.connected.connect(self._on_net_connected)
         th.failed.connect(self._on_net_failed)
@@ -6335,6 +6410,13 @@ class Shell(QMainWindow):
         self.play.net_pending = True
         th.start()
         return True
+
+    def _stop_net_clock(self) -> None:
+        """L'attente est finie, quelle qu'en soit la raison: le compteur s'arrete, et
+        celui qui regarde l'ecran le voit."""
+        if self._net_clock is not None:
+            self._net_clock.stop()
+            self._net_clock = None
 
     def _on_net_thread_finished(self, th) -> None:
         """⚠️ WHICH worker finished matters, and the old handler did not ask.
@@ -6350,6 +6432,7 @@ class Shell(QMainWindow):
         if self._net_thread is th:
             self._net_thread = None
             self.play.net_pending = False
+            self._stop_net_clock()
 
     def _retire_net_thread(self, th) -> None:
         """Cancel a worker and KEEP IT ALIVE until it has really stopped.
@@ -6419,6 +6502,11 @@ class Shell(QMainWindow):
         self._retire_net_thread(th)
         self._close_host_info()
         self._mirror_pending = None            # or the next Host would start a mirror
+        # ⛔ ET LE COMPTEUR S'ARRETE ICI AUSSI. Sans ca il continuait d'ecrire
+        # « en attente — 4:12 » par-dessus tout le reste, sur une tentative annulee:
+        # le compteur avait ete ajoute pour qu'une attente morte se voie, et il en
+        # fabriquait une vivante.
+        self._stop_net_clock()
         self.play.overlay.setText("")
         self.play._flash(cfg.tr(cfg.language(self._settings), "net_cancelled"))
 
@@ -6437,14 +6525,42 @@ class Shell(QMainWindow):
         """
         from ngpc_lobby import HostInfoDialog
         game = self.play._rom_path.stem if self.play._rom_path else "?"
+        self._host_info_port = int(port)
         self._host_info = HostInfoDialog(game, int(port),
                                          cfg.language(self._settings), self)
         self._host_info.finished.connect(self._on_host_info_closed)
         self._host_info.show()
 
     def _on_host_info_closed(self, *_a) -> None:
-        if getattr(self, "_host_info", None) is not None and self._net_attempt_pending():
-            self._cancel_net_attempt()
+        """Le panneau d'adresse se ferme. L'HEBERGEMENT CONTINUE.
+
+        ⛔ IL ANNULAIT LA TENTATIVE, ET C'EST LA PANNE QU'ON A CHERCHEE TOUTE LA
+        SOIREE. Rapporte comme « rien ne change, en attente de connexion..... », en
+        LAN comme en ligne, en cable comme en miroir. Reproduit en regardant les
+        VRAIES sockets (tools/watch_link_sockets.py + un banc sur `Shell`):
+
+            clic « Heberger »            -> ecoute sur le port : OUI
+            fermeture du panneau d'adresse -> ecoute sur le port : NON
+
+        Or ce panneau est une FICHE: il affiche ton IP locale, ton IP publique
+        detectee, la ligne a coller dans Discord, et un bouton « Fermer ». Sa propre
+        classe le dit -- `HostInfoDialog`: « Non-modal -- hosting keeps running behind
+        it ». Un joueur lit son adresse, la copie, ferme la fiche pour revoir son jeu,
+        et vient d'arreter d'heberger sans qu'un mot le lui dise. Son pair, lui, tape
+        dans un port ferme: cote hote « en attente », cote invite « connexion refusee ».
+        Deux ecrans, deux pannes, une seule cause.
+
+        ⚡ L'INTENTION D'ORIGINE RESTE SERVIE AUTREMENT. Fermer le panneau etait pense
+        comme « la sortie ou un joueur qui veut arreter va regarder ». Mais la sortie
+        existe deja et elle est EXPLICITE -- « Annuler la tentative », dans le menu 🔗.
+        Une fiche qu'on ferme ne dit pas « j'abandonne »; elle dit « j'ai lu ». Alors on
+        garde l'ecoute, et on RAPPELLE ou est le bouton qui arrete.
+        """
+        port = getattr(self, "_host_info_port", 0)
+        self._host_info = None
+        if self._net_attempt_pending():
+            self.play._flash(cfg.tr(cfg.language(self._settings),   # noqa: SLF001
+                                    "host_still_listening").format(port=port), 6000)
 
     def _on_net_connected(self, sock) -> None:
         from core.link import TcpLink
@@ -6460,6 +6576,7 @@ class Shell(QMainWindow):
             if busy:
                 self.play._flash(cfg.tr(cfg.language(self._settings), "link_busy"))
             return
+        self._stop_net_clock()       # relie: plus rien a compter
         self._close_host_info()      # the panel answered its question: they are in
         if self._mirror_pending is not None:        # the other online mode
             from core.netplay import SocketPipe
@@ -6781,6 +6898,7 @@ class Shell(QMainWindow):
         # ⛔ CLEAR THE MODE FLAG. Left set by a mirror attempt that timed out, the next
         # ordinary Host/Join would silently start a MIRROR session instead of a cable.
         self._mirror_pending = None
+        self._stop_net_clock()
         self.play.overlay.setText(
             cfg.tr(cfg.language(self._settings), "link_failed").format(why=msg))
 

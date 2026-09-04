@@ -352,6 +352,38 @@ NGPC_API void ngpc_set_fetch_wait_q4(ngpc_t*, uint32_t quarters);
 NGPC_API void ngpc_set_bios_data_wait(ngpc_t*, uint32_t cycles);
 NGPC_API void ngpc_set_slack_by_region(ngpc_t*, int on);
 NGPC_API void ngpc_set_branch_flush(ngpc_t*, int on);
+/* Credit d'avance qui survit a une branche prise, en cycles. 0 = vidage total. */
+NGPC_API void ngpc_set_branch_flush_keep(ngpc_t*, uint32_t cycles);
+/* Cycles ajoutes a chaque branche prise, sans condition. 0 = desarme. */
+NGPC_API void ngpc_set_branch_taken_extra(ngpc_t*, uint32_t cycles);
+/* Cout d'un octet fetche, en SEIZIEMES de cycle. 0 = ancien chemin par mot. */
+NGPC_API void ngpc_set_fetch_wait_byte_q16(ngpc_t*, uint32_t sixteenths);
+/* Cout FIXE d'un acces memoire de donnee, en cycles. 0 = gratuit. */
+NGPC_API void ngpc_set_data_access_cycles(ngpc_t*, uint32_t cycles);
+/* Avance maximale de la file, en cycles. Mesuree par la ROM v16 page 0. */
+/* Credit d'avance qui survit a une INTERRUPTION, en cycles. 0 = tout jete. */
+NGPC_API void ngpc_set_irq_flush_keep(ngpc_t*, uint32_t cycles);
+NGPC_API void ngpc_set_biu_slack(ngpc_t*, int32_t cycles);
+/* Couts OCTET de mul (etats) et div (cycles). 0 = constantes du coeur. */
+/* Taille de la file d'instructions en OCTETS (4). 0 = ancien credit en cycles. */
+NGPC_API void ngpc_set_queue_bytes(ngpc_t*, uint32_t bytes);
+/* DIAGNOSTIC : etat de la file au sortir d'une acceptation d'IRQ, en 1/16 d'octet. */
+/* EXPERIMENT : un transfert de controle qui change de REGION jette l'avance. */
+NGPC_API void ngpc_set_flush_on_region_change(ngpc_t*, int on);
+/* EXPERIMENT : une interruption est transparente pour l'etat de bus du flot
+ * interrompu (sauve a la livraison, rendu au `reti`). */
+NGPC_API void ngpc_set_irq_transparent_queue(ngpc_t*, int on);
+/* EXPERIMENT : le cout d'acces de donnee ne se paie que dans du code CARTOUCHE. */
+/* ESSAI : un transfert bloc paie l'etranglement VRAM. */
+NGPC_API void ngpc_set_block_pays_vram(ngpc_t*, int on);
+NGPC_API void ngpc_set_data_wait_cart_only(ngpc_t*, int on);
+NGPC_API void ngpc_set_irq_queue_keep_q16(ngpc_t*, int32_t q16);
+/* Instrumentation du modele en OCTETS : etat de la file a l'entree de la derniere
+ * instruction (1/16 d'octet), octets qu'elle a fait lire, calage paye, access_wait. */
+NGPC_API void ngpc_dbg_queue(ngpc_t*, int32_t* q_in, uint32_t* bytes,
+                             uint32_t* stall, uint32_t* aw);
+NGPC_API void ngpc_set_muldiv_byte(ngpc_t*, uint32_t mul_states, uint32_t div_cycles);
+NGPC_API void ngpc_set_muldiv_word(ngpc_t*, uint32_t mul_states, uint32_t div_cycles);
 NGPC_API void ngpc_set_block_drains_queue(ngpc_t*, int on);
 NGPC_API void ngpc_set_rx_double(ngpc_t*, int on);
 NGPC_API void ngpc_set_tx_irq_early(ngpc_t*, int on);
@@ -710,7 +742,23 @@ typedef struct {
     uint8_t  rx_shift_full;
     uint8_t  rx_shift_byte;
     uint8_t  rx_had_pending;
-    uint8_t  _pad_v2[3];
+    /* ⛔ THE DETECT LINE HAS TO SURVIVE A RESTORE, AND IT DID NOT.
+     *
+     * `serial_cts_seen` is what makes 0xB1 bit2 answer "a console is at the other end"
+     * -- nothing else does, since cts_high's DEFAULT means "peer ready" and cannot be
+     * told apart from a peer nobody has spoken for. It was in the Machine and in no
+     * block, so every rewind step and every save state UNPLUGGED THE CABLE as far as
+     * the cartridge could tell: a versus game restored mid-match reads "no cable" and
+     * takes whatever exit it has for that. The desktop's rewind ring runs through the
+     * same capture, and libretro netplay runs on retro_serialize.
+     *
+     * ⚡ TAKEN OUT OF THE v2 PADDING ON PURPOSE. The struct keeps its size and its
+     * version, so a state written before this change still loads -- its pad byte is 0,
+     * which reads as "nobody has spoken for the peer", exactly the behaviour that
+     * state was saved with. Bumping the version instead would have made the whole
+     * cable block refuse, throwing away the FIFOs too, to gain nothing. */
+    uint8_t  cts_seen;
+    uint8_t  _pad_v2[2];
     int32_t  tx_cycles;           /* baud-time countdowns, SIGNED      */
     int32_t  rx_cycles;
     uint32_t tx_len;              /* bytes valid in tx_fifo / rx_fifo  */

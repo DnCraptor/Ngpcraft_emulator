@@ -39,6 +39,10 @@ a = Analysis(
     # globbing it at import time, so a new lang/pt.json must ship with no edit
     # here either -- naming the files one by one would silently drop it.
     datas=[(f'cpp/build/{_CORE}', 'cpp/build'),
+           # The clean-room HLE BIOS: without it the packaged app has NO BIOS at
+           # all and "no bios.bin needed" — the README's first promise — is not
+           # true of the thing people download. It was missing here for months.
+           ('hle_bios/bios_hle.bin', 'hle_bios'),
            ('assets/icone_ngpcraft.ico', 'assets'),
            ('assets/ngpc_console.png', 'assets'),
            ('lang', 'lang')],

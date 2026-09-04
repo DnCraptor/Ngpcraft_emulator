@@ -20,6 +20,7 @@ from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from core import link
 from core.link_debug import deliver_injected
 
 FRAME_CONTROL = 1
@@ -342,6 +343,13 @@ class LobbyLink:
         self.bytes_out = 0
         self.bytes_in = 0
         self.machine.serial_set_enabled(True)
+        # A CONSOLE is at the other end, and the game has to be able to SEE it: 0xB1
+        # bit2 only clears once something has spoken for the peer. The lobby is the
+        # other online transport and had the same hole as TcpLink -- see
+        # core.link.declare_peer for the measurement and for why asserting it here is
+        # honest. Losing the peer goes through `disconnect()`, which disables the
+        # channel outright -- the detect line reads "no cable" from that alone.
+        link.declare_peer(self.machine, True)
 
     def pump(self) -> None:
         tx = self.machine.serial_read_tx(256)

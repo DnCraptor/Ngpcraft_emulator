@@ -345,7 +345,13 @@ class LinkState(Structure):
         # Any field added on the C side belongs here in the same commit.
         ("tx_buf_full", c_uint8), ("tx_buf_byte", c_uint8),
         ("rx_shift_full", c_uint8), ("rx_shift_byte", c_uint8),
-        ("rx_had_pending", c_uint8), ("_pad_v2", c_uint8 * 3),
+        # ⛔ `cts_seen` EST PRIS DANS LE BOURRAGE v2, ET C'EST VOULU. C'est lui qui fait
+        # répondre 0xB1 bit2 « une console est au bout du fil » ; il ne vivait dans aucun
+        # bloc, donc chaque cran de rewind et chaque savestate DÉBRANCHAIT le câble aux
+        # yeux de la cartouche. La taille et la version du bloc ne bougent pas : un état
+        # écrit avant ce changement se charge encore, son octet de bourrage vaut 0 —
+        # « personne n'a parlé pour le pair », exactement ce avec quoi il a été pris.
+        ("rx_had_pending", c_uint8), ("cts_seen", c_uint8), ("_pad_v2", c_uint8 * 2),
         ("tx_len", c_uint32), ("rx_len", c_uint32),
         ("tx_count", c_uint32), ("wire_count", c_uint32),
         ("rx_queued_count", c_uint32), ("rx_read_count", c_uint32),
@@ -597,6 +603,58 @@ def _bind(path: Path) -> ctypes.CDLL:
     lib.ngpc_set_slack_by_region.restype = None
     lib.ngpc_set_branch_flush.argtypes = [c_void_p, c_int]
     lib.ngpc_set_branch_flush.restype = None
+    if hasattr(lib, "ngpc_set_branch_flush_keep"):
+        lib.ngpc_set_branch_flush_keep.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_branch_flush_keep.restype = None
+    if hasattr(lib, "ngpc_set_branch_taken_extra"):
+        lib.ngpc_set_branch_taken_extra.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_branch_taken_extra.restype = None
+    if hasattr(lib, "ngpc_set_fetch_wait_byte_q16"):
+        lib.ngpc_set_fetch_wait_byte_q16.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_fetch_wait_byte_q16.restype = None
+    if hasattr(lib, "ngpc_set_data_access_cycles"):
+        lib.ngpc_set_data_access_cycles.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_data_access_cycles.restype = None
+    if hasattr(lib, "ngpc_set_flush_on_region_change"):
+        lib.ngpc_set_flush_on_region_change.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_flush_on_region_change.restype = None
+    if hasattr(lib, "ngpc_set_irq_transparent_queue"):
+        lib.ngpc_set_irq_transparent_queue.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_irq_transparent_queue.restype = None
+    if hasattr(lib, "ngpc_set_block_pays_vram"):
+        lib.ngpc_set_block_pays_vram.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_block_pays_vram.restype = None
+    if hasattr(lib, "ngpc_set_data_wait_cart_only"):
+        lib.ngpc_set_data_wait_cart_only.argtypes = [c_void_p, c_int]
+        lib.ngpc_set_data_wait_cart_only.restype = None
+    if hasattr(lib, "ngpc_set_irq_queue_keep_q16"):
+        lib.ngpc_set_irq_queue_keep_q16.argtypes = [c_void_p, c_int32]
+        lib.ngpc_set_irq_queue_keep_q16.restype = None
+    if hasattr(lib, "ngpc_dbg_queue"):
+        lib.ngpc_dbg_queue.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_uint32),
+                                       POINTER(c_uint32), POINTER(c_uint32)]
+        lib.ngpc_dbg_queue.restype = None
+    if hasattr(lib, "ngpc_dbg_biu"):
+        lib.ngpc_dbg_biu.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_uint32), POINTER(c_uint32)]
+        lib.ngpc_dbg_biu.restype = None
+    if hasattr(lib, "ngpc_dbg_bios_charges"):
+        lib.ngpc_dbg_bios_charges.argtypes = [c_void_p]
+        lib.ngpc_dbg_bios_charges.restype = c_uint32
+    if hasattr(lib, "ngpc_set_irq_flush_keep"):
+        lib.ngpc_set_irq_flush_keep.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_irq_flush_keep.restype = None
+    if hasattr(lib, "ngpc_set_biu_slack"):
+        lib.ngpc_set_biu_slack.argtypes = [c_void_p, c_int32]
+        lib.ngpc_set_biu_slack.restype = None
+    if hasattr(lib, "ngpc_set_queue_bytes"):
+        lib.ngpc_set_queue_bytes.argtypes = [c_void_p, c_uint32]
+        lib.ngpc_set_queue_bytes.restype = None
+    if hasattr(lib, "ngpc_set_muldiv_byte"):
+        lib.ngpc_set_muldiv_byte.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.ngpc_set_muldiv_byte.restype = None
+    if hasattr(lib, "ngpc_set_muldiv_word"):
+        lib.ngpc_set_muldiv_word.argtypes = [c_void_p, c_uint32, c_uint32]
+        lib.ngpc_set_muldiv_word.restype = None
     if hasattr(lib, "ngpc_set_block_drains_queue"):
         lib.ngpc_set_block_drains_queue.argtypes = [c_void_p, c_int]
         lib.ngpc_set_block_drains_queue.restype = None
@@ -839,6 +897,27 @@ class NativeMachine:
         self.set_half_duplex(False)
         self.set_rx_double(False)
         self.set_irq_entry(0)
+        # ⛔ ET LES PIECES DES CAMPAGNES v19-v21, POUR LA MEME RAISON QUE CI-DESSUS.
+        # « legacy » doit DEFINIR la machine : laisser une piece du modele courant armee
+        # ferait comparer l'ancien modele PLUS un morceau du nouveau, et l'A/B
+        # n'attribuerait plus rien. Chacune est guardee : une DLL plus ancienne que la
+        # piece n'a pas a tomber pour un bouton optionnel.
+        for name, arg in (("set_data_wait_cart_only", False),
+                          ("set_irq_transparent_queue", False),
+                          ("set_flush_on_region_change", False),
+                          ("set_block_pays_vram", False),
+                          ("set_queue_bytes", 0),
+                          ("set_irq_queue_keep_q16", 0),
+                          ("set_vram_wait", 0)):
+            fn = getattr(self, name, None)
+            if fn is not None:
+                try:
+                    fn(arg)
+                except Exception:
+                    pass
+        # `block_cart_src_per_byte` n'a pas de setter : il vit dans le modele silicium et
+        # `ldirw_cost = 18` ci-dessus porte deja, en legacy, la somme que ce surcout
+        # explique (14 + 4). Les deux ne doivent donc PAS etre armes ensemble.
 
     def set_timing_silicon(self, word_wait: int = 10, bios_wait: int = 8) -> None:
         """Arm the whole silicon timing model in one call.
@@ -924,6 +1003,139 @@ class NativeMachine:
                 "this core has no ngpc_set_block_drains_queue -- rebuild cpp/build"
             )
         self._lib.ngpc_set_block_drains_queue(self._h, 1 if on else 0)
+
+    def set_flush_on_region_change(self, on: bool) -> None:
+        """EXPERIMENT : un transfert de controle qui change de REGION jette l'avance."""
+        self._lib.ngpc_set_flush_on_region_change(self._h, 1 if on else 0)
+
+    def set_irq_transparent_queue(self, on: bool) -> None:
+        """EXPERIMENT : une IRQ est transparente pour l'etat de bus du flot interrompu."""
+        self._lib.ngpc_set_irq_transparent_queue(self._h, 1 if on else 0)
+
+    def set_block_pays_vram(self, on: bool) -> None:
+        """ESSAI : un transfert bloc paie l'etranglement VRAM comme toute ecriture."""
+        self._lib.ngpc_set_block_pays_vram(self._h, 1 if on else 0)
+
+    def set_data_wait_cart_only(self, on: bool) -> None:
+        """EXPERIMENT : le cout d'acces de donnee ne se paie que dans du code CARTOUCHE."""
+        self._lib.ngpc_set_data_wait_cart_only(self._h, 1 if on else 0)
+
+    def set_irq_queue_keep_q16(self, q16: int) -> None:
+        """DIAGNOSTIC : etat de la file au sortir d'une acceptation d'IRQ, en 1/16 d'octet."""
+        self._lib.ngpc_set_irq_queue_keep_q16(self._h, int(q16))
+
+    def set_queue_bytes(self, nbytes: int) -> None:
+        """Taille de la file d'instructions, en OCTETS (4 sur ce coeur).
+
+        0 = ancien modele (credit d'avance en cycles plafonne par `biu_slack`).
+        Voir `queue_bytes` dans machine.hpp : le modele en octets n'a aucun parametre
+        libre, les deux plafonds sont des faits de la machine.
+        """
+        if not hasattr(self._lib, "ngpc_set_queue_bytes"):
+            raise RuntimeError("this core has no ngpc_set_queue_bytes -- rebuild cpp/build")
+        self._lib.ngpc_set_queue_bytes(self._h, int(nbytes))
+
+    def set_muldiv_word(self, mul_states: int, div_cycles: int) -> None:
+        """Couts MOT de `mul` (etats) et `div` (cycles). 0 = constantes du coeur.
+
+        La v14 n'a mesure que la forme OCTET ; la forme mot date encore du fetch a
+        10 cy/mot. ROM v17.
+        """
+        if not hasattr(self._lib, "ngpc_set_muldiv_word"):
+            raise RuntimeError("this core has no ngpc_set_muldiv_word -- rebuild cpp/build")
+        self._lib.ngpc_set_muldiv_word(self._h, int(mul_states), int(div_cycles))
+
+    def set_muldiv_byte(self, mul_states: int, div_cycles: int) -> None:
+        """Couts OCTET de `mul` (etats) et `div` (cycles). 0 = constantes du coeur.
+
+        ⛔ Couples a `biu_slack` : ces deux instructions sont execute-bound, donc leur
+        cout apparent depend de l'avance qu'on autorise au bus. Voir machine.hpp.
+        """
+        if not hasattr(self._lib, "ngpc_set_muldiv_byte"):
+            raise RuntimeError("this core has no ngpc_set_muldiv_byte -- rebuild cpp/build")
+        self._lib.ngpc_set_muldiv_byte(self._h, int(mul_states), int(div_cycles))
+
+    def dbg_biu(self) -> tuple[int, int, int]:
+        """(biu_debt a l'entree, stall paye, access_wait) de la derniere instruction."""
+        d, st, aw = c_int32(), c_uint32(), c_uint32()
+        self._lib.ngpc_dbg_biu(self._h, ctypes.byref(d), ctypes.byref(st), ctypes.byref(aw))
+        return d.value, st.value, aw.value
+
+    def dbg_queue(self) -> tuple[int, int, int, int]:
+        """(file a l'entree en 1/16 d'octet, octets lus, calage paye, access_wait)."""
+        q = ctypes.c_int32(); b = ctypes.c_uint32()
+        st = ctypes.c_uint32(); aw = ctypes.c_uint32()
+        self._lib.ngpc_dbg_queue(self._h, ctypes.byref(q), ctypes.byref(b),
+                                 ctypes.byref(st), ctypes.byref(aw))
+        return int(q.value), int(b.value), int(st.value), int(aw.value)
+
+    def dbg_bios_charges(self) -> int:
+        """Nombre de charges `bios_wait` depuis le dernier appel (instrumentation)."""
+        return int(self._lib.ngpc_dbg_bios_charges(self._h))
+
+    def set_irq_flush_keep(self, cycles: int) -> None:
+        """Credit d'avance qui SURVIT a une interruption, en cycles (0 = tout jete).
+
+        Voir `irq_flush_keep` dans machine.hpp : la v14 a mesure qu'une branche prise
+        n'emporte que ~2,4 cy du credit, pas les 16 d'une file pleine. Une IRQ est aussi
+        un transfert de controle.
+        """
+        if not hasattr(self._lib, "ngpc_set_irq_flush_keep"):
+            raise RuntimeError("this core has no ngpc_set_irq_flush_keep -- rebuild cpp/build")
+        self._lib.ngpc_set_irq_flush_keep(self._h, int(cycles))
+
+    def set_biu_slack(self, cycles: int) -> None:
+        """Avance maximale de la file d'instructions, en cycles.
+
+        Mesuree par la ROM v16 page 0 : ~7,5 cy, soit UN MOT -- pas les deux que la
+        taille de la file (4 octets) laissait deduire.
+        """
+        if not hasattr(self._lib, "ngpc_set_biu_slack"):
+            raise RuntimeError("this core has no ngpc_set_biu_slack -- rebuild cpp/build")
+        self._lib.ngpc_set_biu_slack(self._h, int(cycles))
+
+    def set_data_access_cycles(self, cycles: int) -> None:
+        """Cout FIXE d'un acces memoire de donnee, en cycles (0 = gratuit).
+
+        Voir `data_access_cycles` : v2 avait prouve cart-data == RAM, jamais qu'elles
+        etaient gratuites. Mesure : ROM v15 pages 1-2 (~4,05 cy par ACCES, pas par octet).
+        """
+        if not hasattr(self._lib, "ngpc_set_data_access_cycles"):
+            raise RuntimeError("this core has no ngpc_set_data_access_cycles -- rebuild cpp/build")
+        self._lib.ngpc_set_data_access_cycles(self._h, int(cycles))
+
+    def set_fetch_wait_byte_q16(self, sixteenths: int) -> None:
+        """Cout d'un octet fetche, en seiziemes de cycle (0 = ancien chemin par mot).
+
+        Le bus cartouche est 8 bits : le cout d'un fetch suit les OCTETS. Voir
+        `fetch_wait_byte_q16` dans machine.hpp.
+        """
+        if not hasattr(self._lib, "ngpc_set_fetch_wait_byte_q16"):
+            raise RuntimeError(
+                "this core has no ngpc_set_fetch_wait_byte_q16 -- rebuild cpp/build")
+        self._lib.ngpc_set_fetch_wait_byte_q16(self._h, int(sixteenths))
+
+    def set_branch_taken_extra(self, cycles: int) -> None:
+        """Cycles ajoutes a chaque branche PRISE, sans condition (0 = desarme).
+
+        Hypothese concurrente de `set_branch_flush_keep` : voir `branch_taken_extra`
+        dans machine.hpp. Ne pas armer les deux ensemble.
+        """
+        if not hasattr(self._lib, "ngpc_set_branch_taken_extra"):
+            raise RuntimeError(
+                "this core has no ngpc_set_branch_taken_extra -- rebuild cpp/build")
+        self._lib.ngpc_set_branch_taken_extra(self._h, int(cycles))
+
+    def set_branch_flush_keep(self, cycles: int) -> None:
+        """Credit d'avance qui SURVIT a une branche prise, en cycles (0 = vidage total).
+
+        N'a d'effet que si `set_branch_flush(True)`. Voir `branch_flush_keep` dans
+        machine.hpp : le silicium (ROM v13) tombe entre les deux reglages extremes.
+        """
+        if not hasattr(self._lib, "ngpc_set_branch_flush_keep"):
+            raise RuntimeError(
+                "this core has no ngpc_set_branch_flush_keep -- rebuild cpp/build")
+        self._lib.ngpc_set_branch_flush_keep(self._h, int(cycles))
 
     def set_branch_flush(self, on: bool) -> None:
         """EXPERIMENT: a taken branch empties the 4-byte instruction queue."""

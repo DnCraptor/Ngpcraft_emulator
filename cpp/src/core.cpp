@@ -694,6 +694,14 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                     && note_watchdog(*m, s, pc_before)) { wd_stop = true; break; }
                 if (m->irq_pending && deliver_irq(*m)) {
                     ++s.irq_deliveries;
+                    /* Les memes gardes que l'autre point de livraison : le trafic de
+                     * l'entree est deja dans les 18 etats documentes, et le laisser
+                     * s'accumuler le ferait payer par la premiere instruction du
+                     * gestionnaire. ⛔ Ce site-la n'en avait AUCUNE -- deux chemins qui
+                     * livrent la meme interruption doivent la livrer pareil. */
+                    m->access_wait = 0;
+                    m->data_wait_cycles = 0;
+                    m->biu_debt = 0;
                     woke = true;
                     break;
                 }
@@ -749,12 +757,9 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
          *
          * The else branch is the pre-2026-08-21 behaviour, kept because
          * `NGPCRAFT_TIMING=legacy` and `cart_wait=0` (a fresh Machine) both need it. */
-        if (m->fetch_pipelined && m->flush_queue_on_branch &&
-            m->cpu.pc != ((pc_before + rec->raw_len) & ngpc::kAddrMask)) {
-            /* The PC did not fall through: the queue held the wrong bytes and is
-             * discarded, so whatever run-ahead the BIU had built up is lost. */
-            m->biu_debt = 0;
-        }
+        /* Le PC n'est pas tombe en sequence : le transfert de controle a ete PRIS. */
+        const bool branch_taken =
+            m->cpu.pc != ((pc_before + rec->raw_len) & ngpc::kAddrMask);
         if (m->access_wait_q4) {
             /* Quarts -> cycles entiers, la retenue passant a l'instruction suivante :
              * c'est ce report qui rend un cout moyen fractionnaire possible sur une boucle. */
@@ -763,18 +768,90 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
             m->fetch_wait_carry = total % 4u;
             m->access_wait_q4 = 0;
         }
-        if (m->fetch_pipelined) {
+        if (m->fetch_pipelined && m->queue_bytes && m->fetch_wait_byte_q16) {
+            /* ===== LA FILE, EN OCTETS. Voir `queue_bytes` dans machine.hpp. =====
+             * Trois pas, et aucun parametre libre : ce qui manque cale le processeur,
+             * l'instruction consomme ses octets, puis le bus recharge pendant qu'elle
+             * s'execute -- sans jamais depasser 4 octets ni un octet par 4 cycles. */
+            const int32_t base = int32_t(rec->cycles) *
+                (m->cycles_already_measured ? 1 : int32_t(m->base_scale));
+            /* Le prix de l'octet est celui de la REGION d'ou l'instruction a ete lue
+             * (cartouche ou BIOS) -- meme file, meme bus, tarif propre a chacun. */
+            const int32_t bc16 = m->fetch_bc16 ? m->fetch_bc16
+                                               : int32_t(m->fetch_wait_byte_q16);
+            const int32_t cap16 = int32_t(m->queue_bytes) * 16;
+
+            int32_t stall = 0;
+            m->dbg_q_in = m->q_sixteenths;
+            m->dbg_q_bytes = m->fetch_bytes;
+            const int32_t need16 = int32_t(m->fetch_bytes) * 16 - m->q_sixteenths;
+            if (need16 > 0) {
+                stall = (need16 * bc16 + 128) / 256;   /* octets manquants x cout */
+                m->q_sixteenths = 0;
+            } else {
+                m->q_sixteenths = -need16;
+            }
+            /* Le bus recharge pendant l'execution : e / cout_octet octets. */
+            if (bc16 > 0) m->q_sixteenths += (base * 256) / bc16;
+            if (m->q_sixteenths > cap16) m->q_sixteenths = cap16;
+            /* Un transfert bloc tient le bus tout du long : rien n'a ete prefetche
+             * derriere lui, il laisse la file VIDE (mesure : Bomberman, 4120 cy). */
+            if (m->block_drains_queue && m->block_transfer_ran) m->q_sixteenths = 0;
+            /* Un transfert de controle pris jette ce que la file contenait. */
+            if (m->flush_queue_on_branch && branch_taken) m->q_sixteenths = 0;
+
+            m->dbg_stall = uint32_t(stall);
+            m->dbg_aw = m->access_wait;
+            m->fetch_bytes = 0;
+            m->fetch_bc16 = 0;
+            rec->cycles = uint16_t(base + stall + m->access_wait);
+        } else if (m->fetch_pipelined) {
             /* The BIU works through `access_wait` while the CPU works through the
              * instruction's own cycles; only the shortfall stalls the CPU. */
             const int32_t base = int32_t(rec->cycles) *
                 (m->cycles_already_measured ? 1 : int32_t(m->base_scale));
+            m->dbg_debt_in = m->biu_debt; m->dbg_aw = m->access_wait;
             m->biu_debt += int32_t(m->access_wait) - base;
             int32_t stall = 0;
             if (m->biu_debt > 0) { stall = m->biu_debt; m->biu_debt = 0; }
+            m->dbg_stall = uint32_t(stall);
             const int32_t slack =
                 (m->biu_slack_follows_region && pc_before >= 0xFF0000u)
                     ? int32_t(2u * m->bios_wait) : m->biu_slack;
             if (m->biu_debt < -slack) m->biu_debt = -slack;
+            /* ⛔⛔ ET LE VIDAGE DE FILE SE FAIT **APRES** CETTE COMPTABILITE, PAS AVANT.
+             *
+             * Il etait applique avant : il jetait donc l'avance que la branche AVAIT en
+             * entrant, jamais celle qu'elle CREE en s'executant. Or c'est la seconde qui
+             * est fausse -- un `ret` du stub BIOS, qui ne fetche pas un octet de la
+             * cartouche, se terminait avec 16 cycles d'avance que le gestionnaire en
+             * cartouche depensait ensuite : ses deux premieres charges coutaient 10 et 14
+             * cycles au lieu de 20. C'est exactement pourquoi le corpus etait « insensible
+             * a ce reglage » -- le bouton ne pouvait rien changer.
+             *
+             * Mesure : une charge dans un ISR coute 20,29 cy sur console (v18 page 1) ;
+             * nous en donnions 18,68. Le PC n'est pas tombe en sequence, donc la file
+             * contient les mauvais octets et l'avance de l'unite de bus est perdue.
+             *
+             * ⚖️ MAIS PAS TOUTE. `branch_flush_keep` est le credit qui SURVIT a la
+             * redirection, en cycles ; 0 = tout est jete. La file fait 4 octets, soit DEUX
+             * mots : la redirection ne peut pas invalider les deux de la meme facon, le
+             * mot deja engage sur le bus se termine. Le nombre vient de la ROM v13. */
+            if (m->flush_queue_on_branch && branch_taken) {
+                const int32_t keep = int32_t(m->branch_flush_keep);
+                if (m->biu_debt < -keep) m->biu_debt = -keep;
+            }
+            /* ⚡ ET UN CHANGEMENT DE REGION JETTE TOUT, branche ou pas de bouton.
+             * Voir `flush_on_region_change` : l'avance batie en lisant une region ne se
+             * depense pas dans une autre -- le bus n'a jamais touche ces octets-la. */
+            if (m->flush_on_region_change && branch_taken) {
+                const bool src_cart = (pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+                                      (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu);
+                const uint32_t npc = m->cpu.pc & ngpc::kAddrMask;
+                const bool dst_cart = (npc >= 0x200000u && npc <= 0x3FFFFFu) ||
+                                      (npc >= 0x800000u && npc <= 0x9FFFFFu);
+                if (src_cart != dst_cart && m->biu_debt < 0) m->biu_debt = 0;
+            }
             /* A block transfer owned the bus for its whole run: nothing was prefetched
              * behind it, so it leaves the queue EMPTY rather than a queue ahead. */
             if (m->block_drains_queue && m->block_transfer_ran) m->biu_debt = 0;
@@ -784,9 +861,59 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
                 rec->cycles * (m->cycles_already_measured ? 1u : m->base_scale)
                 + m->access_wait);
         }
+        /* Surcharge inconditionnelle d'un transfert de controle PRIS -- l'hypothese
+         * concurrente du credit de file : le surcout mesure ne dependrait pas de
+         * l'avance accumulee, il serait paye a chaque branche prise. Les deux
+         * reproduisent la ROM v13 ; seul le reste du corpus les separe. Defaut 0. */
+        /* ⛔ SEULEMENT SUR DU CODE CARTOUCHE. Cette surcharge represente le cout de
+         * RECHARGEMENT de la file sur le bus 8 bits de la cartouche -- elle a ete
+         * mesuree la (v14 rotation C). Le BIOS et la RAM ne sont pas sur ce bus et leur
+         * fetch est facture zero ici : leur faire payer un rechargement qu'ils ne
+         * subissent pas surfacture tout le code du BIOS, et donc chaque interruption,
+         * qui passe par son aiguillage.
+         * Mesure : ROM v18, cout FIXE d'une IRQ -- silicium 111,1 cy, nous 135,6 avant
+         * cette condition. */
+        /* ⛔ SAUF SUR UN `reti` QUAND L'INTERRUPTION EST TRANSPARENTE. Cette surcharge
+         * represente le RECHARGEMENT de la file sur le bus 8 bits de la cartouche. Or si
+         * l'interruption rend au flot interrompu l'etat de bus qu'il avait
+         * (`irq_transparent_queue`), le `reti` ne recharge rien : la file est rendue, pas
+         * refaite. La facturer ici contredirait la transparence qu'on vient d'adopter --
+         * et c'est exactement les 4 cy qui separaient notre chemin (114) des 110 de
+         * l'annexe B, pour 111,5 mesures au silicium. */
+        const bool reti_here = (rec->raw_len == 1 && rec->raw[0] == 0x07);
+        if (m->branch_taken_extra && branch_taken &&
+            !(m->irq_transparent_queue && reti_here && m->irq_save_depth) &&
+            ((pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+             (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu)))
+            rec->cycles = uint16_t(rec->cycles + m->branch_taken_extra);
+
+        /* Le temps d'acces aux donnees s'ajoute SANS passer par le recouvrement du
+         * prefetch : voir `data_wait_cycles` dans machine.hpp. */
+        if (m->data_wait_cycles) {
+            /* ⛔ EN CARTOUCHE SEULEMENT quand `data_wait_cart_only` est arme : voir le
+             * champ dans machine.hpp -- deux mesures silicium separent les deux cas par
+             * la region du CODE, pas par celle des donnees. */
+            if (!m->data_wait_cart_only ||
+                ((pc_before >= 0x200000u && pc_before <= 0x3FFFFFu) ||
+                 (pc_before >= 0x800000u && pc_before <= 0x9FFFFFu)))
+                rec->cycles = uint16_t(rec->cycles + m->data_wait_cycles);
+            m->data_wait_cycles = 0;
+        }
+
+        /* ⚡ LE `reti` REND AU FLOT INTERROMPU L'ETAT DE BUS QU'IL AVAIT. Voir
+         * `irq_transparent_queue` : sans ca, les cycles de l'ISR lui rechargent sa file
+         * et l'interruption le rend MOINS CHER, ce que le silicium refute (ROM v19). */
+        if (m->irq_transparent_queue && m->irq_save_depth && reti_here) {
+            --m->irq_save_depth;
+            m->q_sixteenths = m->irq_q_save[m->irq_save_depth];
+            m->biu_debt = m->irq_debt_save[m->irq_save_depth];
+        }
+
         m->cycles_already_measured = false;
         m->block_transfer_ran = false;
         m->access_wait = 0;
+        m->fetch_bytes = 0;
+        m->fetch_bc16 = 0;
         m->fetch_window = 0xFFFFFFFFu;   // next step re-arms it before its own fetch
 
         s.total_cycles += rec->cycles;
@@ -820,7 +947,49 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
              * avait prise est perdue. La garder decale le timing APRES chaque ISR, et un
              * split raster ne vit que de ca -- il ne demande pas « plus vite », il demande
              * de tomber au bon endroit. */
-            m->biu_debt = 0;
+            {
+                const int32_t keep = int32_t(m->irq_flush_keep);
+                if (m->biu_debt < -keep) m->biu_debt = -keep;
+            }
+            /* ⛔ ET LA MEME CHOSE POUR LE MODELE EN OCTETS. Le commentaire ci-dessus dit
+             * « une interruption vide la file » ; il ne le faisait que pour le credit en
+             * cycles. Un modele qui contredit le mecanisme que son propre commentaire
+             * decrit est faux, quel que soit ce que ca donne sur le corpus. */
+            if (m->irq_transparent_queue && m->irq_save_depth < 8) {
+                m->irq_q_save[m->irq_save_depth] = m->q_sixteenths;
+                m->irq_debt_save[m->irq_save_depth] = m->biu_debt;
+                ++m->irq_save_depth;
+            }
+            m->q_sixteenths = m->irq_queue_keep_q16;
+            m->fetch_bytes = 0;
+            m->fetch_bc16 = 0;
+            /* ⛔ ET LES EMPILEMENTS DE L'ENTREE NE SE FACTURENT PAS DEUX FOIS. Les quatre
+             * valeurs de Toshiba pour l'acceptation d'une interruption -- 28 / 24 / 22 /
+             * 18 etats -- sont indexees sur LA LARGEUR DE BUS DE LA ZONE DE PILE. Elles
+             * contiennent donc deja le prix des ecritures de PC et SR. `deliver_irq` passe
+             * par `store`, qui accumule `data_access_cycles` ; laisser cette accumulation
+             * la ferait payer une seconde fois, sur le dos de l'instruction suivante.
+             * Mesure : la ROM v8 (WORK1) est passee de -1,8 % a -6,4 % le jour ou le cout
+             * d'acces a ete arme, alors que l'entree elle-meme est deja au MINIMUM des
+             * quatre valeurs documentees et ne peut pas descendre. */
+            m->data_wait_cycles = 0;
+            /* ⛔⛔ ET `access_wait` -- C'ETAIT LE BUG, ET IL ETAIT VISIBLE A L'INSTRUCTION.
+             * `access_wait` est remis a zero a la FIN d'un pas d'instruction ; la
+             * livraison d'interruption se fait APRES. Or `deliver_irq` LIT LE VECTEUR,
+             * quatre octets en BIOS, soit deux mots a `bios_wait` = **16 cycles** qui
+             * s'accumulaient alors dans un `access_wait` que plus personne ne remettait a
+             * zero -- et qui retombaient sur la PREMIERE instruction du gestionnaire.
+             *
+             * ⚡ MESURE : les deux `push` du stub d'aiguillage du BIOS,
+             *     FF22A5  push (0x6FD6)   cy=40   access_wait=32   stall=16
+             *     FF22A9  push (0x6FD4)   cy=24   access_wait=16   stall=0
+             * instructions IDENTIQUES a l'adresse pres, memes acces, et deux charges
+             * `bios_wait` chacune (compteur `ngpc_dbg_bios_charges`). Les 16 de plus de
+             * la premiere ne venaient donc pas d'elle : ils venaient de l'entree.
+             *
+             * Et comme les empilements ci-dessous, ce trafic est deja dans les 18 etats
+             * documentes de l'acceptation : le facturer, c'est le compter deux fois. */
+            m->access_wait = 0;
             s.total_cycles += irq_cost;
             m->total_cycles += irq_cost;
             /* The cycles of an interrupt entry are cycles LIKE ANY OTHERS:
@@ -1534,6 +1703,120 @@ NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bi
     m->access_wait_q4     = 0;
     m->fetch_wait_carry   = 0;
     m->fetch_wait_per_word = true;
+    /* ⚡ FETCH FACTURE PAR OCTET, ET C'EST LA FORME QUI COMPTE AUTANT QUE LA VALEUR.
+     * Le bus cartouche est 8 bits : le prix d'un fetch suit les OCTETS. Facturer par
+     * MOT rendait le cout d'une instruction dependant de sa PARITE -- 5 octets payaient
+     * 3 charges en partant d'une adresse paire, 2 en partant d'une impaire -- et c'est
+     * ce qui rendait le modele sensible a l'adresse la ou le silicium ne l'est pas
+     * (ROM v12 : 682/682/683/682 sur console, 715/733/732/732 chez nous).
+     * Valeur mesuree DIRECTEMENT par la ROM v14 page 1 : 4,03 cy/octet sur une droite
+     * qui ferme a 0,35 %. 64 seiziemes = 4,00, ce que la structure predit aussi
+     * (2 cycles de bus x 2 etats x 2 cycles = 8,00 cy/mot). */
+    m->fetch_wait_byte_q16 = 64;
+    /* Surcharge d'une branche PRISE, en cycles. Mesuree sur la rotation C de la v14
+     * page 0 -- branche prise file VIDE, donc sans part conditionnelle : silicium
+     * 16,3 cy/branche contre 11,3 chez nous. Le corpus des 26 cases confirme
+     * l'optimum a 4 (ecart moyen 1,30 %, contre 2,01 % a 5 et 2,74 % a 6).
+     * ⛔ Le fetch par octet SEUL degrade le corpus (7,13 %) : les 8,25 cy/mot d'avant
+     * sur-facturaient le bus pour compenser cette branche non facturee. Les deux
+     * corrections vont ENSEMBLE ou pas du tout. */
+    m->branch_taken_extra = 4;
+    /* Cout FIXE d'un acces memoire de donnee. Mesure par la ROM v15 (pages 1 et 2) :
+     * ~4,05 cy par ACCES, identique en lecture et en ecriture, et INDEPENDANT de la
+     * largeur -- une lecture d'un octet et une de deux coutent le meme prix sur console
+     * (215 contre 216 comptes). ⛔ Une premiere version facturait par OCTET, calee sur la
+     * seule largeur que la v14 avait mesuree : la v15 l'a refutee en une ligne. C'etait
+     * la derniere case du corpus qui restait a plus de 6 % (`MEM`). */
+    m->data_access_cycles = 4;
+    /* ⚡ ET CE COUT NE SE PAIE QUE DANS DU CODE CARTOUCHE (ROM v19, tir silicium).
+     *
+     * Deux mesures se contredisaient sous une regle uniforme : la boucle `MEM` du corpus
+     * EXIGE ces 4 cy (silicium 65,3 cy/tour ; nous 62 sans, 66 avec) et le chemin d'une
+     * interruption les REFUSE (silicium 111,5 ; annexe B 110 ; nous 130 avec, 114 sans).
+     * Les deux ecrivent en RAM : ce n'est donc pas la region des DONNEES qui les separe,
+     * c'est celle du CODE -- `MEM` est en cartouche, le stub d'interruption est en BIOS.
+     *
+     * ⚖️ Et c'est un MECANISME : si ce cout est une contention -- l'acces de donnee vole
+     * un cycle de bus au prefetch -- il ne mord que la ou le fetch est cher, le bus
+     * 8 bits de la cartouche. Meme regle, meme raison que `branch_taken_extra`.
+     * Corpus : 0,40 % -> 0,32 % ; chemin d'IRQ 130 -> 114 pour 111,5 mesures. */
+    m->data_wait_cart_only = true;
+    /* ⚡ ET UNE INTERRUPTION EST TRANSPARENTE POUR L'ETAT DE BUS DU FLOT INTERROMPU.
+     *
+     * ⛔ Sans ca, les cycles de l'ISR RECHARGENT la file du code interrompu : une
+     * interruption le rendait MOINS CHER (-0,574 cy/instruction), soit ~17 cy de
+     * ristourne par interruption -- qui compensaient exactement la sur-facturation
+     * ci-dessus. Deux erreurs de signes opposes : c'est pour ca qu'aucun balayage a un
+     * bouton n'a jamais converge en deux campagnes.
+     *
+     * ⚡ LE SILICIUM LE TRANCHE (ROM v19) : le cout d'une interruption est PLAT selon que
+     * la boucle interrompue soit limitee par le bus ou par l'execution -- 112,6 / 112,0 /
+     * 110,7 / 110,5, contraste **+1,5**, quand nos modeles predisaient +18,0 et +11,6.
+     * Arme, notre contraste tombe a **-1,2**. */
+    m->irq_transparent_queue = true;
+    /* ⚡ ET UN TRANSFERT DE CONTROLE PRIS QUI CHANGE DE REGION JETTE L'AVANCE.
+     *
+     * Le `ret` du stub BIOS finissait avec 16 cycles d'avance -- batie en lisant des
+     * octets de BIOS -- que les deux premieres charges du gestionnaire en CARTOUCHE
+     * depensaient : 10 et 14 cycles au lieu de 20. Le bus n'a jamais touche ces
+     * octets-la ; il ne connaissait meme pas l'adresse du gestionnaire.
+     *
+     * ⚖️ ET PAS `flush_queue_on_branch` TOUT COURT : une branche qui reste dans la meme
+     * region garde legitimement une part de son avance (v14, `branch_flush_keep` ~13-14),
+     * et vider a chaque branche casse le corpus (0,31 % -> 2,85 %). Conditionne au
+     * CHANGEMENT de region, le corpus ne bouge pas d'un centieme (0,31 % / 1,89 %)
+     * pendant qu'une charge dans un ISR passe de 18,00 a 19,25 cy mesures, pour 20,29
+     * sur console (v18 page 1), et la pente derivee de 18,68 a 19,62. */
+    m->flush_on_region_change = true;
+    /* ⚡ L'ÉTRANGLEMENT VRAM DU K2GE, ENFIN CHIFFRÉ (ROM v3, tir silicium).
+     *
+     * Il etait livre a 0 depuis 2026-07 avec la mention « effet confirme, cout non
+     * epingle -- on ne livre pas un chiffre invente ». Le tir existait pourtant :
+     * VWR **452** contre MEM **471**. A 0 nous rendions VWR = **503**, soit +11 % -- et
+     * pire, une ecriture VRAM y coutait MOINS qu'une ecriture RAM (elle est exclue de
+     * `charge_data_access`). A 9 cycles par octet en affichage actif : VWR = **452**,
+     * au compte pres, MEM inchange a 471. Balayage monotone, valeur unique.
+     *
+     * ⛔ NE SE PAIE PAS PENDANT UN TRANSFERT BLOC -- voir `in_block_copy`. `ldirw_cost`
+     * = 18 a ete mesure contre le copieur HiColor de Bomberman, qui ecrit justement en
+     * VRAM, avec une fenetre d'UN cycle : ce cout contient deja l'etranglement. Sans
+     * cette garde, `test_bomberman_hicolor_phase` tombe -- le copieur derive de sa
+     * tranche de 4120 cycles et corrompt une ligne par bande. */
+    /* ⚡ ET IL SE PAIE PAR ACCES, PAS PAR OCTET (ROM v20 page 3, tir silicium) : une
+     * ecriture MOT en VRAM coute **2,95 cy** de plus qu'en RAM, et une ecriture OCTET
+     * **2,95** aussi -- rapport **1,00**. Meme refutation que `data_wait_q16` par la v15.
+     * ⚖️ La v3 ne pouvait pas trancher : elle n'ecrit que des OCTETS, ou les deux formes
+     * coincident. C'est la double difference de la v20 (les memes ecritures refaites en
+     * RAM) qui separe l'etranglement du cout propre de l'instruction.
+     * Valeur : 10 equilibre les DEUX tirs (v3 VWR -0,9 %, v20 V8B +1,3 %) la ou 9 collait
+     * a la v3 (0,0 %) mais laissait la v20 a +3,9 %. */
+    m->vram_wait          = 10;
+    /* La file d'instructions, MODELISEE EN OCTETS -- 4, la taille documentee. Elle
+     * remplace le credit d'avance en cycles (`biu_slack`), qui etait UN scalaire pour
+     * trois regimes et que trois mesures tiraient dans trois directions. Le modele en
+     * octets n'a aucun parametre libre et rend 26,6 cy/division sur le montage v16
+     * page 0, contre 26,5 mesures sur console (le credit en cycles rendait 16,0). */
+    /* ⚡ LA FILE, MODELISEE EN OCTETS -- 4, la taille documentee. Elle remplace le
+     * credit d'avance en CYCLES (`biu_slack`), qui etait UN scalaire pour trois regimes
+     * et que trois mesures tiraient dans trois directions incompatibles.
+     *
+     * Le modele n'a AUCUN parametre libre : la file fait 4 octets, le bus en livre un
+     * tous les 4 cycles, et c'est tout. Sur le montage v16 page 0 il rend 26,6
+     * cy/division contre **26,5 mesures** ; le credit en cycles rendait 16,0.
+     *
+     * ⛔ IL NE S'ARME PAS SEUL. Arme au-dessus des couts MOT de `mul`/`div` herites du
+     * fetch a 10 cy/mot, il laissait MUL a -9 %, DIV a -6 % et cassait l'ancrage
+     * Bomberman -- ce qui ressemblait a une refutation du modele alors que c'etaient les
+     * deux constantes qui etaient fausses. La ROM v17 les a mesurees (47 et 15).
+     *
+     * ⛔ ET MEME AVEC ELLES, IL RESTE DESARME (0). Avec le triplet complet le corpus
+     * tombe a 1,5 % et MUL/DIV rentrent (+2 %), mais TOUTES les cases restent a -1 a
+     * -2,3 % : la machine entiere est ~1,5 % trop lente, et ca suffit a decaler la
+     * phase du copieur de Bomberman (dont la marge est d'UNE ligne) et a casser le HUD
+     * de Cool Boarders. Il manque encore une piece que le modele ne facture pas.
+     * ⇒ Ne PAS armer avant que ce biais uniforme soit explique -- pas compense, explique.
+     *   `ngpc_set_queue_bytes(4)` l'arme pour la mesure. */
+    m->queue_bytes        = 0;
     m->fetch_pipelined    = true;
     m->biu_debt           = 0;
     /* ⚠️ LA MARGE SUIT LE COUT REEL DU MOT, PAS LE PARAMETRE ENTIER. La file fait
@@ -1556,7 +1839,26 @@ NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bi
      * et le fond de KOF R-2 glitchaient en jeu, observes manette en main. Aucun banc ne
      * l'a vu -- le corpus ne regarde que des ecrans d'intro. */
     m->ldir_cost          = 14;
-    m->ldirw_cost         = 18;
+    /* ⚠️ 18, ET LE SILICIUM DIT 14 -- CONFLIT OUVERT, PAS UN OUBLI (ROM v20 page 0).
+     * Un `ldirw` RAM->RAM coute **14,16 cy/iteration** sur console, exactement comme un
+     * `ldirb` (14,12) et exactement l'annexe B (3), `7n+1` etats. Mais le copieur
+     * HiColor de Bomberman -- qui ecrit en **VRAM** -- exige 18 : a 14 il tourne 21 %
+     * trop vite (6476 cycles pour deux blocs contre 8240 mesures sur console).
+     * ⛔ Et l'hypothese evidente est REFUTEE : « 18 = 14 + l'etranglement VRAM » ne tient
+     * pas. Arme (`block_pays_vram`), le throttle ne change **rien** au copieur -- il
+     * passe par `access_wait`, donc il est integralement absorbe par le recouvrement,
+     * le cout de base d'un bloc etant enorme. Et meme non absorbe il vaut 2,9, pas 4.
+     * ⇒ La difference RAM/VRAM sur un transfert bloc est REELLE et n'est pas encore
+     * expliquee. On garde 18 : il tient l'ancrage jouable, et 14 casse une image. */
+    /* ⚡ 14, ET NON 18 (ROM v21, tir silicium). Le meme `ldirw` coute **14,04**
+     * cy/iteration en RAM -> RAM -- l'annexe B (3) au centieme -- et **18,16** en
+     * ROM -> RAM. Ce n'est donc pas l'instruction qui vaut 18 : c'est 14 plus le prix de
+     * lire sa SOURCE sur le bus 8 bits de la cartouche. Voir
+     * `block_cart_src_per_byte`. La destination, elle, ne coute rien (RAM -> VRAM :
+     * 14,12). Notre 18 uniforme etait 29 % trop cher sur toute copie RAM -> RAM ou
+     * RAM -> VRAM -- la plupart de celles que font les jeux. */
+    m->ldirw_cost         = 14;
+    m->block_cart_src_per_byte = 2;   /* +4 par iteration MOT : v21, +4,12 mesures */
     /* ⚡ ET LA FILE D'INSTRUCTIONS NE PREND AUCUNE AVANCE PENDANT UNE COPIE DE BLOC.
      *
      * Une copie repetee tient le bus pendant toute sa duree -- lecture et ecriture a
@@ -1601,6 +1903,10 @@ NGPC_API void ngpc_set_timing_silicon(ngpc_t* h, uint32_t word_wait, uint32_t bi
      * which is the same discipline that the eight-setters-in-three-places bugs cost a
      * day to learn. Anything added below must be cleared here too. */
     m->flush_queue_on_branch = false;
+    m->data_wait_cycles = 0;
+    m->q_sixteenths = 0;
+    m->fetch_bytes = 0;
+    m->fetch_bc16 = 0;
     m->biu_slack_follows_region = false;
     m->relay_gates_on_rts    = false;
     m->rx_blocked_by_tx      = false;
@@ -1666,6 +1972,112 @@ NGPC_API void ngpc_set_block_drains_queue(ngpc_t* h, int on) {
 NGPC_API void ngpc_set_branch_flush(ngpc_t* h, int on) {
     if (!h) return;
     reinterpret_cast<Machine*>(h)->flush_queue_on_branch = on != 0;
+}
+
+NGPC_API void ngpc_set_branch_flush_keep(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->branch_flush_keep = cycles;
+}
+
+NGPC_API void ngpc_set_branch_taken_extra(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->branch_taken_extra = cycles;
+}
+
+NGPC_API void ngpc_set_fetch_wait_byte_q16(ngpc_t* h, uint32_t sixteenths) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->fetch_wait_byte_q16 = sixteenths;
+}
+
+NGPC_API void ngpc_set_data_access_cycles(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->data_access_cycles = cycles;
+}
+
+NGPC_API void ngpc_dbg_biu(ngpc_t* h, int32_t* debt_in, uint32_t* stall, uint32_t* aw) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    if (debt_in) *debt_in = m->dbg_debt_in;
+    if (stall)   *stall   = m->dbg_stall;
+    if (aw)      *aw      = m->dbg_aw;
+}
+
+NGPC_API void ngpc_dbg_queue(ngpc_t* h, int32_t* q_in, uint32_t* bytes,
+                             uint32_t* stall, uint32_t* aw) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    if (q_in)  *q_in  = m->dbg_q_in;
+    if (bytes) *bytes = m->dbg_q_bytes;
+    if (stall) *stall = m->dbg_stall;
+    if (aw)    *aw    = m->dbg_aw;
+}
+
+NGPC_API uint32_t ngpc_dbg_bios_charges(ngpc_t* h) {
+    if (!h) return 0;
+    auto* m = reinterpret_cast<Machine*>(h);
+    const uint32_t v = m->dbg_bios_charges;
+    m->dbg_bios_charges = 0;
+    return v;
+}
+
+NGPC_API void ngpc_set_irq_flush_keep(ngpc_t* h, uint32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_flush_keep = cycles;
+}
+
+NGPC_API void ngpc_set_biu_slack(ngpc_t* h, int32_t cycles) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->biu_slack = cycles;
+}
+
+NGPC_API void ngpc_set_flush_on_region_change(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->flush_on_region_change = (on != 0);
+}
+
+NGPC_API void ngpc_set_irq_transparent_queue(ngpc_t* h, int on) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->irq_transparent_queue = (on != 0);
+    m->irq_save_depth = 0;
+}
+
+NGPC_API void ngpc_set_block_pays_vram(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->block_pays_vram = (on != 0);
+}
+
+NGPC_API void ngpc_set_data_wait_cart_only(ngpc_t* h, int on) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->data_wait_cart_only = (on != 0);
+}
+
+NGPC_API void ngpc_set_irq_queue_keep_q16(ngpc_t* h, int32_t q16) {
+    if (!h) return;
+    reinterpret_cast<Machine*>(h)->irq_queue_keep_q16 = q16;
+}
+
+NGPC_API void ngpc_set_queue_bytes(ngpc_t* h, uint32_t bytes) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->queue_bytes = bytes;
+    m->q_sixteenths = 0;
+    m->fetch_bytes = 0;
+    m->fetch_bc16 = 0;
+}
+
+NGPC_API void ngpc_set_muldiv_word(ngpc_t* h, uint32_t mul_states, uint32_t div_cycles) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->mul_word_states = mul_states;
+    m->div_word_cycles = div_cycles;
+}
+
+NGPC_API void ngpc_set_muldiv_byte(ngpc_t* h, uint32_t mul_states, uint32_t div_cycles) {
+    if (!h) return;
+    auto* m = reinterpret_cast<Machine*>(h);
+    m->mul_byte_states = mul_states;
+    m->div_byte_cycles = div_cycles;
 }
 
 NGPC_API void ngpc_set_rx_double(ngpc_t* h, int on) {
@@ -1898,10 +2310,19 @@ NGPC_API void ngpc_serial_state(ngpc_t* h, ngpc_serial_state_t* out) {
     /* 0xB1 as the GAME sees it, not as it sits in the I/O page. read8 forces the
      * sub-battery bit and drives bit2 -- the cable-DETECT line Card Fighters'
      * Clash gates its handshake on -- from the cable state, so dumping the raw
-     * byte here would report "no cable" on a working one. Mirrors machine.hpp. */
+     * byte here would report "no cable" on a working one.
+     *
+     * ⛔ AND IT MUST BE THE SAME RULE READ8 USES. This stayed on the OLD model
+     * (bit2 from serial_link_enabled alone) after read8 moved to the peer's RTS,
+     * so the debugger's Link tab reported `port_b1 = 0x02`, "cable detected", on
+     * an online session where the CPU was reading 0x06, "no peer" -- the exact
+     * fault that was being looked for, hidden by the instrument sent to look for
+     * it. Measured with tools/link_online_probe.py. Mirrors machine.hpp read8;
+     * change the two together. */
     out->port_b1         = uint32_t(uint8_t(
-        m.serial_link_enabled ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
-                              :  (m.mem[0x0000B1] | 0x02 | 0x04)));
+        (m.serial_link_enabled && m.serial_cts_seen && !m.serial_cts_high)
+            ? ((m.mem[0x0000B1] | 0x02) & ~0x04)
+            :  (m.mem[0x0000B1] | 0x02 | 0x04)));
     out->port_b2         = m.mem[0x0000B2];
 }
 
@@ -2170,6 +2591,7 @@ NGPC_API void ngpc_get_link_state(ngpc_t* h, ngpc_link_state_t* out) {
     out->tx_shifting  = m->serial_tx_shifting ? 1 : 0;
     out->tx_byte      = m->serial_tx_byte;
     out->cts_high     = m->serial_cts_high ? 1 : 0;
+    out->cts_seen     = m->serial_cts_seen ? 1 : 0;   /* see the header: the detect line */
     out->rx_pending   = m->serial_rx_pending ? 1 : 0;
     out->rx_byte      = m->serial_rx_byte;
     out->tx_cycles    = m->serial_tx_cycles;
@@ -2215,6 +2637,7 @@ NGPC_API int ngpc_set_link_state(ngpc_t* h, const ngpc_link_state_t* in) {
     m->serial_tx_shifting  = in->tx_shifting != 0;
     m->serial_tx_byte      = in->tx_byte;
     m->serial_cts_high     = in->cts_high != 0;
+    m->serial_cts_seen     = in->cts_seen != 0;
     m->serial_rx_pending   = in->rx_pending != 0;
     m->serial_tx_buf_full    = in->tx_buf_full != 0;
     m->serial_tx_buf_byte    = in->tx_buf_byte;

@@ -177,6 +177,7 @@ so games run, save and link out of the box.
 | 2-player link cable | ✅ real ring driver, same byte rate | ✅ |
 | Clock / RTC / alarm | ✅ incl. *Set by hand* | ✅ + the BIOS setup screen |
 | Library covers | ✅ | ✅ |
+| System font (SYSFONTSET) | ✅ ours, corrected 30/08 — it was unreadable before | ✅ the console's own |
 | NEO·GEO POCKET intro, setup screens | ❌ deliberately skipped | ✅ |
 | Console settings kept in the coin cell | via the emulator's settings | ✅ its own screens |
 | A game that reads BIOS work RAM directly | ⚠️ sees ours, not SNK's | ✅ |
@@ -697,11 +698,43 @@ numbers are in [`hw_calibration/`](hw_calibration/README.md).
 
 | Knob | Ships as | Where it comes from |
 |---|---|---|
-| `cart_wait` — cycles per **instruction-fetch** byte off the cart | **3** | `cpu_calib_v1` on hardware: fetch-bound classes came back ~3.4× slower than this core, execution-bound ones ~2.5×, raster exact — the signature of a per-fetch-byte cost |
-| `cart_data_wait` — cycles per **data** byte read off the cart | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). Only fetch is wait-stated. An earlier guess of **5** was curve-fit to a frame rate and this ROM **refuted** it |
-| `ldir_cost` — cycles per iteration of the **byte** `LDIR`/`LDDR` | **14** | The datasheet says 7, but its MUL/DIV figures already proved to be floors. 14 puts Cool Boarders at its hardware 30 fps and leaves Fatal Fury at 60 — one fix, both games. Strongly evidenced, not yet pinned by a clean ROM |
-| `ldirw_cost` — cycles per iteration of the **word** `LDIRW`/`LDDRW` | **18** | A different instruction, and the loop is billed per *iteration*: a word iteration moves **two** bytes, so reusing 14 sold a word copy at half price. Measured on Bomberman's HiColor title screen, whose open-loop raster copier must spend exactly 8 scanlines per block — at 14 a block came to 0.793× and the picture sheared, at 18 the frame is pixel-identical to the same ROM's self-synchronising path, and 19 breaks it again. `0` means "follow `ldir_cost`" |
-| `vram_wait` — cycles per byte written to display RAM | **0 (off)** | The K2GE throttle is **real**: `cpu_calib_v3` on silicon gave VWR 452 < MEM 471. The cost per byte is not pinned, so nothing ships a number rather than shipping a guess |
+| `fetch_wait_byte_q16` — cost of one **instruction-fetch byte**, in sixteenths of a cycle | **64** (= 4.00 cy/byte) | `cpu_calib_v14` page 1 measured it **directly**: 4.03 cy/byte on a line closing to 0.35 %. The cart bus is **8-bit**, so a fetch is priced per byte — charging per *word* made an instruction's price depend on its **parity** (5 bytes paid 3 charges from an even address, 2 from an odd one) and was what made this core address-sensitive where silicon is not (`cpu_calib_v12`: `682/682/683/682` on hardware) |
+| `branch_taken_extra` — cycles added to a **taken** control transfer, **cart code only** | **4** | `cpu_calib_v14` page 0, rotation C (branch taken on an *empty* queue, so no flush component): silicon 16.3 cy/branch against 11.3 here. ⛔ **The cart-only condition is measured, not stylistic**: this models queue *refill on the 8-bit cart bus*. BIOS and RAM are not on that bus and their fetch is billed zero here, so charging them a refill they never pay over-billed every interrupt (which goes through the BIOS dispatch). Conditioning it cut the corpus from 0.67 % to 0.59 % |
+| `data_access_cycles` — cycles for one **data** memory access, **cart code only** | **4** | `cpu_calib_v15` pages 1-2: ~4.05 cy **per access**, identical for reads and writes, and **independent of width** — a 1-byte read and a 2-byte read cost the same (215 vs 216 counts). An earlier per-**byte** form, fitted to the single width v14 had measured, was **refuted** by this ROM. ⛔ **The cart-only condition is measured** (`data_wait_cart_only`, 2026-08-29): the corpus's `MEM` loop *requires* these 4 cy (silicon 65.3 cy/iteration, 62 without / 66 with) while the interrupt path *refuses* them (silicon 111.5, 114 without / 130 with) — and **both write to RAM**, so what separates them is the region of the **code**, not of the data. Mechanism: this is bus **contention** — the data access steals a bus cycle from the prefetch — so it can only bite where the fetch is expensive, i.e. the 8-bit cart bus. Same rule and same reason as `branch_taken_extra` |
+| `cart_data_wait` — *extra* cycles for a cart data byte, on top of the above | **0** | `cpu_calib_v2`: a random cart read and a RAM read cost the same (252 == 252). ⚠️ That proves they are **equal to each other**, never that they are free — and v15 has since priced both at 4 cy/access |
+| `mul` / `div`, **byte** form | **12 states / 32 cycles** | `cpu_calib_v14` pages 3-4, lines closing to 0.5 %. Both land just above the datasheet floor (11 and 15 states) — consistent with variable latency |
+| `mul` / `div`, **word** form | 19 states / 56 cycles | ⚠️ **No single constant can be right.** Three silicon-backed authorities give three numbers: Appendix B table (4) **14 / 23 states**, `cpu_calib_v17` (marginal slope) **17 / 52**, the corpus (loop level) **19 / 56**. That is not a contradiction — the 900/L1 divide has **variable latency**, the table is a *floor*, and the two ROMs divide **different operands**. The corpus value ships; re-deriving from v17 and arming it puts `MUL` at **+6.1 %** |
+| interrupt entry (`kIrqDeliveryCycles`) | 18 states (36 cy) | `cpu_calib_v8`, and **cleared** by v18: a `nop` inside an ISR costs 4.03 cy (same as outside), so the handler's code is billed correctly and the entry was never the suspect. Appendix B table (11) gives **18 states**, `JP (FFFF00H + vector)` included — a single value, not the 28/24/22/18 set quoted elsewhere |
+| `irq_transparent_queue` — an interrupt is **transparent** to the interrupted stream's bus state (queue/debt saved on delivery, restored on `reti`) | **on** | `cpu_calib_v19` (silicon, 2026-08-29). Without it the ISR's cycles **refill the interrupted code's queue**, so an interrupt made the interrupted code *cheaper* (−0.574 cy/instruction) — impossible, since during the ISR the bus is fetching the ISR's own bytes. ⚡ v19 measures the per-interrupt cost against how bus-bound the interrupted loop is: **112.6 / 112.0 / 110.7 / 110.5**, contrast **+1.5**, where both overlap models predicted **+18.0** and **+11.6**. Armed, our contrast is **−1.2**. ⛔ And `branch_taken_extra` is **not** charged on a transparent `reti`: it models queue *refill*, and a restored queue is not refilled |
+| `ldir_cost` / `ldirw_cost` — per iteration of the byte / word block copy | **14 / 14** | `cpu_calib_v20` and `v21` on silicon: a `ldirb` **and** a `ldirw` both cost **14,0x cy per iteration** RAM→RAM — exactly Appendix B (3), `7n + 1` **states**. ⚠️ Our long-standing **18** was not wrong, it was **mis-attributed**: fitted against Bomberman's HiColor copier, which copies **ROM → VRAM**, it carried 14 (the instruction) **+ 4** (the price of reading its source over the cart's **8-bit** bus). Applying it to every transfer made us **29 % too expensive** on any RAM→RAM or RAM→VRAM copy — most of what games do |
+| `block_cart_src_per_byte` — extra cycles per byte a block transfer reads **from the cart** | **2** | `cpu_calib_v21`, four paths of the same `ldirw`: RAM→RAM **14,04**, RAM→VRAM **14,12** (the destination costs **nothing**, +0,08), ROM→RAM **18,16**, ROM→VRAM **18,16** — the **source** carries all of it, +4,12 per word iteration, and the two effects are **additive** (+4,20 predicted). ⛔ The **byte** form's 2 cy is *derived* from the word measurement (4 ÷ 2), not measured directly |
+| `vram_wait` — cycles per **data access** to display RAM **during active display**, **block copies excluded** | **10** | `cpu_calib_v3` on silicon: **VWR 452** against **MEM 471**. Shipped at 0 until 2026-08-30, where VWR read **503** (+11.3 %) — and worse, a VRAM write cost *less* than a RAM write, since VRAM is excluded from `charge_data_access`. ⚡ **Per ACCESS, not per byte** — `cpu_calib_v20` page 3, silicon: a word write and a byte write to VRAM both cost **2,95 cy** more than the same write to RAM, ratio **1,00**. v3 could not tell (it only writes bytes, where the two forms coincide). The two shots agree on the value (2,74 and 2,95 cy/write) ⇒ **10**, which balances both (v3 −0,9 %, v20 +1,3 %). ⛔ **Not charged during a block transfer** (`in_block_copy`), and `cpu_calib_v21` says why: on a block copy the **destination costs nothing at all** — RAM→RAM 14,04 against RAM→VRAM 14,12, a difference of +0,08. The K2GE throttle is real on an isolated write and simply does not bite there. (Billing it anyway made Bomberman's HiColor copier drift off its 4120-cycle slice and corrupt one line per band; `test_bomberman_hicolor_phase` catches it.) |
+
+**Where this lands.** Against 26 silicon measurements from five calibration ROMs, the model
+is at **0.18 % mean error, 0.77 % worst case** — every one of the 26 cells now under 1 %.
+Before this campaign: 4.78 % and 12.31 %. Re-run it with `python hw_calibration/corpus_gate.py`.
+
+⚡ **And the interrupt path now lands on the official tables to the cycle.** Appendix B for
+the full TI0 path — 18 states (entry) + 8 + 8 (`PUSH<W> (mem)` 6 + `(#16)` 2) + 9 (`ret`) +
+12 (`reti`) = **110 cy**; silicon measures **111.5**; this core spends **110.0** (direct
+sum over hundreds of interrupts, σ = 0). It used to spend 130, and *looked* right at 115 in
+throughput only because **+20 cy of double-billing and −17 cy of an impossible rebate
+cancelled out**. ⚖️ Two errors of opposite sign is why no single-knob sweep ever converged
+across two campaigns — each knob touched only one of them.
+
+⛔ **Two of these do not move alone.** Charging the fetch per byte *without* charging the
+taken branch makes the model **worse** (corpus 4.78 % → 7.13 %): the old 8.25 cy/word was
+over-charging the bus to make up for a branch that cost nothing.
+
+⛔⛔ **And a measured per-instruction cost already contains its own memory traffic.**
+`data_access_cycles` is charged in `load_sized`/`store`, so three paths must be excluded by
+hand or they are billed twice: **block transfers** (`ldir_cost`/`ldirw_cost` were measured
+against Bomberman's 4120-cycle slice — double-charging cost +43 % per block and shredded
+Cool Boarders' HUD), **interrupt entry** (Toshiba's 28/24/22/18 states are keyed on the
+*stack area's* bus width, so they already include pushing PC and SR), and the interrupt's
+**own vector read** — that last one was a real bug, billed to the first instruction of every
+handler until it was found by instrumentation. Only instructions whose price comes from a
+**table** may take a per-access cost on top.
 
 ### ⚠️ The application and the library do not start the same way
 

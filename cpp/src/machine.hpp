@@ -1210,10 +1210,137 @@ struct Machine {
      * Whatever is missing makes the console FASTER than us, not slower. Kept at false;
      * revisit only once the emulator is on the fast side of silicon. */
     bool     flush_queue_on_branch = false;
-    /* EXPERIMENT (measured below): a REPEATING block transfer holds the bus for its
-     * whole run, so the instruction queue cannot run ahead during it. When set, the
-     * BIU's run-ahead is zeroed after LDIR/LDIRW/CPIR/... instead of being left at
-     * its full one-queue credit. */
+    /* Cycles de credit d'avance qui SURVIVENT a une branche prise, quand le vidage
+     * est arme. 0 = vidage total (le comportement d'origine du drapeau).
+     *
+     * ⚖️ POURQUOI CE N'EST PAS UN BOOLEEN. La ROM v13 fait varier la DENSITE de
+     * branches d'un facteur 8 a travail constant et lit la PENTE du cout, en cycles
+     * par branche prise. Les deux reglages extremes encadrent le silicium sans
+     * l'atteindre :
+     *
+     *     drapeau desarme (vidage nul)     12,2 cy/branche
+     *     SILICIUM (tir 2026-08-27)      ~18,2 cy/branche
+     *     drapeau arme, keep = 0          24,1 cy/branche
+     *
+     * ⇒ une branche prise coute bien PLUS que sa ligne de table -- notre refutation
+     * du 21/08 rejetait a raison le vidage TOTAL et a tort le vidage tout court --
+     * mais environ la MOITIE de ce que coute un vidage total. La file fait 4 octets,
+     * soit deux mots : ce que le silicium decrit est un mot perdu et un mot conserve,
+     * pas une file videe.
+     *
+     * ⛔ CE N'EST PAS UNE CONSTANTE CALEE SUR UN JEU. C'est une pente mesuree sur
+     * quatre points alignes, et l'ordonnee de la droite absorbe tout le cout du
+     * travail : une erreur sur `mul` ou `ld` la deplace sans toucher la pente. */
+    uint32_t branch_flush_keep = 0;
+    /* Credit d'avance qui SURVIT a une INTERRUPTION, en cycles. 0 = tout est jete.
+     *
+     * ⚖️ MEME QUESTION QUE POUR LA BRANCHE, ET PROBABLEMENT LA MEME REPONSE. Une IRQ est
+     * un transfert de controle : la v14 a mesure qu'une branche prise n'emporte que
+     * ~2,4 cy du credit, pas les 16 d'une file pleine (`branch_flush_keep` ~13-14). Or
+     * la livraison d'interruption, elle, met le credit a ZERO.
+     *
+     * ⚡ ET CA SE VOIT DANS LA TRACE. Le stub d'aiguillage du BIOS est
+     *     FF22A5  push (0x6FD6)   \  il empile le vecteur utilisateur
+     *     FF22A9  push (0x6FD4)   /  (Timer 0 = 0x6FD4, quatre octets)
+     *     FF22AD  ret             -> et saute dessus
+     * Deux `push (nn)` IDENTIQUES a l'adresse pres, que nous facturons **40 et 24
+     * cycles**. Les 16 d'ecart sont exactement le credit que le vidage a jete, paye par
+     * la premiere instruction du stub.
+     * Mesure : ROM v18, cout FIXE d'une IRQ -- silicium 111,1 cy, nous 131,2. */
+    uint32_t irq_flush_keep = 0;
+    /* DIAGNOSTIC (modele en OCTETS) : etat de la file au sortir de l'acceptation d'une
+     * interruption, en 1/16 d'octet. La file est videe -- le PC part au vecteur -- mais
+     * l'acceptation dure 18 etats pendant lesquels le bus, lui, tourne. Deux regles se
+     * defendent : « le bus est pris par les empilements et la lecture du vecteur, donc
+     * rien n'est recharge » (0) et « ce sont des cycles comme les autres, donc la file
+     * se recharge » (jusqu'a la capacite). Balaye, pas pose : voir le README v18. */
+    int32_t irq_queue_keep_q16 = 0;
+    mutable uint32_t dbg_bios_charges = 0;  /* instrumentation temporaire */
+    int32_t dbg_debt_in = 0;   /* biu_debt A L'ENTREE de la derniere instruction */
+    uint32_t dbg_stall = 0;    /* et le stall qu'elle a paye */
+    uint32_t dbg_aw = 0;       /* et son access_wait */
+    /* Idem pour le modele en OCTETS : etat de la file A L'ENTREE de la derniere
+     * instruction, et nombre d'octets qu'elle a fait lire. Sans ca, la file est la
+     * seule partie du modele qu'on ne peut qu'inferer -- et c'est un compteur, pas un
+     * raisonnement, qui a trouve le bug d'IRQ du 27/08. */
+    int32_t dbg_q_in = 0;
+    uint32_t dbg_q_bytes = 0;
+    /* Cycles ajoutes a CHAQUE branche prise, sans condition -- l'hypothese concurrente
+     * de `branch_flush_keep`.
+     *
+     * ⚖️ LES DEUX REPRODUISENT LA ROM v13, ET C'EST TOUT LE PROBLEME. Le vidage
+     * partiel ne coute que si la file avait pris de l'avance ; la surcharge coute
+     * toujours. Sur la boucle de la v13 -- construite exprES pour que l'avance soit
+     * maximale a la branche -- les deux donnent la meme pente. Ils ne se separent que
+     * sur du code FETCH-BOUND, ou l'avance est nulle : le vidage y est invisible, la
+     * surcharge non. C'est le corpus v2/v10/v11/v12 qui tranche, pas la v13.
+     *
+     * ⛔ Ne pas armer les deux ensemble : ils modelisent la MEME mesure. */
+    uint32_t branch_taken_extra = 0;
+    /* Couts OCTET de `mul` et `div` reg-reg, en ETATS et en CYCLES respectivement.
+     * 0 = utiliser les constantes de reg_family.cpp.
+     *
+     * ⚖️ ILS SONT COUPLES A `biu_slack`, ET C'EST TOUT LE PROBLEME. Ces deux
+     * instructions sont execute-bound : leur temps sert au bus a prendre de l'avance,
+     * donc leur cout APPARENT depend de l'avance qu'on autorise. Les caler a slack=16
+     * puis baisser slack les rend fausses, et inversement -- a slack=6 le corpus voit
+     * MUL a -10,8 % et DIV a -7 % alors que TOUT LE RESTE reste juste.
+     * ⇒ On ne les regle pas separement : `biu_slack`, `mul` et `div` se resolvent
+     * ENSEMBLE contre trois mesures (v16 page 0, v14 pages 3 et 4). Ces deux boutons
+     * existent pour rendre ce balayage possible sans recompiler. */
+    /* ===================== LA FILE, MODELISEE EN OCTETS =====================
+     * `queue_bytes` = taille de la file d'instructions, en octets (4 sur ce coeur).
+     * 0 = ancien modele, un credit d'avance en CYCLES plafonne par `biu_slack`.
+     *
+     * ⚖️ POURQUOI REMPLACER LE CREDIT EN CYCLES. `biu_slack` etait UN scalaire pour
+     * trois regimes, et trois mesures le tiraient dans trois directions :
+     * v16 page 0 demandait ~6, le corpus 16, le cout d'IRQ davantage. Un scalaire ne
+     * peut pas satisfaire les trois -- ce n'etait pas une valeur a trouver, c'etait la
+     * FORME du modele qui etait fausse.
+     *
+     * ⚡ LE MODELE PHYSIQUE N'A PAS DE PARAMETRE LIBRE. La file fait 4 OCTETS et le bus
+     * en livre un tous les `fetch_wait_byte_q16 / 16` cycles (4,00, mesure v14 p.1) :
+     *
+     *     il manque         need = n - q      octets a l'instruction  -> le CPU cale
+     *                       cale = need x cout_octet
+     *     puis elle consomme ses n octets     -> q = max(0, q - n)
+     *     puis, PENDANT ses e cycles d'execution, le bus recharge
+     *                       q = min(4, q + e / cout_octet)
+     *
+     * Les deux plafonds -- 4 octets en avance, et pas plus vite qu'un octet par
+     * 4 cycles -- sont des FAITS de la machine, pas des reglages.
+     *
+     * ⚡ ET IL TOMBE JUSTE LA OU L'AUTRE ECHOUAIT. Sur le montage v16 page 0 (une
+     * division inseree dans une chaine de charges limitee par le bus), le credit en
+     * cycles rend un cout marginal de 16,0 cy ; le modele en octets rend 26, et le
+     * silicium 26,5. La difference tient a ce que le credit en cycles laissait DEUX
+     * charges profiter de l'avance (16 cy contre 10 cy de deficit chacune) la ou la
+     * file, elle, ne contient jamais que 4 octets -- soit les 4/5 d'une seule charge. */
+    uint32_t queue_bytes = 0;
+    mutable int32_t q_sixteenths = 0;   /* remplissage courant, en 1/16 d'octet */
+    mutable uint32_t fetch_bytes = 0;   /* octets d'instruction lus, l'instruction en cours */
+    /* Prix d'un octet FETCHE dans la region ou l'instruction courante a ete lue, en
+     * 1/16 de cycle. 0 = aucun octet compte. La file est la meme pour la cartouche et
+     * pour le BIOS -- c'est le meme bus -- mais leur tarif au mot n'a pas a etre le
+     * meme, donc le prix suit la REGION plutot qu'une constante unique. */
+    mutable int32_t fetch_bc16 = 0;
+
+    uint32_t mul_byte_states = 0;
+    uint32_t div_byte_cycles = 0;
+    /* Idem pour la forme MOT, que la v14 n'a jamais exercee (ROM v17). */
+    uint32_t mul_word_states = 0;
+    uint32_t div_word_cycles = 0;
+    /* A REPEATING block transfer holds the bus for its whole run -- a read and a write
+     * every iteration -- so the instruction queue cannot run ahead during it and the
+     * instruction after one pays its own fetch in full. Set, the BIU's run-ahead is
+     * zeroed after LDIR/LDIRW/CPIR/... instead of being left at its one-queue credit.
+     *
+     * ⚖️ ARMED BY THE SILICON MODEL, AND MEASURED: BOMBERMAN's open-loop raster copier
+     * must spend exactly 4120 cycles a block. Without this, 4086 (0.9917x) and the
+     * title screen loses one line per band; with it, 4134 (1.0034x) and the picture is
+     * pixel-clean. The eleven calibration ROMs are bit-identical either way. Full
+     * account in ngpc_set_timing_silicon (core.cpp). Default off = the pre-model
+     * behaviour, like every other piece of it. */
     bool     block_drains_queue = false;
     /* Set by the block-transfer handler when the loop actually REPEATED, read and
      * cleared by the run loop -- same shape as `cycles_already_measured`. */
@@ -1280,6 +1407,127 @@ struct Machine {
      * Le reste est accumule en quarts et converti a la fin de l'instruction, la retenue
      * etant reportee : sur une boucle, le cout moyen est donc bien fractionnaire. */
     uint32_t fetch_wait_q4 = 0;
+    /* Cout d'un octet FETCHE, en SEIZIEMES de cycle. 0 = ancien chemin, par MOT.
+     *
+     * ⚖️ POURQUOI PAR OCTET. Le bus cartouche est 8 BITS (AM8/16 est bonde haut sur
+     * cette carte), donc le processeur va chercher UN OCTET par cycle de bus : le cout
+     * d'un fetch est proportionnel aux octets, pas aux mots. Facturer par mot -- c'est
+     * a dire une seule fois par adresse PAIRE -- fait dependre le prix d'une
+     * instruction de sa PARITE : une instruction de 5 octets paye 3 charges si elle
+     * commence en pair, 2 si elle commence en impair. 50 % d'ecart pour la meme
+     * instruction.
+     *
+     * ⇒ C'EST CE QUI RENDAIT NOTRE MODELE SENSIBLE A L'ADRESSE la ou le silicium ne
+     * l'est pas : ROM v12, la meme boucle a quatre adresses donne 682/682/683/682 sur
+     * console et 715/733/732/732 chez nous.
+     *
+     * Le seizieme d'appoint est tire des quatre bits bas de l'adresse, sans etat --
+     * meme raison qu'en `fetch_wait_q4` : une retenue reportee d'une instruction a
+     * l'autre desynchronise un rejeu (le test libretro l'avait attrape). Sur seize
+     * octets consecutifs, `v & 15` d'entre eux coutent un cycle de plus ; la moyenne
+     * est exacte et ne depend d'aucun alignement.
+     *
+     * Mesure directe : ROM v14 page 1, chaines de `ld XWA,#imm32` -- 4,03 cy/octet sur
+     * une droite qui ferme a 0,35 %. 64 seiziemes = 4,00 cy/octet = 8,00 cy/mot, ce que
+     * la structure predit (2 cycles de bus x 2 etats x 2 cycles). */
+    uint32_t fetch_wait_byte_q16 = 0;
+    /* Cout FIXE d'un acces memoire de donnee, en cycles. 0 = gratuit (l'ancien
+     * comportement, et une HYPOTHESE, pas une mesure).
+     *
+     * ⚖️ CE QUE v2 AVAIT PROUVE, ET CE QU'ELLE N'AVAIT PAS PROUVE. `CRND == RRND` dit
+     * qu'une lecture de donnee en cartouche coute comme une lecture en RAM : elles sont
+     * EGALES ENTRE ELLES, jamais qu'elles sont GRATUITES. Lire « egales » comme « donc
+     * nulles » est un pas que v2 n'autorisait pas, et la valeur est restee a 0 pendant
+     * un an sans que rien la contraigne.
+     *
+     * ⚡ MESURE : ROM v15 pages 1 et 2, huit acces par tour a trois largeurs, en lecture
+     * puis en ecriture. Le surcout est **~4,05 cycles par ACCES** et il ne bouge pas avec
+     * la largeur : +4,10 sur l'octet, +4,06 sur le mot, +4,03 sur le long. La difference
+     * entre largeurs qui subsiste (32,5 cy pour huit acces) est deja portee par la table
+     * d'instructions -- 4/4/6 etats -- et notre modele la rendait deja juste.
+     *
+     * ⛔ ET LA FORME COMPTE AUTANT QUE LA VALEUR. Une premiere version facturait par
+     * OCTET (`data_wait_q16`), calee sur la seule largeur que la v14 avait mesuree : elle
+     * callait cette page-la au cycle pres et ne corrigeait PAS le `MEM` du corpus. La v15
+     * l'a refutee en une ligne -- une lecture d'un octet et une de deux octets coutent le
+     * MEME prix (215 contre 216 comptes) -- donc le cout suit les ACCES, pas les octets.
+     *
+     * ✅ Et deux egalites de notre modele sont CONFIRMEES au passage : lecture et
+     * ecriture coutent pareil (ecart <= 0,5 compte sur les quatre paires), et la largeur
+     * ne joue que par ses etats.
+     *
+     * Facture dans `load_sized` et `store`, c'est-a-dire par ACCES et non par octet --
+     * donc les `push`/`pop` d'un programme le sont aussi, puisqu'ils passent par la.
+     * ⛔ SAUF L'ENTREE EN INTERRUPTION, qui serait comptee DEUX FOIS : les quatre valeurs
+     * de Toshiba pour l'acceptation (28/24/22/18 etats) sont indexees sur la largeur de
+     * bus de la ZONE DE PILE, donc elles contiennent deja le prix des ecritures de PC et
+     * SR. Voir le `data_wait_cycles = 0` dans la livraison d'interruption (core.cpp).
+     * ⛔ Les transferts bloc ne sont pas charges non plus : non mesures. */
+    /* EXPERIMENT : `data_access_cycles` ne se paie que dans du code CARTOUCHE.
+     *
+     * ⚖️ POURQUOI CETTE FORME PLUTOT QU'UNE AUTRE. Deux mesures silicium se
+     * contredisent sous une regle uniforme : la boucle `MEM` du corpus EXIGE ces 4 cy
+     * (65,3 cy/tour mesures contre 62 sans, 66 avec), et le chemin d'interruption les
+     * REFUSE (111,5 mesures contre 110 sans, 126 avec). Ce qui separe les deux n'est pas
+     * la region des DONNEES -- les deux ecrivent en RAM -- c'est la region du CODE : la
+     * boucle `MEM` est en cartouche, le stub d'interruption est en BIOS.
+     *
+     * ⚡ Et c'est un mecanisme, pas un reglage : si ce cout est une CONTENTION -- l'acces
+     * de donnee vole un cycle de bus au prefetch -- il ne peut mordre que la ou le fetch
+     * est cher, c'est-a-dire sur le bus 8 bits de la cartouche. Le BIOS ne le subit pas.
+     * C'est exactement la regle deja appliquee a `branch_taken_extra`, pour la meme
+     * raison et depuis la meme famille de mesures. */
+    /* EXPERIMENT : une interruption est TRANSPARENTE pour l'etat de bus du flot
+     * interrompu -- l'etat de la file (ou la dette) est sauve a la livraison et rendu au
+     * `reti`.
+     *
+     * ⛔ CE QU'IL CORRIGE, ET C'EST MESURE. Sans lui, les cycles de l'ISR RECHARGENT la
+     * file du code interrompu : une interruption y rend le code interrompu MOINS CHER
+     * (-0,574 cy/instruction pour le credit, -0,224 pour la file), soit ~17 et ~7 cy de
+     * ristourne par interruption. C'est impossible -- pendant l'ISR le bus cherche les
+     * octets de l'ISR, pas ceux du flot interrompu.
+     *
+     * ⚡ ET LE SILICIUM LE DIT (ROM v19) : le cout d'une interruption est PLAT selon que
+     * la boucle interrompue soit limitee par le bus (`ld XWA`, 5 octets) ou par
+     * l'execution (`nop`, 1 octet) -- 112,6 / 112,0 / 110,7 / 110,5, contraste +1,5.
+     * Nos deux modeles predisaient +18,0 et +11,6. La ristourne n'existe pas.
+     *
+     * ⚖️ Transparente, et pas « file vide au retour » : le silicium ne montre NI gain NI
+     * surcout au retour. La pile de sauvegarde suit les imbrications. */
+    /* EXPERIMENT : un transfert de controle PRIS qui CHANGE DE REGION jette l'avance.
+     *
+     * ⚖️ POURQUOI PAS `flush_queue_on_branch` TOUT COURT. L'avance de l'unite de bus est
+     * du temps pendant lequel elle a lu des octets EN AVANCE. Quand une branche reste
+     * dans la meme region, ces octets etaient au bon tarif et une partie survit
+     * legitimement (v14 : `branch_flush_keep` ~13-14). Quand elle CHANGE de region, ils
+     * ne valent rien : le credit a ete bati en lisant du BIOS a 4 cy/octet et serait
+     * depense sur de la cartouche au meme tarif nominal, mais le bus n'a jamais touche
+     * ces octets-la -- il ne connaissait meme pas l'adresse.
+     *
+     * ⚡ MESURE. Le `ret` du stub BIOS finit avec 16 cycles d'avance, et les deux
+     * premieres charges du gestionnaire en cartouche les depensent : 10 et 14 cycles au
+     * lieu de 20. Une charge dans un ISR coute 18,00 cy chez nous contre 20,29 mesures
+     * sur console (v18 page 1). Vider a CHAQUE branche corrige ca mais casse le corpus
+     * (0,31 % -> 2,85 %) : les boucles cartouche, elles, gardent leur credit. */
+    bool     flush_on_region_change = false;
+
+    bool     irq_transparent_queue = false;
+    int32_t  irq_q_save[8] = {0};
+    int32_t  irq_debt_save[8] = {0};
+    uint8_t  irq_save_depth = 0;
+
+    bool     data_wait_cart_only = false;
+    uint32_t data_access_cycles = 0;
+    /* Accumulateur de l'instruction en cours, en cycles entiers.
+     *
+     * ⛔ IL EST SEPARE DE `access_wait`, ET C'EST LE POINT. `access_wait` est du temps
+     * de BUS que la file de prefetch peut recouvrir : le processeur ne cale que si la
+     * file s'est videe. Un acces OPERANDE ne se recouvre pas -- il occupe le bus, donc
+     * il retarde a la fois l'execution et le prefetch. Verse dans `access_wait`, le
+     * cout d'une lecture etait tout simplement AVALE par le credit d'avance : passer
+     * de 0 a 1 cycle par octet ne deplacait la page 2 de la v14 que de 12,05 a 12,21
+     * au lieu des ~16 attendus. */
+    mutable uint32_t data_wait_cycles = 0;
     mutable uint32_t access_wait_q4 = 0;   /* accumulateur de l instruction en cours */
     uint32_t fetch_wait_carry = 0; /* retenue reportee d'une instruction a l'autre */
     /* EXPERIMENT: drop the receiver's second charge of the byte time. Known to be a
@@ -1334,6 +1582,41 @@ struct Machine {
      * integer. It is also NOT the explanation for Cool Boarders: that game writes VRAM
      * during vblank, and its residual turned out to be LDIR (see ldir_cost). If you pin the
      * cost, update hw_calibration/README.md, the shell and the README table together. */
+    /* ⛔ ET IL NE SE PAIE PAS PENDANT UN TRANSFERT BLOC. `ldir_cost`/`ldirw_cost` ne
+     * sortent pas d'une table : ils ont ete MESURES contre du materiel -- 18 contre le
+     * copieur HiColor de Bomberman, qui ecrit justement en VRAM, avec une fenetre d'UN
+     * cycle. Ce cout contient donc DEJA l'etranglement du K2GE ; l'ajouter par-dessus le
+     * facture deux fois. C'est la meme garde que `data_wait_cycles` (voir
+     * `data_wait_before` dans mem_family.cpp), et c'est le test
+     * `test_bomberman_hicolor_phase` qui l'a exigee : arme sans elle, le copieur derive
+     * de sa tranche de 4120 cycles et corrompt une ligne par bande. */
+    mutable bool in_block_copy = false;
+    /* ESSAI : un transfert bloc paie l'etranglement VRAM comme n'importe quelle
+     * ecriture. Hypothese : `ldirw_cost = 18` etait la SOMME de l'instruction (14, ce
+     * que la doc ET la v20 disent) et du throttle, mal attribuee a l'instruction --
+     * la v20 mesure `ldirw` en RAM->RAM, ou il n'y a pas de throttle. */
+    bool     block_pays_vram = false;
+    /* ⚡ SURCOUT D'UN TRANSFERT BLOC DONT LA **SOURCE** EST EN CARTOUCHE, PAR OCTET LU.
+     *
+     * ROM v21, tir silicium 2026-08-30. Le meme `ldirw`, quatre chemins :
+     *      RAM -> RAM   **14,04** cy/iteration   (annexe B (3), 7n+1 etats : 14,00)
+     *      RAM -> VRAM  14,12   ⇒ la DESTINATION ne coute RIEN (+0,08)
+     *      ROM -> RAM   18,16   ⇒ la SOURCE coute **+4,12**
+     *      ROM -> VRAM  18,16   ⇒ et les deux effets s'ADDITIONNENT (+4,20 predit)
+     *
+     * ⇒ Le bus cartouche est 8 BITS : lire un MOT y coute deux acces d'octet. D'ou
+     * **2 cycles par octet lu**, soit +4 sur une iteration mot.
+     *
+     * ⚖️ ET C'EST CE QUI EXPLIQUE `ldirw_cost = 18`. Ce nombre n'etait pas faux, il etait
+     * **mal attribue** : cale sur le copieur HiColor de Bomberman, qui copie ROM -> VRAM,
+     * il portait 14 (l'instruction) + 4 (sa source en cartouche) -- et nous l'appliquions
+     * a TOUS les transferts, donc 29 % trop cher sur toute copie RAM -> RAM ou
+     * RAM -> VRAM, c'est-a-dire la plupart de celles que font les jeux.
+     *
+     * ⛔ FORME OCTET : 2 cy/octet est DERIVE de la mesure du mot (4 / 2 octets), pas
+     * mesure directement. Il faudrait une rotation `ldirb` a source cartouche pour le
+     * confirmer. Le noter avant de s'appuyer dessus. */
+    uint32_t block_cart_src_per_byte = 0;
     uint32_t vram_wait = 0;
 
     /* WHICH CONSOLE WE ARE PRETENDING TO BE, for a monochrome cartridge.
@@ -1629,7 +1912,26 @@ struct Machine {
              * Charging the cart and letting the BIOS fetch for free is an asymmetry
              * nothing justifies. */
             const bool is_fetch = (a - fetch_window) < 8u;
-            if (is_fetch && (!fetch_wait_per_word || !(a & 1u))) access_wait += bios_wait;
+            if (is_fetch && queue_bytes && fetch_wait_byte_q16) {
+                /* LE BIOS EST SUR LE MEME BUS, DONC DANS LA MEME FILE. Le modele en
+                 * octets ne recouvrait que la CARTOUCHE : le fetch BIOS s'ajoutait brut
+                 * a `access_wait`, sans le moindre recouvrement avec l'execution, alors
+                 * que le credit en cycles l'absorbait. Le chemin d'une interruption est
+                 * presque entierement en BIOS (aiguillage `push`/`push`/`ret`), d'ou une
+                 * ordonnee de 156,1 cy contre 111,1 mesures sur console -- et l'exces
+                 * SUIVAIT `bios_wait` (156,1 / 141,4 / 124,1 a 8 / 4 / 0), ce qui le
+                 * nomme au lieu de le deviner.
+                 *
+                 * ET IL N'INTRODUIT AUCUN PARAMETRE : le prix reste celui de la region
+                 * -- `bios_wait` par MOT, soit `bios_wait / 2` par octet, ce que porte
+                 * `fetch_bc16`. A 8 par mot c'est 4,00 cy/octet, exactement le tarif
+                 * cartouche mesure par la v14 ; la moyenne ne bouge donc pas. Ce qui
+                 * change, c'est que ce temps se RECOUVRE avec l'execution et ne depend
+                 * plus de la parite de l'adresse. */
+                ++fetch_bytes;
+                fetch_bc16 = int32_t(bios_wait) * 8;   /* cy/octet, en 1/16 */
+            }
+            else if (is_fetch && (!fetch_wait_per_word || !(a & 1u))) { access_wait += bios_wait; ++dbg_bios_charges; }
             else if (!is_fetch && bios_data_wait
                      && (!fetch_wait_per_word || !(a & 1u))) access_wait += bios_data_wait;
         }
@@ -1640,7 +1942,18 @@ struct Machine {
                 /* Un wait par acces 16 bits. En quarts de cycle si une valeur
                  * fractionnaire est posee -- l'entier ne descend pas sous 4 % d'erreur
                  * sur les boucles cartouche, et ces 4 % font clignoter un split raster. */
-                if (!(a & 1u)) {
+                if (fetch_wait_byte_q16 && queue_bytes) {
+                    /* Modele FILE : on COMPTE l'octet, on ne le facture pas ici -- son
+                     * prix depend de ce que la file contenait deja, et ca se decide a
+                     * la fin de l'instruction. Voir `queue_bytes`. */
+                    ++fetch_bytes;
+                    fetch_bc16 = int32_t(fetch_wait_byte_q16);
+                } else if (fetch_wait_byte_q16) {
+                    /* Par OCTET : voir `fetch_wait_byte_q16`. Aucune condition sur la
+                     * parite, c'est tout l'interet. */
+                    access_wait += (fetch_wait_byte_q16 >> 4)
+                                 + (((a & 15u) < (fetch_wait_byte_q16 & 15u)) ? 1u : 0u);
+                } else if (!(a & 1u)) {
                     /* ⚡ LE QUART DE CYCLE SANS AUCUN ETAT. Le silicium demande 8,25
                      * cycles par mot (ROM a_irq_calib_v8) : on l'obtenait en REPORTANT
                      * une retenue d'une instruction a l'autre. C'etait de l'etat, et
@@ -1686,6 +1999,18 @@ struct Machine {
         if (hygiene_on) check_uninit_read(a);
         return mem[a];
     }
+    /* Un acces de donnee, quelle que soit sa largeur. Les SFR (page 0x00-0xFF) et la
+     * VRAM sont exclus : la premiere n'est pas de la memoire externe, la seconde a son
+     * propre etranglement (`vram_wait`) et n'a pas ete mesuree ici. */
+    inline void charge_data_access(uint32_t a) const {
+        if (!data_access_cycles) return;
+        a &= kAddrMask;
+        const bool ram  = (a >= 0x004000u && a < 0x008000u);
+        const bool cart = (a >= 0x200000u && a <= 0x3FFFFFu) ||
+                          (a >= 0x800000u && a <= 0x9FFFFFu);
+        if (ram || cart) data_wait_cycles += data_access_cycles;
+    }
+
     inline uint32_t read32(uint32_t a) const {
         return uint32_t(read8(a)) | (uint32_t(read8(a + 1)) << 8) |
                (uint32_t(read8(a + 2)) << 16) | (uint32_t(read8(a + 3)) << 24);

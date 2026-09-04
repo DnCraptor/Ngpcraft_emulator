@@ -119,6 +119,9 @@ what games poll for:
   background). The stored font is 2bpp with glyph = 3 / background = 0, so every
   2-bit field is `11` or `00` and the source byte *is* the glyph mask — the recolour
   is `(src AND fg*0x55) OR (NOT src AND bg*0x55)`, no lookup table.
+  Games index the font BY ASCII CODE: the tile number written into the tilemap is
+  the character itself, so tile `0x50` has to be a `P`. Getting the font wrong is
+  therefore not cosmetic — it is a menu nobody can read. See **The font** below.
 - **ALARMSET / ALARMDOWNSET** (`0x09`/`0x0B`) — the RTC alarm: `QC3` day, `RB3` hour,
   `RC3` minute, `0xFF` meaning "any". The chip has no wildcard except day 0 = every
   day, so the SDK's `0xFF` is normalised here as the retail BIOS does; arming also
@@ -217,8 +220,37 @@ bash build.sh        # gen_crt0.py -> asm900 -> tulink -> tuconv -> pack -> bios
 ```
 
 `gen_crt0.py` generates `src/crt0.asm` (vectors, stubs, and the pre-expanded
-2bpp font, read from the tracked `font_2bpp.bin`). Pillow is only needed to
-re-rasterise that font — `python gen_crt0.py --regen-font`, which rewrites the
-`.bin` and so changes the shipped image. `pack_bios.py` turns the linker's S-record into the flat 64 KiB
+2bpp font, read from the tracked `font_2bpp.bin`). `python gen_crt0.py
+--regen-font` rewrites that `.bin` from `font_glyphs.py` and so changes the
+shipped image. `pack_bios.py` turns the linker's S-record into the flat 64 KiB
 image. `tests/test_hle_bios_image.py` guards the structure and a deterministic
-boot without needing the toolchain.
+boot without needing the toolchain; `tests/test_hle_bios_font.py` guards the
+font itself — see below.
+
+## The font
+
+`font_glyphs.py` holds the 96 printable characters **written out pixel by
+pixel**, 5 wide by 7 tall inside the 8x8 cell, one column of left bearing and
+the eighth row left clear so lines never touch. `gen_crt0.py` packs them into
+`font_2bpp.bin`.
+
+Two things about it are worth knowing, because both were once wrong and both
+produced menus that were almost letters and completely unreadable.
+
+**A CHAR-RAM row is a little-endian 16-bit word.** The byte at the LOWER address
+carries the RIGHT half of the row. Writing the halves the other way round shows
+every glyph with its own left and right sides exchanged. The retail BIOS's own
+`P` (tile `0x50`) is the reference: `f0 3f | 0c 30 | 0c 30 | f0 3f | 00 30 ...`.
+
+**It is a table, not a rasteriser.** It used to be rendered with
+`ImageFont.load_default()` — a face about eleven pixels tall — into an 8x8 box,
+so every glyph lost its bottom stroke: `E` came out as an `F` and `L` as a bare
+vertical bar. That also made the SHIPPED IMAGE depend on which Pillow version
+the build machine had installed, which quietly defeats the checksum the Libretro
+build pins it with. There is no font dependency any more.
+
+⚠️ The image's own tests passed through both faults. They checked its size, its
+checksum, its syscall table and its vectors — everything except whether the font
+spelt anything. `tests/test_hle_bios_font.py` is the missing check: glyph shapes,
+the byte order, every capital distinct, and a fixture of the broken glyph so the
+instrument proves it can fire.

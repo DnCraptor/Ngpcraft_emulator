@@ -37,11 +37,24 @@ ONE_QUEUE = 16
 
 
 def _rom() -> bytes:
-    """`ldirw (XIX+),(XIY+)` at 0x200044, then a run of `nop`, then `jr $`.
+    """`ldirw (XIX+),(XIY+)` at 0x200044, then a run of `ld XWA,#imm32`, then `jr $`.
 
     `95 11` is LDIRW (XIX+),(XIY+) -- the encoding tests/test_decode.py and
     tests/test_execute.py already pin. Entering at 0x200046 instead skips the copy and
-    runs the SAME nops, which is the control: no block, no drain, no difference.
+    runs the SAME loads, which is the control: no block, no drain, no difference.
+
+    ⛔ LES SUIVANTES ETAIENT DES `nop`, ET LA SONDE EST DEVENUE AVEUGLE. Depuis que le
+    fetch est facture par OCTET (`fetch_wait_byte_q16`, mesure directe ROM v14 page 1),
+    un `nop` coute exactement 4,0 cycles de bus pour 4,0 cycles d'execution : il est PILE
+    a l'equilibre, la file ne prend jamais d'avance derriere lui, et vider un credit qui
+    n'existe pas ne coute rien. Les deux mesures tombaient sur le meme nombre et ce test
+    echouait alors que le mecanisme, lui, marchait toujours -- `test_bomberman_hicolor_
+    phase`, l'ancrage silicium REEL (4120 cycles par bande), est reste vert tout du long.
+
+    ⇒ `ld XWA,#imm32` : 5 octets pour 5 etats, soit 20 cycles de bus contre 10
+    d'execution. Franchement fetch-bound, donc il DEPENSE le credit d'avance -- et c'est
+    exactement ce qu'un drain lui retire. Meme lecon que la ROM v13 : une sonde faite
+    d'instructions a l'equilibre ne mesure rien.
     """
     rom = bytearray(b"\xFF" * 0x100000)
     rom[0:28] = b" LICENSED BY SNK CORPORATION"
@@ -49,8 +62,8 @@ def _rom() -> bytes:
     rom[0x23] = 0x10
     rom[0x40:0x44] = b"\x00\x68\xFE\x00"          # nop ; jr $   (the reset vector parks)
     rom[0x44:0x46] = b"\x95\x11"                  # ldirw (XIX+),(XIY+)
-    rom[0x46:0x60] = b"\x00" * 0x1A               # nops: they pay the fetch
-    rom[0x60:0x62] = b"\x68\xFE"                  # jr $
+    rom[0x46:0x78] = b"\x40\x01\x01\x01\x01" * 10  # ld XWA,# : ils payent le fetch
+    rom[0x78:0x7A] = b"\x68\xFE"                  # jr $
     return bytes(rom)
 
 

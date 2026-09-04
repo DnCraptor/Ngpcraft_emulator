@@ -72,23 +72,43 @@ def build_font_2bpp():
 
 
 def rasterise_font_2bpp():
-    """Rebuild the font bytes from Pillow's default face. Only ever called by
-    --regen-font; changing what this returns changes the shipped BIOS image."""
-    from PIL import Image, ImageFont, ImageDraw
-    fnt = ImageFont.load_default()
+    """Rebuild the font bytes from the written-down glyphs in font_glyphs.py.
+
+    ⛔ IT USED TO CALL PILLOW, AND THAT WAS THE BUG. `ImageFont.load_default()`
+    is about eleven pixels tall; drawn into an 8x8 box every glyph lost its
+    bottom stroke, so the BIOS handed games an `E` shaped like an `F` and an `L`
+    with no foot. It also made the SHIPPED IMAGE depend on which Pillow the
+    build machine had installed. The glyphs are a table now: no dependency, and
+    the same bytes on every machine.
+    """
+    # By file path, not by sys.path: this module is imported from the test
+    # suite as well as run from its own directory.
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "font_glyphs", os.path.join(here, "font_glyphs.py")
+    )
+    font_glyphs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(font_glyphs)
+    glyph_rows = font_glyphs.glyph_rows
+
     out = bytearray()
     for code in range(256):
-        img = Image.new("L", (8, 8), 0)
-        if 0x20 <= code < 0x7F:
-            ImageDraw.Draw(img).text((0, -1), chr(code), fill=255, font=fnt)
-        for y in range(8):
+        rows = glyph_rows(code) if 0x20 <= code < 0x7F else [" " * 8] * 8
+        for row in rows:
             word = 0
             for x in range(8):
                 word = (word << 2) & 0xFFFF
-                lit = img.getpixel((x, y)) > 96
-                word |= FONT_FG if lit else FONT_BG
-            out.append((word >> 8) & 0xFF)   # big-endian: pixels 0-3
+                word |= FONT_FG if row[x] == "#" else FONT_BG
+            # ⛔ LOW BYTE FIRST. A CHAR-RAM row is a 16-bit word stored
+            # little-endian, so the byte at the lower address carries the RIGHT
+            # half of the row. Writing the halves the other way round swaps them
+            # on screen: every glyph came out as its own two halves exchanged,
+            # which reads as a font that is nearly right and completely
+            # illegible. Checked against the retail BIOS's own 'P' at tile 0x50:
+            #   retail  f0 3f | 0c 30 | 0c 30 | f0 3f | 00 30 ...
             out.append(word & 0xFF)          # pixels 4-7
+            out.append((word >> 8) & 0xFF)   # pixels 0-3
     assert len(out) == 0x1000
     return bytes(out)
 

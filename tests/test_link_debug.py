@@ -224,14 +224,28 @@ def test_serial_state_reports_cable_detect_as_the_game_reads_it():
     """0xB1 bit2 is the cable-DETECT input (0 = peer connected) -- the line Card
     Fighters' Clash gates its handshake on. The snapshot has to show it the way
     read8 presents it, not the way it happens to sit in the I/O page, or the tab
-    would say "no cable" on a working one."""
+    would say "no cable" on a working one.
+
+    ⛔ THIS TEST USED TO ASSERT THE OPPOSITE OF THE HARDWARE, and it is how the
+    instrument came to lie. It read "cable armed -> detect reads 0", which was the
+    model read8 abandoned on 2026-08-19: silicon says a cable with NOBODY at the far
+    end still reads 1, and only a peer whose game opened its port clears the bit
+    (specs/LINK_CABLE.md §1). read8 was moved; the snapshot and this test were not,
+    so `port_b1` kept answering 0x02 on an online session where the CPU was reading
+    0x06. The rule is one rule: whatever read8 returns, the snapshot returns.
+    """
     from core.native import NativeMachine
 
     m = NativeMachine(b"\x00" * 0x10000)
     assert m.serial_state().port_b1 & 0x04, "no cable -> detect reads 1"
     m.serial_set_enabled(True)
     st = m.serial_state()
-    assert not (st.port_b1 & 0x04), "cable armed -> detect reads 0"
+    assert st.port_b1 & 0x04, "cable armed but NO peer -> detect still reads 1"
+    assert st.port_b1 == m.read(0xB1, 1)[0], "the snapshot must equal what read8 gives"
+    m.serial_set_cts(False)                 # a peer has now spoken for itself
+    st = m.serial_state()
+    assert not (st.port_b1 & 0x04), "peer present and ready -> detect reads 0"
+    assert st.port_b1 == m.read(0xB1, 1)[0]
     assert st.port_b1 & 0x02, "the sub-battery bit is forced high, as in read8"
 
 

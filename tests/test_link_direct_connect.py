@@ -519,3 +519,153 @@ def test_mirror_play_is_left_alone(app):
     finally:
         page.timer.stop()                    # voir la fixture `pair`
         page.machine = page._mirror = None
+
+
+def _bare_window():
+    """La fenetre du shell, sans jeu charge: `_start_net` et ses compagnons ne
+    touchent a la console que par `self.play.overlay`, qui existe des la construction."""
+    return shell.Shell()
+
+
+# --------------------------------------------------------------------------
+# ⛔ « EN ATTENTE DE CONNEXION..... » — LE MESSAGE QUI NE DIT PAS S'IL EST VIVANT
+#
+# Rapporte par un joueur qui essayait a deux, en LAN puis en ligne: « rien ne change,
+# en attente de connexion..... ». En regardant les VRAIES sockets de ses deux instances
+# (tools/watch_link_sockets.py): AUCUNE ecoute. Le fil avait rendu la main depuis
+# longtemps -- HOST_TIMEOUT_S valait 300 s -- et l'ecran affichait toujours le texte
+# pose une seule fois par `_start_net`.
+#
+# Deux joueurs qui montent une partie depassent cinq minutes sans effort: on clique
+# Heberger, on va sur l'autre PC, on charge la ROM, on se met d'accord. Passe le delai,
+# le pair qui arrive enfin se prend un refus de connexion pendant que l'hote montre
+# encore « en attente ». Les deux ecrans mentent, chacun a sa facon.
+#
+# Deux choses sont donc gelees ici: le delai n'est plus de l'ordre de la minute, et une
+# attente VIVANTE se voit -- son texte avance.
+
+def test_the_waiting_message_counts_so_a_dead_attempt_is_visible(app, monkeypatch):
+    """Le texte d'attente doit CHANGER tant que la tentative est en vie."""
+    win = _bare_window()
+    seen = []
+    win.play.overlay.setText = lambda t: seen.append(t)      # type: ignore[assignment]
+    monkeypatch.setattr(shell._NetConnect, "HOST_TIMEOUT_S", 30.0)
+    try:
+        assert win._start_net("host", "", free_port(), "⏳ attente")
+        assert seen, "aucun texte pose au demarrage"
+        first = seen[-1]
+        assert "⏳ attente" in first, first
+        assert wait_until(lambda: (app.processEvents(), len(seen) > 1)[1], 3.0), \
+            "le texte n'a jamais bouge: rien ne distingue une attente morte"
+        assert seen[-1] != first
+    finally:
+        win._cancel_net_attempt()
+        app.processEvents()
+
+
+def test_the_clock_stops_when_the_attempt_does(app, monkeypatch):
+    """...et il s'arrete quand elle finit, sinon il recouvrirait le verdict."""
+    win = _bare_window()
+    monkeypatch.setattr(shell._NetConnect, "HOST_TIMEOUT_S", 30.0)
+    assert win._start_net("host", "", free_port(), "⏳ attente")
+    assert win._net_clock is not None
+    win._on_net_failed("boom")
+    assert win._net_clock is None, "le compteur survit a l'echec et efface le message"
+    assert "boom" in win.play.overlay.text()
+
+
+def test_a_host_waits_far_longer_than_two_players_take_to_get_ready():
+    """⛔ LA VALEUR ELLE-MEME EST LE CORRECTIF, pas seulement l'affichage.
+
+    Cinq minutes, c'est le temps de charger une ROM et d'ouvrir Discord. Un hote qui
+    cesse d'ecouter pendant que son pair s'installe rend une panne que ni l'un ni
+    l'autre ne peut diagnostiquer. La sortie appartient au joueur (`_cancel_net_attempt`
+    est dans le menu 🔗), pas a un chronometre.
+    """
+    assert shell._NetConnect.HOST_TIMEOUT_S >= 900.0
+    assert shell._NetConnect.JOIN_TIMEOUT_S >= 900.0
+
+
+# --------------------------------------------------------------------------
+# ⛔ FERMER LA FICHE D'ADRESSE NE DOIT PAS ARRETER D'HEBERGER
+#
+# `HostInfoDialog` est une FICHE: IP locale, IP publique detectee, ligne a coller,
+# bouton « Fermer ». Sa propre classe promet « Non-modal -- hosting keeps running
+# behind it ». Le shell, lui, annulait la tentative sur `finished`. Mesure sur un
+# `Shell` reel, en regardant la vraie socket:
+#
+#     clic « Heberger en miroir »       -> ecoute sur le port : OUI
+#     fermeture de la fiche d'adresse   -> ecoute sur le port : NON
+#
+# Un joueur lit son adresse, ferme la fiche pour revoir son jeu, et vient d'arreter
+# d'heberger sans qu'un mot le lui dise. La sortie explicite existe deja
+# (« Annuler la tentative », menu 🔗); une fiche qu'on ferme dit « j'ai lu ».
+
+def _is_listening(port: int) -> bool:
+    """⛔ NE PAS SE CONNECTER POUR SAVOIR SI QUELQU'UN ECOUTE. Un `connect` reussi EST
+    le pair que l'hote attendait: `_accept` le rend et ferme son ecoute. La sonde
+    terminait donc l'hebergement puis constatait qu'il n'ecoutait plus -- et ce faux
+    positif m'a fait accuser la fermeture de la fiche d'adresse. On regarde la table
+    TCP du systeme, qui ne touche a rien."""
+    import subprocess
+    try:
+        # ⚠️ pas de `text=True`: netstat sort en codepage OEM sous Windows et le
+        # decodage implicite explose sur un octet 0x90. On lit des octets.
+        raw = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+                             capture_output=True, timeout=15).stdout
+        out = (raw or b"").decode("utf-8", "replace")
+    except Exception:                                    # noqa: BLE001
+        pytest.skip("netstat indisponible")
+    return any(f":{port} " in ln and "LISTENING" in ln for ln in out.splitlines())
+
+
+def test_closing_the_address_card_keeps_the_host_listening(app, monkeypatch):
+    from PyQt6.QtWidgets import QInputDialog
+    port = free_port()
+    win = _bare_window()
+    win.play.machine = object()                      # « un jeu tourne »
+    monkeypatch.setattr(QInputDialog, "getInt",
+                        staticmethod(lambda *a, **k: (port, True)))
+    try:
+        win._host_mirror()
+        assert wait_until(lambda: (app.processEvents(), _is_listening(port))[1], 5.0), \
+            "l'hote n'a jamais ecoute"
+        assert win._host_info is not None, "la fiche d'adresse n'a pas ete montree"
+
+        win._host_info.accept()                      # le bouton « Fermer » de la fiche
+        app.processEvents()
+        assert _is_listening(port), "fermer la fiche a arrete l'hebergement"
+        assert win._net_attempt_pending(), "la tentative a ete annulee en silence"
+    finally:
+        win._cancel_net_attempt()
+        app.processEvents()
+
+
+def test_cancelling_stops_the_clock(app, monkeypatch):
+    """⛔ ET LE COMPTEUR MEURT AVEC LA TENTATIVE. Ajoute pour qu'une attente MORTE se
+    voie, il en fabriquait une vivante: annulee, la tentative gardait un compteur qui
+    avancait -- exactement l'ecran qu'on essayait de rendre impossible."""
+    monkeypatch.setattr(shell._NetConnect, "HOST_TIMEOUT_S", 30.0)
+    win = _bare_window()
+    assert win._start_net("host", "", free_port(), "⏳ attente")
+    assert win._net_clock is not None
+    win._cancel_net_attempt()
+    assert win._net_clock is None, "le compteur survit a l'annulation"
+
+
+def test_joining_your_own_pc_says_so(app, monkeypatch):
+    """« 127.0.0.1 » est legitime (deux fenetres sur un PC) mais se fait prendre pour
+    « l'adresse du serveur qu'on m'a donnee ». On ne la refuse pas, on la NOMME."""
+    monkeypatch.setattr(shell._NetConnect, "JOIN_TIMEOUT_S", 30.0)
+    win = _bare_window()
+    seen = []
+    win.play.overlay.setText = lambda t: seen.append(t)   # type: ignore[assignment]
+    assert win._start_net("join", "127.0.0.1", free_port(), "⏳ connexion")
+    try:
+        assert wait_until(lambda: (app.processEvents(),
+                                   any("CE PC" in t or "THIS PC" in t
+                                       for t in seen))[1], 12.0), \
+            "rien ne dit jamais que 127.0.0.1 designe cette machine"
+    finally:
+        win._cancel_net_attempt()
+        app.processEvents()

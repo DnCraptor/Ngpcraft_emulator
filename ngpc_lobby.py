@@ -33,6 +33,40 @@ def _lan_ip() -> str:
         s.close()
 
 
+def _other_local_ips(primary: str) -> list[str]:
+    """Les AUTRES adresses IPv4 de cette machine, celle de la route par defaut exclue.
+
+    ⛔ POURQUOI CE N'EST PAS DU DETAIL. `_lan_ip()` rend l'adresse de l'interface qui
+    sort vers internet -- le 192.168.x de la box. Or la seule facon gratuite et
+    permanente de jouer a distance sans toucher a sa box, c'est un reseau prive virtuel
+    (Tailscale, ZeroTier): il ajoute une interface avec SA propre adresse, et c'est
+    celle-la que le pair doit composer. Elle ne passe pas par la route par defaut, donc
+    la fiche ne l'affichait pas -- elle envoyait le joueur sur l'adresse qui ne marche
+    justement que chez lui.
+
+    Le tri met les plages de reseau virtuel en premier (100.64/10 chez Tailscale,
+    10.147/16 chez ZeroTier tombent dans le prive classique), puis le reste.
+    """
+    import socket
+    found: set[str] = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                found.add(ip)
+    except OSError:
+        pass
+    found.discard(primary)
+
+    def rank(ip: str) -> tuple[int, str]:
+        # 100.64.0.0/10 -- la plage que Tailscale distribue.
+        first, second = (ip.split(".") + ["0", "0"])[:2]
+        virtual = first == "100" and 64 <= int(second or 0) <= 127
+        return (0 if virtual else 1, ip)
+
+    return sorted(found, key=rank)
+
+
 def _public_ip(timeout: float = 4.0) -> str:
     """Best-effort public IP (what a peer over the internet dials), via a couple
     of tiny plain-text services. Empty string if none answer."""
@@ -86,6 +120,12 @@ class HostInfoDialog(QDialog):
         h.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(h)
         v.addWidget(QLabel(self._t("host_lan").format(addr=f"{lan}:{port}")))
+        others = _other_local_ips(lan)
+        if others:
+            alt = QLabel(self._t("host_other_addrs").format(
+                addrs=", ".join(f"{ip}:{port}" for ip in others[:4])))
+            alt.setWordWrap(True)
+            v.addWidget(alt)
         self._pub_lbl = QLabel(self._t("host_wan_detecting"))
         self._pub_lbl.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(self._pub_lbl)
