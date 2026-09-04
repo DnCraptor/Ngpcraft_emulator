@@ -601,22 +601,25 @@ def test_a_host_waits_far_longer_than_two_players_take_to_get_ready():
 # d'heberger sans qu'un mot le lui dise. La sortie explicite existe deja
 # (« Annuler la tentative », menu 🔗); une fiche qu'on ferme dit « j'ai lu ».
 
-def _is_listening(port: int) -> bool:
-    """⛔ NE PAS SE CONNECTER POUR SAVOIR SI QUELQU'UN ECOUTE. Un `connect` reussi EST
-    le pair que l'hote attendait: `_accept` le rend et ferme son ecoute. La sonde
-    terminait donc l'hebergement puis constatait qu'il n'ecoutait plus -- et ce faux
-    positif m'a fait accuser la fermeture de la fiche d'adresse. On regarde la table
-    TCP du systeme, qui ne touche a rien."""
-    import subprocess
-    try:
-        # ⚠️ pas de `text=True`: netstat sort en codepage OEM sous Windows et le
-        # decodage implicite explose sur un octet 0x90. On lit des octets.
-        raw = subprocess.run(["netstat", "-ano", "-p", "TCP"],
-                             capture_output=True, timeout=15).stdout
-        out = (raw or b"").decode("utf-8", "replace")
-    except Exception:                                    # noqa: BLE001
-        pytest.skip("netstat indisponible")
-    return any(f":{port} " in ln and "LISTENING" in ln for ln in out.splitlines())
+def _is_listening(win) -> bool:
+    """Est-ce que l'hote ecoute ENCORE ? On le demande au fil qui ecoute.
+
+    ⛔ NE PAS SE CONNECTER POUR LE SAVOIR. Un `connect` reussi EST le pair que l'hote
+    attendait : `_accept` le rend et referme l'ecoute. La sonde terminait donc
+    l'hebergement, puis constatait qu'il n'ecoutait plus -- un faux positif qui a fait
+    accuser la fermeture de la fiche d'adresse.
+
+    ⛔ ET PAS `netstat` NON PLUS. La premiere version lisait la table TCP du systeme avec
+    `netstat -ano -p TCP`, qui est de la syntaxe Windows : ailleurs la commande rend une
+    sortie vide, aucune ligne ne correspond, et le test echoue en annoncant « l'hote n'a
+    jamais ecoute » sur un hote parfaitement vivant. Un banc qui depend du systeme pour
+    repondre a une question que l'objet teste connait deja se trompe de source.
+
+    `_NetConnect._srv` porte la socket d'ecoute et n'est renseigne QUE pendant l'attente
+    (son `finally` la remet a None en sortant, quelle que soit la sortie).
+    """
+    th = win._net_thread
+    return th is not None and getattr(th, "_srv", None) is not None
 
 
 def test_closing_the_address_card_keeps_the_host_listening(app, monkeypatch):
@@ -628,13 +631,20 @@ def test_closing_the_address_card_keeps_the_host_listening(app, monkeypatch):
                         staticmethod(lambda *a, **k: (port, True)))
     try:
         win._host_mirror()
-        assert wait_until(lambda: (app.processEvents(), _is_listening(port))[1], 5.0), \
+        assert wait_until(lambda: (app.processEvents(), _is_listening(win))[1], 5.0), \
             "l'hote n'a jamais ecoute"
         assert win._host_info is not None, "la fiche d'adresse n'a pas ete montree"
 
         win._host_info.accept()                      # le bouton « Fermer » de la fiche
-        app.processEvents()
-        assert _is_listening(port), "fermer la fiche a arrete l'hebergement"
+        # ⚠️ ET ON LAISSE LE TEMPS A UNE ANNULATION D'AGIR. `cancel()` ne ferme pas la
+        # socket lui-meme : il pose un drapeau que la boucle d'attente relit toutes les
+        # POLL_S. Verifier dans la foulee verrait donc l'ecoute encore ouverte meme avec
+        # l'ancien comportement -- un test qui ne peut plus echouer.
+        end = time.monotonic() + 4 * shell._NetConnect.POLL_S
+        while time.monotonic() < end:
+            app.processEvents()
+            time.sleep(0.02)
+        assert _is_listening(win), "fermer la fiche a arrete l'hebergement"
         assert win._net_attempt_pending(), "la tentative a ete annulee en silence"
     finally:
         win._cancel_net_attempt()
