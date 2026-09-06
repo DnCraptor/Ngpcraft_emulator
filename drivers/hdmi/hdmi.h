@@ -65,6 +65,9 @@ extern "C" {
 	#define beginHDMI_PIN_data (HDMI_BASE_PIN+2)
 #endif
 
+#ifdef TEXTMODE_COLS
+#undef TEXTMODE_COLS
+#endif
 #define TEXTMODE_COLS 53
 #define TEXTMODE_ROWS 30
 

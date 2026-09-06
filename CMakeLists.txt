@@ -49,8 +49,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pico_sdk_init()
 
-# Final .uf2/.elf/.bin land in <repo>/bin, not scattered under build/.
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+# One clean output dir for every artifact. NOTE: RUNTIME_OUTPUT_DIRECTORY steers
+# .elf/.bin/.hex here, but pico_add_extra_outputs writes the .uf2 into the build
+# tree regardless, so it is relocated with a POST_BUILD copy below.
+set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 
 # Stack layout / guards — verbatim from pico-speccy MURM2 (core0 4 KB fills the
 # empty SCRATCH_Y; core1 pinned 2 KB; MSPLIM guards turn any overflow into a
@@ -131,3 +136,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BUILD_NAME}")
 message(STATUS "NGP build name: ${BUILD_NAME}")
 
 pico_add_extra_outputs(${PROJECT_NAME})
+
+# pico_add_extra_outputs emits the .uf2 into CMAKE_CURRENT_BINARY_DIR, not OUTPUT_DIR;
+# put the flashable image alongside the other artifacts in OUTPUT_DIR.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_CURRENT_BINARY_DIR}/${BUILD_NAME}.uf2"
+        "${OUTPUT_DIR}/${BUILD_NAME}.uf2"
+    VERBATIM)
