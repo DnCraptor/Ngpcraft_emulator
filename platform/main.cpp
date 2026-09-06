@@ -1,4 +1,4 @@
-// platform/main.cpp — NGP-on-RP2350, Milestone 0 (platform bring-up only).
+// platform/main.cpp — NGP-on-RP2350: platform bring-up, then hand off to emu_run().
 //
 // Boots the vendored pico-speccy platform and shows a colour-bar test pattern,
 // BEFORE any emulator glue. Once this shows on real hardware, the three seam
@@ -17,6 +17,7 @@ extern "C" {
 void video_show_test_pattern(void);          // platform/video_hooks.c
 extern uint8_t linkVGA01;                     // defined in the vga driver
 int testPins(uint32_t pin0, uint32_t pin1);   // platform/vga_detect.cpp
+void emu_run(void);                           // platform/emu.cpp (never returns)
 }
 
 #ifndef PICO_DEFAULT_LED_PIN
@@ -64,9 +65,8 @@ int main() {
 
     sem_release(&vga_start_semaphore);                 // let core1 enter its service loop
 
-    while (true) {                                     // phase 3: steady 2 Hz heartbeat
-        gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(250);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(250);
-    }
+    // Seam 1 bring-up: load a cart from SD into PSRAM and run it blind. GP25 now
+    // reports the emulator (see emu.cpp); the colour bars stay until the video seam.
+    emu_run();                                         // never returns
     return 0;
 }

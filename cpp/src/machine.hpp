@@ -606,10 +606,54 @@ bool exec_mem_family(struct Machine& m, ngpc_record_t* rec, uint8_t op, uint32_t
 Region region_of(uint32_t addr);
 bool   region_writable(Region r);
 
+/* Region-backed store replacing the flat 16 MB `mem` vector, which cannot fit
+ * RP2350 SRAM. The live machine (~96 KB: IO/RAM/K2GE/VRAM/BIOS) stays in SRAM;
+ * the cartridge window is a caller-owned PSRAM buffer set via ngpc_set_cart_ram().
+ * operator[] dispatches an address to its backing byte -- semantics identical to
+ * the old flat array (same 0xFF-padded windows, same writability), only the
+ * storage location changes. Boundaries MUST track region_of() above. */
+struct MemProxy {
+    uint8_t  io  [0x00100] = {};   /* 0x000000-0x0000FF  TMP95C061 SFRs        */
+    uint8_t  ram [0x04000] = {};   /* 0x004000-0x007FFF  work RAM + Z80 RAM     */
+    uint8_t  k2ge[0x01000] = {};   /* 0x008000-0x008FFF  video regs + palette   */
+    uint8_t  vram[0x03000] = {};   /* 0x009000-0x00BFFF  SCR1/SCR2/CHR          */
+    uint8_t  bios[0x10000] = {};   /* 0xFF0000-0xFFFFFF  BIOS (persists a reset) */
+    uint8_t* cart = nullptr;       /* 0x200000/0x800000 windows -> PSRAM (die1@0, die2@0x200000) */
+    uint8_t  sink = 0;             /* unmapped reads see 0; guarded writes never reach here */
+
+    inline uint8_t* ptr(uint32_t a) {
+        a &= 0x00FFFFFFu;
+        if (a >= 0x004000u && a <= 0x007FFFu) return &ram[a - 0x004000u];   /* RAM: hottest */
+        if (a >= 0x200000u && a <= 0x3FFFFFu) return cart ? &cart[a - 0x200000u]            : &sink;
+        if (a <= 0x0000FFu)                   return &io[a];
+        if (a >= 0x008000u && a <= 0x008FFFu) return &k2ge[a - 0x008000u];
+        if (a >= 0x009000u && a <= 0x00BFFFu) return &vram[a - 0x009000u];
+        if (a >= 0x800000u && a <= 0x9FFFFFu) return cart ? &cart[0x200000u + (a - 0x800000u)] : &sink;
+        if (a >= 0xFF0000u)                   return &bios[a - 0xFF0000u];
+        return &sink;                                                        /* unmapped */
+    }
+    inline uint8_t&       operator[](uint32_t a)       { return *ptr(a); }
+    inline const uint8_t& operator[](uint32_t a) const { return *const_cast<MemProxy*>(this)->ptr(a); }
+
+    /* Replaces std::fill(mem.begin()+lo, mem.begin()+hi, v) over a window. */
+    inline void fill(uint32_t lo, uint32_t hi, uint8_t v) {
+        for (uint32_t a = lo; a < hi; ++a) *ptr(a) = v;
+    }
+    /* Replaces the reset's std::fill(mem.begin(), mem.end(), 0): only the SRAM
+     * machine regions. cart is defined by the 0xFF-fill+copy that follows; bios
+     * persists (it is ROM, never written) and is loaded once. */
+    inline void clear_sram() {
+        std::memset(io, 0, sizeof io);   std::memset(ram,  0, sizeof ram);
+        std::memset(k2ge, 0, sizeof k2ge); std::memset(vram, 0, sizeof vram);
+    }
+};
+
 struct Machine {
-    std::vector<uint8_t> mem;
-    std::vector<uint8_t> rom;
-    std::vector<uint8_t> bios;
+    MemProxy mem;               /* region-dispatched: SRAM regions + cart in PSRAM      */
+    uint8_t* rom      = nullptr;/* pristine cartridge image (PSRAM); reset re-copies it */
+    uint32_t rom_len  = 0;
+    uint32_t bios_len = 0;      /* BIOS bytes loaded into mem.bios                      */
+    uint32_t cart_cap = 0;      /* capacity of each cart region (working / pristine)    */
     /* What the coin cell kept. Empty = the cell is dead (or was never fitted), which is
      * a blank RAM and a BIOS that says so. Restored by `reset_memory()` AFTER the wipe,
      * exactly like the flash contents: a power cycle does not erase either of them. */
@@ -1768,7 +1812,7 @@ struct Machine {
 
     bool in_vblank() const { return scanline >= kVisibleScanlines; }
 
-    Machine() : mem(kMemSize, 0) {}
+    Machine() {}
 
     void reset_memory();
 
@@ -2301,7 +2345,7 @@ struct Machine {
     }
 
     uint32_t rom_entry_point() const {
-        if (rom.size() < 0x20) return 0x200000;
+        if (rom_len < 0x20) return 0x200000;
         return uint32_t(rom[0x1C]) | (uint32_t(rom[0x1D]) << 8) |
                (uint32_t(rom[0x1E]) << 16) | (uint32_t(rom[0x1F]) << 24);
     }

@@ -84,13 +84,13 @@ bool region_writable(Region r) {
  * A BIOS without that routine gets no table and no invented address. */
 uint32_t Machine::seed_user_vector_table() {
     static const uint8_t kAnchor[] = {0x44, 0xB8, 0x6F, 0x00, 0x00};   /* ld XIX, 0x00006FB8 */
-    if (bios.size() < sizeof(kAnchor) + 5) return 0;
+    if (bios_len < sizeof(kAnchor) + 5) return 0;
 
-    for (size_t i = 5; i + sizeof(kAnchor) <= bios.size(); ++i) {
-        if (std::memcmp(&bios[i], kAnchor, sizeof(kAnchor)) != 0) continue;
-        if (bios[i - 5] != 0x45) continue;                             /* ld XIY, imm32 */
-        const uint32_t stub = uint32_t(bios[i - 4]) | (uint32_t(bios[i - 3]) << 8) |
-                              (uint32_t(bios[i - 2]) << 16) | (uint32_t(bios[i - 1]) << 24);
+    for (size_t i = 5; i + sizeof(kAnchor) <= bios_len; ++i) {
+        if (std::memcmp(&mem.bios[i], kAnchor, sizeof(kAnchor)) != 0) continue;
+        if (mem.bios[i - 5] != 0x45) continue;                             /* ld XIY, imm32 */
+        const uint32_t stub = uint32_t(mem.bios[i - 4]) | (uint32_t(mem.bios[i - 3]) << 8) |
+                              (uint32_t(mem.bios[i - 2]) << 16) | (uint32_t(mem.bios[i - 1]) << 24);
         if (stub < kBiosBase) continue;                                /* must point INTO the BIOS */
         for (unsigned slot = 0; slot < kUserVectorTableSlots; ++slot) {
             const uint32_t a = kUserVectorTableBase + slot * 4;
@@ -129,7 +129,7 @@ void Machine::reset_memory() {
     serial_rx_shift_byte = 0;
     serial_rx_had_pending = false;
 
-    std::fill(mem.begin(), mem.end(), uint8_t(0));
+    mem.clear_sram();
 
     for (uint32_t a = 0; a < 0x100; ++a) mem[a] = kIoPageReset[a];
 
@@ -145,7 +145,7 @@ void Machine::reset_memory() {
      * (already zeroed above). The documented non-zero cells follow. */
 
     /* The BIOS copies the ROM header mode byte here at power-on. */
-    mem[0x006F91] = rom.size() > 0x23 ? rom[0x23] : 0x00;
+    mem[0x006F91] = rom_len > 0x23 ? rom[0x23] : 0x00;
 
     /* ⚡ K1GE COMPATIBLE MODE, FOR THE MONOCHROME CARTRIDGES.
      *
@@ -165,7 +165,7 @@ void Machine::reset_memory() {
      * exactly as we do for the user vector table and the registers. Without it, the
      * mono games run and draw, and the renderer resolves every pixel through the
      * K2GE palettes they never wrote: a blank screen. */
-    if (rom.size() > 0x23 && rom[0x23] < 0x10) {
+    if (rom_len > 0x23 && rom[0x23] < 0x10) {
         mem[0x0087E2] = 0x80;
         mem[0x0087F0] = 0x55;      // locked, which is where the BIOS leaves it
         mem[0x006F95] = 0x00;
@@ -325,14 +325,14 @@ void Machine::reset_memory() {
      * image straight through 0x200000..0x5FFFFF, planting the second die's bytes
      * at 0x400000 -- an address range that is NOT a cartridge window on this bus.
      * Chip 0 is capped at its die size; the remainder goes where the pins go. */
-    std::fill(mem.begin() + 0x200000, mem.begin() + 0x400000, uint8_t(0xFF));
-    const size_t chip0 = rom.size() < size_t(0x200000) ? rom.size() : size_t(0x200000);
+    mem.fill(0x200000, 0x400000, 0xFF);
+    const size_t chip0 = rom_len < size_t(0x200000) ? rom_len : size_t(0x200000);
     for (size_t i = 0; i < chip0; ++i)
         mem[0x200000 + i] = rom[i];
-    if (rom.size() > 0x200000) {
-        std::fill(mem.begin() + 0x800000, mem.begin() + 0xA00000, uint8_t(0xFF));
-        const size_t chip1 = rom.size() - 0x200000 < size_t(0x200000)
-                                 ? rom.size() - 0x200000 : size_t(0x200000);
+    if (rom_len > 0x200000) {
+        mem.fill(0x800000, 0xA00000, 0xFF);
+        const size_t chip1 = rom_len - 0x200000 < size_t(0x200000)
+                                 ? rom_len - 0x200000 : size_t(0x200000);
         for (size_t i = 0; i < chip1; ++i)
             mem[0x800000 + i] = rom[0x200000 + i];
     }
@@ -341,9 +341,8 @@ void Machine::reset_memory() {
     flash_mode[0] = flash_mode[1] = 0;
     flash_step[0] = flash_step[1] = 0;
 
-    /* BIOS image, when attached. */
-    for (size_t i = 0; i < bios.size() && (0xFF0000 + i) <= kAddrMask; ++i)
-        mem[0xFF0000 + i] = bios[i];
+    /* BIOS lives in mem.bios (loaded once by ngpc_load_bios) and persists a reset:
+     * it is ROM, the game never writes it, so there is nothing to restore here. */
 
     /* ⚡ WHAT THE SUB-BATTERY KEPT. Applied AFTER the wipe above, because on the real
      * console a power cycle does not clear this RAM -- a coin cell holds it, and that
@@ -1005,7 +1004,7 @@ uint32_t Machine::flash_presented_capacity(int chip) const {
  * programs, so an under-filled cart would have walked its 1.5 MiB of padding a
  * quarter of a million times for one save. */
 void Machine::flash_measure_image() {
-    const uint32_t total = uint32_t(rom.size());
+    const uint32_t total = rom_len;
     for (int chip = 0; chip < 2; ++chip) {
         const uint32_t begin = chip == 0 ? 0u : kCartChipSize;
         if (total <= begin) { flash_image_bytes[chip] = 0; continue; }

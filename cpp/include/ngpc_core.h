@@ -169,6 +169,12 @@ NGPC_API uint32_t    ngpc_abi_version(void);
 NGPC_API ngpc_t*     ngpc_create(void);
 NGPC_API void        ngpc_destroy(ngpc_t*);
 
+/* Cartridge RAM: two caller-owned buffers of `cap` bytes each (>= 4 MiB for a full
+ * 4 MiB cart). `work` is the live cart window (reads + flash saves); `pristine` holds
+ * the loaded image and is re-copied into the window on every reset. Call once, after
+ * ngpc_create() and before ngpc_load_rom(). RP2350: both in PSRAM. Desktop: two malloc()s. */
+NGPC_API void        ngpc_set_cart_ram(ngpc_t*, uint8_t* work, uint8_t* pristine, size_t cap);
+
 NGPC_API int         ngpc_load_rom (ngpc_t*, const uint8_t* data, size_t len);
 NGPC_API int         ngpc_load_bios(ngpc_t*, const uint8_t* data, size_t len); /* 65536 */
 

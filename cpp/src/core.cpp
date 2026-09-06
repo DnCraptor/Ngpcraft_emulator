@@ -28,10 +28,21 @@ NGPC_API void ngpc_destroy(ngpc_t* h) {
     delete reinterpret_cast<Machine*>(h);
 }
 
+NGPC_API void ngpc_set_cart_ram(ngpc_t* h, uint8_t* work, uint8_t* pristine, size_t cap) {
+    if (!h) return;
+    Machine* m = reinterpret_cast<Machine*>(h);
+    m->mem.cart = work;       /* live cart window: reads + flash-save writes land here */
+    m->rom      = pristine;   /* pristine image, re-copied into the window on every reset */
+    m->cart_cap = uint32_t(cap);
+}
+
 NGPC_API int ngpc_load_rom(ngpc_t* h, const uint8_t* data, size_t len) {
     if (!h || !data || len < 0x30) return -1;   /* ROM_HEADER_SIZE */
     Machine* m = reinterpret_cast<Machine*>(h);
-    m->rom.assign(data, data + len);
+    if (!m->rom || !m->mem.cart) return -2;   /* ngpc_set_cart_ram() not called yet */
+    if (len > m->cart_cap)       return -3;   /* ROM larger than the cart region      */
+    if (data != m->rom) std::memcpy(m->rom, data, len);   /* skip when read straight into pristine */
+    m->rom_len = uint32_t(len);
     m->flash_measure_image();
     /* The cartridge IS the flash chip. Its block map comes from its size, and a game
      * saves by erasing and programming the small blocks at the top (SDK FlashMem.txt).
@@ -168,7 +179,8 @@ NGPC_API uint32_t ngpc_get_framebuffer(ngpc_t* h, uint16_t* out, uint32_t max_pi
 NGPC_API int ngpc_load_bios(ngpc_t* h, const uint8_t* data, size_t len) {
     if (!h || !data || len != 65536) return -1;
     Machine* m = reinterpret_cast<Machine*>(h);
-    m->bios.assign(data, data + len);
+    std::memcpy(m->mem.bios, data, len);      /* len == 65536, fills the whole window */
+    m->bios_len = uint32_t(len);
     return 0;
 }
 
@@ -187,7 +199,7 @@ NGPC_API int ngpc_load_bios(ngpc_t* h, const uint8_t* data, size_t len) {
  * Returns false (and leaves `out` untouched) when there is no BIOS to boot. */
 static bool capture_bios_boot_char_ram(ngpc_t* h, uint8_t* out) {
     Machine* m = reinterpret_cast<Machine*>(h);
-    if (m->bios.empty()) return false;          /* no BIOS -> nothing to seed, and no invention */
+    if (m->bios_len == 0) return false;          /* no BIOS -> nothing to seed, and no invention */
 
     ngpc_reset(h, kResetBiosBoot);
 

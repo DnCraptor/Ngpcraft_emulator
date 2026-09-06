@@ -100,7 +100,9 @@ add_executable(${PROJECT_NAME}
     platform/main.cpp
     platform/board.cpp
     platform/video_hooks.c
-    platform/vga_detect.cpp)
+    platform/vga_detect.cpp
+    platform/emu.cpp
+    platform/usb_disk_stub.c)
 
 # MURM2 pin map + VGA_HDMI display path — from pico-speccy IF(MURM2) block.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
