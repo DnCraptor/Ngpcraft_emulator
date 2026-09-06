@@ -5,9 +5,8 @@
 // de-ZX substitutions: Config::max_flash_freq -> BOARD_MAX_FLASH_FREQ, and
 // Debug::fault_log(...) -> removed. Provenance: DnCraptor/pico-speccy.
 //
-// Milestone 0 scope: flash timings valid at 378 MHz + a slim core1 render loop.
-// PSRAM bring-up (butter/QMI + SPI) is intentionally NOT here yet — it belongs
-// with Seam 1 (cart ROM in PSRAM); the emulator is not driven at this milestone.
+// Covers: flash timings valid at 378 MHz, butter/QSPI PSRAM bring-up (Seam 1 —
+// cart ROM lives in PSRAM), and a slim core1 render loop.
 
 #include <pico/stdlib.h>
 #include <pico/multicore.h>
@@ -24,6 +23,7 @@
 #include <hardware/regs/pads_qspi.h>
 #include <hardware/structs/pads_qspi.h>
 #include <hardware/regs/addressmap.h>
+#include "ChipPackage.h"
 
 #include "board.h"
 extern "C" {
@@ -291,6 +291,201 @@ static void __no_inline_not_in_flash_func(flash_qe_fix)() {
     restore_interrupts(ints);
 }
 
+// ── butter/QSPI PSRAM (vendored verbatim from pico-speccy main.cpp; the only
+// edit is Config::max_psram_freq -> 166, its pico-speccy default) ─────────────
+uint8_t psram_pin;
+static bool psram_disabled_runtime = false;
+#ifdef BUTTER_PSRAM_GPIO
+#define MB16 (16ul << 20)
+#define MB8 (8ul << 20)
+#define MB4 (4ul << 20)
+#define MB1 (1ul << 20)
+uint8_t* PSRAM_DATA = (uint8_t*)0x11000000;
+static int BUTTER_PSRAM_SIZE = -1;
+
+static void __not_in_flash_func(psram_retiming)() {
+    const int max_psram_freq = 166 * MHZ;
+    const int clock_hz = clock_get_hz(clk_sys);
+    int divisor = (clock_hz + max_psram_freq - 1) / max_psram_freq;
+    if (divisor == 1 && clock_hz > 100000000) divisor = 2;
+    int rxdelay = divisor;
+    if (clock_hz / divisor > 100000000) rxdelay += 1;
+    const int clock_period_fs = 1000000000000000ll / clock_hz;
+    const int max_select = (125 * 1000000) / clock_period_fs;
+    const int min_deselect = (18 * 1000000 + (clock_period_fs - 1)) / clock_period_fs - (divisor + 1) / 2;
+    qmi_hw->m[1].timing = 1 << QMI_M1_TIMING_COOLDOWN_LSB |
+                          QMI_M1_TIMING_PAGEBREAK_VALUE_1024 << QMI_M1_TIMING_PAGEBREAK_LSB |
+                          max_select << QMI_M1_TIMING_MAX_SELECT_LSB |
+                          min_deselect << QMI_M1_TIMING_MIN_DESELECT_LSB |
+                          rxdelay << QMI_M1_TIMING_RXDELAY_LSB |
+                          divisor << QMI_M1_TIMING_CLKDIV_LSB;
+}
+static uint32_t __not_in_flash_func(butter_psram_probe)() {
+#if BUTTER_PSRAM_GPIO == 255
+    return 0;   // PSRAM disabled via CMake kill-switch (set(PSRAM OFF))
+#else
+    if (BUTTER_PSRAM_SIZE != -1) return BUTTER_PSRAM_SIZE;
+    for(int i = MB8; i < MB16; i += 4096)
+        PSRAM_DATA[i] = 16;
+    for(int i = MB4; i < MB8; i += 4096)
+        PSRAM_DATA[i] = 8;
+    for(int i = MB1; i < MB4; i += 4096)
+        PSRAM_DATA[i] = 4;
+    for(int i = 0; i < MB1; i += 4096)
+        PSRAM_DATA[i] = 1;
+    uint32_t res = PSRAM_DATA[MB16 - 4096];
+    for (int i = MB16 - MB1; i < MB16; i += 4096) {
+        if (res != PSRAM_DATA[i]) {
+            BUTTER_PSRAM_SIZE = 0;
+            return 0;
+        }
+    }
+    // A floating bus (no chip) can read back a consistent garbage value (e.g.
+    // 0xFF); only the markers actually planted by the probe are trustworthy.
+    if (res != 1 && res != 4 && res != 8 && res != 16)
+        res = 0;
+    BUTTER_PSRAM_SIZE = res << 20;
+    return BUTTER_PSRAM_SIZE;
+#endif
+}
+
+// What every consumer asks: usable butter PSRAM. 0 while the runtime kill-switch is on.
+uint32_t __not_in_flash_func(butter_psram_size)() {
+    if (psram_disabled_runtime) return 0;
+    return butter_psram_probe();
+}
+
+// The probe result regardless of the switch — "is there a chip on this board at all",
+// which is what decides whether the Debug > PSRAM row is offered.
+uint32_t __not_in_flash_func(butter_psram_probed)() { return butter_psram_probe(); }
+
+// Probe for a PSRAM chip on XIP CS1 via QMI direct mode: exit QPI (0xF5) in
+// case the chip is still in QPI after a warm reboot, then Read ID (0x9F).
+// APS6404-compatible chips answer MF ID 0x0D, KGD 0x5D; with no chip the SD
+// lines float and read 0x00/0xFF. Must run entirely from RAM: while direct
+// mode is enabled any flash (CS0) access would deadlock the QMI.
+static bool __no_inline_not_in_flash_func(psram_detect)() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        // Exit QPI mode (quad-width single byte, output enabled)
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        qmi_hw->direct_tx = QMI_DIRECT_TX_OE_BITS |
+                            (QMI_DIRECT_TX_IWIDTH_VALUE_Q << QMI_DIRECT_TX_IWIDTH_LSB) |
+                            0xF5;
+        while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+            ;
+        (void)qmi_hw->direct_rx;
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)   // respect min CS deselect time
+            ;
+
+        // Read ID: 0x9F + 3 address bytes, then MF ID and KGD
+        qmi_hw->direct_csr |= QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        uint8_t mfid = 0, kgd = 0;
+        for (int i = 0; i < 6; ++i) {
+            qmi_hw->direct_tx = (i == 0) ? 0x9F : 0xFF;
+            while (!(qmi_hw->direct_csr & QMI_DIRECT_CSR_TXEMPTY_BITS))
+                ;
+            while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+                ;
+            uint8_t b = (uint8_t)qmi_hw->direct_rx;
+            if (i == 4) mfid = b;
+            else if (i == 5) kgd = b;
+        }
+        qmi_hw->direct_csr &= ~QMI_DIRECT_CSR_ASSERT_CS1N_BITS;
+        for (volatile int d = 0; d < 64; ++d)
+            ;
+
+        if (kgd == 0x5D || mfid == 0x5D)
+            return true;
+        // The first transaction after a chip reset is known to come back
+        // garbage on some chips (see init_psram in psram_spi.c) — retry.
+    }
+    return false;
+}
+void __no_inline_not_in_flash_func(psram_init)(uint cs_pin) {
+    gpio_set_function(cs_pin, GPIO_FUNC_XIP_CS1);
+
+    // DIRECT-MODE WINDOW — strict discipline (root cause of the intermittent
+    // post-reset boot hang, hw-traced 2026-07-07): while DIRECT_CSR.EN is set,
+    // ANY flash (CS0) fetch stalls the core forever. That includes (a) calls
+    // into flash-resident code — psram_retiming() used to run inside this
+    // window and its clock_get_hz() is flash code, so the boot hung whenever
+    // that line wasn't already XIP-cache-resident — and (b) any IRQ whose
+    // handler lives in flash (USB is live here: tuh_init ran before us). So:
+    // IRQs off for the whole window, nothing but RAM code inside, and the
+    // window ends BEFORE psram_retiming/format setup (plain register writes
+    // that don't need direct mode).
+    const uint32_t ints = save_and_disable_interrupts();
+
+    // Enable direct mode (manual CS for the ID probe), clkdiv of 30.
+    qmi_hw->direct_csr = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
+    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+        ;
+
+    // No chip on CS1 (board assembled without PSRAM): leave XIP CS1 unconfigured.
+    // Without this check the size probe below reads a floating bus, which can
+    // return a consistent garbage value and report a chip that is not there.
+    if (!psram_detect()) {
+        qmi_hw->direct_csr = 0;
+        restore_interrupts(ints);
+        BUTTER_PSRAM_SIZE = 0;
+        return;
+    }
+
+    // Re-enter direct mode with auto CS, clkdiv of 10.
+    qmi_hw->direct_csr = 10 << QMI_DIRECT_CSR_CLKDIV_LSB | \
+                               QMI_DIRECT_CSR_EN_BITS | \
+                               QMI_DIRECT_CSR_AUTO_CS1N_BITS;
+    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+        ;
+
+    // Enable QPI mode on the PSRAM
+    const uint CMD_QPI_EN = 0x35;
+    qmi_hw->direct_tx = QMI_DIRECT_TX_NOPUSH_BITS | CMD_QPI_EN;
+
+    while (qmi_hw->direct_csr & QMI_DIRECT_CSR_BUSY_BITS)
+        ;
+
+    // END of the direct-mode window — flash code is safe again from here on.
+    qmi_hw->direct_csr = 0;
+    restore_interrupts(ints);
+
+    psram_retiming();
+
+    // Set PSRAM commands and formats
+    qmi_hw->m[1].rfmt =
+        QMI_M0_RFMT_PREFIX_WIDTH_VALUE_Q << QMI_M0_RFMT_PREFIX_WIDTH_LSB |\
+        QMI_M0_RFMT_ADDR_WIDTH_VALUE_Q   << QMI_M0_RFMT_ADDR_WIDTH_LSB |\
+        QMI_M0_RFMT_SUFFIX_WIDTH_VALUE_Q << QMI_M0_RFMT_SUFFIX_WIDTH_LSB |\
+        QMI_M0_RFMT_DUMMY_WIDTH_VALUE_Q  << QMI_M0_RFMT_DUMMY_WIDTH_LSB |\
+        QMI_M0_RFMT_DATA_WIDTH_VALUE_Q   << QMI_M0_RFMT_DATA_WIDTH_LSB |\
+        QMI_M0_RFMT_PREFIX_LEN_VALUE_8   << QMI_M0_RFMT_PREFIX_LEN_LSB |\
+        6                                << QMI_M0_RFMT_DUMMY_LEN_LSB;
+
+    qmi_hw->m[1].rcmd = 0xEB;
+
+    qmi_hw->m[1].wfmt =
+        QMI_M0_WFMT_PREFIX_WIDTH_VALUE_Q << QMI_M0_WFMT_PREFIX_WIDTH_LSB |\
+        QMI_M0_WFMT_ADDR_WIDTH_VALUE_Q   << QMI_M0_WFMT_ADDR_WIDTH_LSB |\
+        QMI_M0_WFMT_SUFFIX_WIDTH_VALUE_Q << QMI_M0_WFMT_SUFFIX_WIDTH_LSB |\
+        QMI_M0_WFMT_DUMMY_WIDTH_VALUE_Q  << QMI_M0_WFMT_DUMMY_WIDTH_LSB |\
+        QMI_M0_WFMT_DATA_WIDTH_VALUE_Q   << QMI_M0_WFMT_DATA_WIDTH_LSB |\
+        QMI_M0_WFMT_PREFIX_LEN_VALUE_8   << QMI_M0_WFMT_PREFIX_LEN_LSB;
+
+    qmi_hw->m[1].wcmd = 0x38;
+
+    // Enable writes to PSRAM
+    hw_set_bits(&xip_ctrl_hw->ctrl, XIP_CTRL_WRITABLE_M1_BITS);
+
+    // init size
+    butter_psram_size();
+}
+#else
+uint8_t* PSRAM_DATA = (uint8_t*)0;
+uint32_t __not_in_flash_func(butter_psram_size)()   { return 0; }
+uint32_t __not_in_flash_func(butter_psram_probed)() { return 0; }
+#endif  // BUTTER_PSRAM_GPIO
+
 // ── entry points ─────────────────────────────────────────────────────────────
 
 // Runs on core0 before core1 launch: flash QE fix, regulator, clock -> CPU_MHZ
@@ -312,6 +507,17 @@ void board_init(void) {
         set_sys_clock_khz(applied * KHZ, 1);
     }
     flash_timings(applied);                 // steady-state timing for the active clock
+
+    // Butter/QSPI PSRAM (cart ROM will live here). The XIP CS1 strap differs by
+    // package — GPIO 47 on RP2350B, BUTTER_PSRAM_GPIO on RP2350A — picked at
+    // runtime so one build serves both. Runs last: psram_retiming() derives QMI
+    // timing from the final clk_sys.
+#ifdef BUTTER_PSRAM_GPIO
+#if BUTTER_PSRAM_GPIO != 255
+    psram_pin = chip_is_rp2350a() ? BUTTER_PSRAM_GPIO : 47;
+    psram_init(psram_pin);
+#endif
+#endif
 }
 
 // core1 entry. graphics_init() arms the VGA/HDMI PIO+DMA scanout; we signal core0

@@ -49,9 +49,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pico_sdk_init()
 
-# One clean output dir for every artifact. NOTE: RUNTIME_OUTPUT_DIRECTORY steers
-# .elf/.bin/.hex here, but pico_add_extra_outputs writes the .uf2 into the build
-# tree regardless, so it is relocated with a POST_BUILD copy below.
+# One clean output dir for every artifact. RUNTIME_OUTPUT_DIRECTORY steers the
+# .elf here, and pico_add_extra_outputs writes the .uf2/.bin/.hex beside it.
 set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}")
@@ -100,7 +99,8 @@ target_compile_options(ngpc_core PRIVATE -fno-exceptions -fno-rtti -O2)
 add_executable(${PROJECT_NAME}
     platform/main.cpp
     platform/board.cpp
-    platform/video_hooks.c)
+    platform/video_hooks.c
+    platform/vga_detect.cpp)
 
 # MURM2 pin map + VGA_HDMI display path — from pico-speccy IF(MURM2) block.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -136,11 +136,3 @@ set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BUILD_NAME}")
 message(STATUS "NGP build name: ${BUILD_NAME}")
 
 pico_add_extra_outputs(${PROJECT_NAME})
-
-# pico_add_extra_outputs emits the .uf2 into CMAKE_CURRENT_BINARY_DIR, not OUTPUT_DIR;
-# put the flashable image alongside the other artifacts in OUTPUT_DIR.
-add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "${CMAKE_CURRENT_BINARY_DIR}/${BUILD_NAME}.uf2"
-        "${OUTPUT_DIR}/${BUILD_NAME}.uf2"
-    VERBATIM)

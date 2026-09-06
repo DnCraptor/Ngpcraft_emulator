@@ -14,7 +14,9 @@
 #include "board.h"
 extern "C" {
 #include "graphics.h"
-void video_show_test_pattern(void);   // platform/video_hooks.c
+void video_show_test_pattern(void);          // platform/video_hooks.c
+extern uint8_t linkVGA01;                     // defined in the vga driver
+int testPins(uint32_t pin0, uint32_t pin1);   // platform/vga_detect.cpp
 }
 
 #ifndef PICO_DEFAULT_LED_PIN
@@ -46,6 +48,10 @@ int main() {
     led_blink(3);          // phase 2: board_init survived
 
     stdio_init_all();
+
+    // Cable auto-detect: sample the VGA base pins so graphics_init (core1) routes
+    // scanout to whichever connector is plugged (video_driver=0 enables this).
+    linkVGA01 = testPins(VGA_BASE_PIN, VGA_BASE_PIN + 1);
 
     sem_init(&vga_start_semaphore, 0, 1);
     sem_init(&graphics_ready_semaphore, 0, 1);

@@ -22,9 +22,9 @@
 
 static uint8_t  fb[FB_H_ALLOC][FB_W];
 
-// 1 = VGA, 2 = HDMI, 0 = auto-detect by cable (needs testPins, port pending).
-// Set to 1 for VGA. TODO: port testPins() to enable cable auto-detect (video_driver=0).
-uint8_t video_driver = 2;
+// 0 = auto-detect by cable (main() sets linkVGA01 via testPins), 1 = VGA, 2 = HDMI.
+// Force a specific output by setting 1 (VGA) or 2 (HDMI).
+uint8_t video_driver = 0;
 
 // -- driver callbacks ---------------------------------------------------------
 
