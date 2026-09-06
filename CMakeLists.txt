@@ -1,3 +1,17 @@
+# == DO NOT EDIT THE FOLLOWING LINES for the Raspberry Pi Pico VS Code Extension to work ==
+if(WIN32)
+    set(USERHOME $ENV{USERPROFILE})
+else()
+    set(USERHOME $ENV{HOME})
+endif()
+set(sdkVersion 2.3.1)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.1)
+set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
+if (EXISTS ${picoVscode})
+    include(${picoVscode})
+endif()
+# ====================================================================================
 cmake_minimum_required(VERSION 3.13)
 
 # ── NGP on RP2350 — firmware build skeleton (MURM2 + VGA_HDMI) ────────────────
@@ -18,6 +32,13 @@ set(PICO_BOARD picospeccy_rp2350b CACHE STRING "Board type" FORCE)
 set(CPU_MHZ 378)            # nominal profile; 504 MHz = overclock (menu, later)
 set(BUTTER_PSRAM_GPIO 8)    # MURM2
 
+# Output naming mirrors pico-speccy: <board>-<project>-<display>-<version>, so the
+# .uf2 name states the target hardware. BOARD_TAG follows pico-speccy (m2p2=MURM2).
+# TODO: turn BOARD_TAG/pins into a board matrix so every pico-speccy board builds.
+set(BOARD_TAG   m2p2)       # MURM2 / RP2350B
+set(PORT_VERSION 0.1.0)
+set(BUILD_NAME "${BOARD_TAG}-ngp-VGA-HDMI-${PORT_VERSION}")
+
 include(pico_sdk_import.cmake)
 
 set(PROJECT_NAME ngp_rp2350)
@@ -28,11 +49,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 pico_sdk_init()
 
+# Final .uf2/.elf/.bin land in <repo>/bin, not scattered under build/.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/bin")
+
 # Stack layout / guards — verbatim from pico-speccy MURM2 (core0 4 KB fills the
 # empty SCRATCH_Y; core1 pinned 2 KB; MSPLIM guards turn any overflow into a
 # fault at the boundary instead of silent neighbour-stack corruption).
 add_compile_definitions(PICO_STACK_SIZE=0x2000 PICO_CORE1_STACK_SIZE=0x800
-                        PICO_USE_STACK_GUARDS=1)
+                        PICO_USE_STACK_GUARDS=1
+                        CPU_MHZ=${CPU_MHZ})
 
 # ── vendored platform drivers ────────────────────────────────────────────────
 # picomp3lib intentionally omitted (MP3 decoder — ZX/NeoGS side, unused by NGP).
@@ -67,7 +92,10 @@ target_compile_options(ngpc_core PRIVATE -fno-exceptions -fno-rtti -O2)
 # Milestone 0 links the core but does not call it.
 
 # ── firmware target ──────────────────────────────────────────────────────────
-add_executable(${PROJECT_NAME} platform/main.cpp)
+add_executable(${PROJECT_NAME}
+    platform/main.cpp
+    platform/board.cpp
+    platform/video_hooks.c)
 
 # MURM2 pin map + VGA_HDMI display path — from pico-speccy IF(MURM2) block.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
@@ -87,10 +115,19 @@ if (BUTTER_PSRAM_GPIO)
 endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    pico_stdlib pico_multicore
+    pico_stdlib pico_multicore pico_bootrom
     hardware_pio hardware_dma hardware_interp
+    hardware_vreg hardware_clocks hardware_sync hardware_flash
+    hardware_pwm hardware_i2c hardware_adc
     graphics vga-nextgen hdmi
     sdcard fatfs psram ps2 nespad audio
     ngpc_core)
+
+# Custom memory map: enlarges the stack region (PICO_STACK_SIZE=0x2000 overflows
+# the SDK default SCRATCH_Y) and reserves room for the cart ROM window (Seam 1).
+pico_set_linker_script(${PROJECT_NAME} "${CMAKE_SOURCE_DIR}/rp2350-memmap.ld")
+
+set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME "${BUILD_NAME}")
+message(STATUS "NGP build name: ${BUILD_NAME}")
 
 pico_add_extra_outputs(${PROJECT_NAME})

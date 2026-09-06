@@ -23,7 +23,7 @@ extern "C" {
 #include "font8x8.h"
 #include "font8x16.h"
 
-typedef struct video_mode_t{
+struct video_mode_t {
   int v_total;
   int v_active;
   int freq;
