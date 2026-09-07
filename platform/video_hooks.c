@@ -66,3 +66,46 @@ void video_show_test_pattern(void) {
 
     graphics_set_buffer(&fb[0][0], FB_W, FB_H_VIS);
 }
+
+
+// ── on-screen trap readout (Seam 1 diagnostics) ──────────────────────────────
+// A tiny 8x8 hex font so a trap can name itself on the HDMI/VGA screen without a
+// serial cable: one flash, read the numbers, port the opcode. Drawn straight into
+// the same 8-bit framebuffer the scanout already shows (no mode change).
+static const uint8_t hexfont[16][8] = {
+    {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0}, {0x18,0x38,0x18,0x18,0x18,0x18,0x7E,0},
+    {0x3C,0x66,0x06,0x0C,0x30,0x60,0x7E,0}, {0x3C,0x66,0x06,0x1C,0x06,0x66,0x3C,0},
+    {0x0C,0x1C,0x3C,0x6C,0x7E,0x0C,0x0C,0}, {0x7E,0x60,0x7C,0x06,0x06,0x66,0x3C,0},
+    {0x1C,0x30,0x60,0x7C,0x66,0x66,0x3C,0}, {0x7E,0x06,0x0C,0x18,0x30,0x30,0x30,0},
+    {0x3C,0x66,0x66,0x3C,0x66,0x66,0x3C,0}, {0x3C,0x66,0x66,0x3E,0x06,0x0C,0x38,0},
+    {0x18,0x3C,0x66,0x66,0x7E,0x66,0x66,0}, {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0},
+    {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0}, {0x78,0x6C,0x66,0x66,0x66,0x6C,0x78,0},
+    {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0}, {0x7E,0x60,0x60,0x7C,0x60,0x60,0x60,0},
+};
+
+static void put_glyph(int px, int py, int scale, int g, uint8_t col) {
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++)
+            if (hexfont[g][r] & (0x80 >> c))
+                for (int sy = 0; sy < scale; sy++)
+                    for (int sx = 0; sx < scale; sx++) {
+                        int x = px + c*scale + sx, y = py + r*scale + sy;
+                        if ((unsigned)x < FB_W && (unsigned)y < FB_H_ALLOC) fb[y][x] = col;
+                    }
+}
+static void put_hex(int x, int y, int scale, uint32_t v, int ndig, uint8_t col) {
+    for (int i = ndig - 1; i >= 0; i--) { put_glyph(x, y, scale, (v >> (4*i)) & 0xF, col); x += (8*scale)+scale; }
+}
+
+// Rows (white on blue): stop_status(2), stop_pc(6), stop_opcode(2), frame_count(4).
+void video_show_trap(uint32_t status, uint32_t pc, uint32_t op, uint32_t frames) {
+    graphics_set_palette(0, 0x000000);
+    graphics_set_palette(1, 0x000080);   // blue backdrop
+    graphics_set_palette(7, 0xFFFFFF);   // white text
+    for (int y = 0; y < FB_H_ALLOC; y++) for (int x = 0; x < FB_W; x++) fb[y][x] = 1;
+    put_hex(16,  20, 3, status, 2, 7);
+    put_hex(16,  70, 3, pc,     6, 7);
+    put_hex(16, 120, 3, op,     2, 7);
+    put_hex(16, 170, 3, frames, 4, 7);
+    graphics_set_buffer(&fb[0][0], FB_W, FB_H_VIS);
+}

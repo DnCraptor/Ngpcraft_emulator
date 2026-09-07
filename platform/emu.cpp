@@ -20,6 +20,8 @@ extern "C" {
 #include "ngpc_core.h"
 }
 
+extern "C" const unsigned char bios_hle_data[65536];   // generated from hle_bios/bios_hle.bin
+
 #ifndef PICO_DEFAULT_LED_PIN
 #define PICO_DEFAULT_LED_PIN 25
 #endif
@@ -71,6 +73,7 @@ static uint32_t load_first_rom(uint8_t *dst, uint32_t cap) {
     return total;
 }
 
+extern "C" void video_show_trap(uint32_t status, uint32_t pc, uint32_t op, uint32_t frames);
 extern "C" void emu_run(void) {
     // Two cartridge regions in PSRAM: [0,cap) live window, [cap,2*cap) pristine.
     // cap = half the PSRAM, capped at a 4 MiB cart (a 4 MiB cart needs 8 MiB PSRAM).
@@ -82,6 +85,7 @@ extern "C" void emu_run(void) {
 
     ngpc_t *emu = ngpc_create();
     ngpc_set_cart_ram(emu, work, pristine, cap);
+    ngpc_load_bios(emu, bios_hle_data, 65536);   // HANDOFF needs the 0xFFFF00 vector table
 
     // Read the ROM straight into the pristine buffer; ngpc_load_rom then only
     // records length + flash geometry (its copy is skipped when data == pristine).
@@ -100,6 +104,14 @@ extern "C" void emu_run(void) {
     while (true) {
         ngpc_summary_t s;
         ngpc_run_frames(emu, 1, 200000u, &s);       // one frame, 200k-instr backstop
+        if (s.stop_status != 41 /* NGPC_COUNT_REACHED */ && s.stop_status != 0 /* NGPC_OK */) {
+            // Trap (un-ported opcode / HALT): stop spinning, show it on screen.
+            video_show_trap(s.stop_status, s.stop_pc, s.stop_opcode, s.frame_count);
+            while (true) {                          // slow blink == trapped (see screen)
+                gpio_put(PICO_DEFAULT_LED_PIN, 1); sleep_ms(700);
+                gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(700);
+            }
+        }
         if ((++fc % 30u) == 0) gpio_xor_mask(1u << PICO_DEFAULT_LED_PIN);
     }
 }

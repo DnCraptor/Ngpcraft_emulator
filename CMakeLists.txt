@@ -96,13 +96,23 @@ target_compile_options(ngpc_core PRIVATE -fno-exceptions -fno-rtti -O2)
 # Milestone 0 links the core but does not call it.
 
 # ── firmware target ──────────────────────────────────────────────────────────
+# Embed the HLE BIOS (hle_bios/bios_hle.bin, 64 KB) as a C array. HANDOFF reads its
+# IRQ vector table from 0xFFFF00 (the BIOS window), so a BIOS MUST be resident even
+# in the BIOS-less hand-off path; without it the first VBlank jumps to PC=0. The .bin
+# already lives in the repo, so the array is generated at configure time (flash, const).
+file(READ "${CMAKE_SOURCE_DIR}/hle_bios/bios_hle.bin" _BIOS_HEX HEX)
+string(REGEX REPLACE "(..)" "0x\\1," _BIOS_C "${_BIOS_HEX}")
+file(WRITE "${CMAKE_BINARY_DIR}/bios_hle_data.c"
+     "const unsigned char bios_hle_data[65536] = { ${_BIOS_C} };\n")
+
 add_executable(${PROJECT_NAME}
     platform/main.cpp
     platform/board.cpp
     platform/video_hooks.c
     platform/vga_detect.cpp
     platform/emu.cpp
-    platform/usb_disk_stub.c)
+    platform/usb_disk_stub.c
+    "${CMAKE_BINARY_DIR}/bios_hle_data.c")
 
 # MURM2 pin map + VGA_HDMI display path — from pico-speccy IF(MURM2) block.
 target_compile_definitions(${PROJECT_NAME} PRIVATE
