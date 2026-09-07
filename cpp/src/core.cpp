@@ -548,7 +548,6 @@ static bool deliver_irq(ngpc::Machine& m) {
     /* Log the delivery with its raster position. An interrupt is half of every raster
      * effect -- seeing the register writes without the IRQ that triggered them shows
      * the symptom and hides the cause. `addr` carries the vector index. */
-    if (m.elog_lo <= m.elog_hi) m.note_event(ngpc::Machine::kEventIrq, best_index, 0, c.pc);
     return true;
 }
 
@@ -1383,19 +1382,6 @@ NGPC_API uint32_t ngpc_link_relay_count(ngpc_t* h) {
     return reinterpret_cast<Machine*>(h)->serial_relay_count;
 }
 
-NGPC_API void ngpc_set_write_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
-    if (!h) return;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    m->wlog_lo = lo;
-    m->wlog_hi = hi;
-    m->wlog_count = 0;
-}
-
-NGPC_API uint64_t ngpc_write_log_count(ngpc_t* h) {
-    if (!h) return 0;
-    return reinterpret_cast<Machine*>(h)->wlog_count;
-}
-
 NGPC_API void ngpc_set_coverage(ngpc_t* h, int enabled) {
     if (!h) return;
     Machine* m = reinterpret_cast<Machine*>(h);
@@ -1493,38 +1479,6 @@ NGPC_API uint32_t ngpc_get_hw_violations(ngpc_t* h, ngpc_violation_t* out, uint3
     return want;
 }
 
-NGPC_API void ngpc_set_event_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
-    if (!h) return;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    m->elog_lo = lo;
-    m->elog_hi = hi;
-    m->elog_count = 0;
-}
-
-NGPC_API uint64_t ngpc_event_log_count(ngpc_t* h) {
-    if (!h) return 0;
-    return reinterpret_cast<Machine*>(h)->elog_count;
-}
-
-NGPC_API uint32_t ngpc_get_event_log(ngpc_t* h, ngpc_event_t* out, uint32_t n) {
-    if (!h || !out || n == 0) return 0;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    const uint64_t total = m->elog_count;
-    const uint64_t held = total < Machine::kElogSize ? total : Machine::kElogSize;
-    const uint32_t want = uint32_t(held < n ? held : n);
-    const uint64_t first = total - want;
-    for (uint32_t i = 0; i < want; ++i) {
-        const Machine::EventRec& e = m->elog[(first + i) % Machine::kElogSize];
-        out[i].pc = e.pc;
-        out[i].addr = e.addr;
-        out[i].scanline = e.scanline;
-        out[i].cycle = e.cycle;
-        out[i].value = e.value;
-        out[i].type = e.type;
-    }
-    return want;
-}
-
 NGPC_API void ngpc_set_callstack(ngpc_t* h, int enabled) {
     if (!h) return;
     Machine* m = reinterpret_cast<Machine*>(h);
@@ -1552,53 +1506,6 @@ NGPC_API uint32_t ngpc_get_callstack(ngpc_t* h, ngpc_frame_t* out, uint32_t n) {
         out[i].entry_pc = f.entry_pc;
         out[i].return_pc = f.return_pc;
         out[i].entry_sp = f.entry_sp;
-    }
-    return want;
-}
-
-NGPC_API void ngpc_set_read_log(ngpc_t* h, uint32_t lo, uint32_t hi) {
-    if (!h) return;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    m->rlog_lo = lo;
-    m->rlog_hi = hi;
-    m->rlog_count = 0;
-}
-
-NGPC_API uint64_t ngpc_read_log_count(ngpc_t* h) {
-    if (!h) return 0;
-    return reinterpret_cast<Machine*>(h)->rlog_count;
-}
-
-NGPC_API uint32_t ngpc_get_read_log(ngpc_t* h, ngpc_read_t* out, uint32_t n) {
-    if (!h || !out || n == 0) return 0;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    const uint64_t total = m->rlog_count;
-    const uint64_t held = total < Machine::kRlogSize ? total : Machine::kRlogSize;
-    const uint32_t want = uint32_t(held < n ? held : n);
-    /* The most recent `want`, oldest first. */
-    const uint64_t first = total - want;
-    for (uint32_t i = 0; i < want; ++i) {
-        const Machine::ReadRec& r = m->rlog[(first + i) % Machine::kRlogSize];
-        out[i].pc = r.pc;
-        out[i].addr = r.addr;
-        out[i].value = r.value;
-    }
-    return want;
-}
-
-NGPC_API uint32_t ngpc_get_write_log(ngpc_t* h, ngpc_write_t* out, uint32_t n) {
-    if (!h || !out || n == 0) return 0;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    const uint64_t total = m->wlog_count;
-    const uint64_t held = total < Machine::kWlogSize ? total : Machine::kWlogSize;
-    const uint32_t want = uint32_t(held < n ? held : n);
-    /* The most recent `want`, oldest first. */
-    const uint64_t first = total - want;
-    for (uint32_t i = 0; i < want; ++i) {
-        const Machine::WriteRec& r = m->wlog[(first + i) % Machine::kWlogSize];
-        out[i].pc = r.pc;
-        out[i].addr = r.addr;
-        out[i].value = r.value;
     }
     return want;
 }
@@ -2382,23 +2289,6 @@ NGPC_API uint32_t ngpc_get_audio(ngpc_t* h, int16_t* out, uint32_t frames) {
 NGPC_API uint64_t ngpc_audio_dropped(ngpc_t* h) {
     if (!h) return 0;
     return reinterpret_cast<Machine*>(h)->apu.dropped;
-}
-
-NGPC_API uint64_t ngpc_apu_write_count(ngpc_t* h) {
-    if (!h) return 0;
-    return reinterpret_cast<Machine*>(h)->apu_writes;
-}
-
-NGPC_API uint32_t ngpc_get_apu_writes(ngpc_t* h, ngpc_apu_write_t* out, uint32_t n) {
-    if (!h || !out || n == 0) return 0;
-    Machine* m = reinterpret_cast<Machine*>(h);
-    const uint64_t total = m->apu_writes;
-    const uint64_t held  = total < Machine::kApuLogSize ? total : Machine::kApuLogSize;
-    const uint32_t want  = uint32_t(held < n ? held : n);
-    const uint64_t first = total - want;                  /* oldest we still keep */
-    for (uint32_t i = 0; i < want; ++i)
-        out[i] = m->apu_log[(first + i) % Machine::kApuLogSize];
-    return want;
 }
 
 NGPC_API void ngpc_get_z80(ngpc_t* h, ngpc_z80_t* out) {

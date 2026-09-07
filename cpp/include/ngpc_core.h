@@ -463,16 +463,6 @@ typedef struct {
 #define NGPC_APU_WRITE_PORT 0
 #define NGPC_APU_WRITE_MEM  1
 
-typedef struct {
-    uint64_t cycle;
-    uint16_t address;   /* the OUT port, or the full Z80 address for a MEM write */
-    uint8_t  value;
-    uint8_t  kind;
-} ngpc_apu_write_t;
-
-/* Copies up to `n` of the most recent APU writes, oldest first, into `out`.
- * Returns how many were copied. The log is a ring buffer; `ngpc_apu_write_count`
- * reports the TOTAL ever seen so a caller can tell when it has dropped some. */
 /* Drains up to `frames` STEREO frames (interleaved L,R, signed 16-bit, 44100 Hz)
  * from the chip's ring buffer. Returns how many were copied.
  * `ngpc_audio_dropped` reports frames the host was too slow to collect: silently
@@ -581,8 +571,6 @@ NGPC_API uint32_t ngpc_get_layer_mask(ngpc_t*);
 NGPC_API uint32_t ngpc_get_audio(ngpc_t*, int16_t* out, uint32_t frames);
 NGPC_API uint64_t ngpc_audio_dropped(ngpc_t*);
 
-NGPC_API uint32_t ngpc_get_apu_writes(ngpc_t*, ngpc_apu_write_t* out, uint32_t n);
-NGPC_API uint64_t ngpc_apu_write_count(ngpc_t*);
 
 NGPC_API void ngpc_get_z80(ngpc_t*, ngpc_z80_t* out);
 NGPC_API void ngpc_set_cpu(ngpc_t*, const ngpc_cpu_t* in);
@@ -835,44 +823,7 @@ NGPC_API int  ngpc_write_mem(ngpc_t*, uint32_t addr, const uint8_t* in, uint32_t
 #define NGPC_RASTER_BASE  0x008000
 NGPC_API int ngpc_get_raster_log(ngpc_t*, uint8_t* out, uint32_t n);
 
-/* ------------------------------------------------------------- write log --
- * Who wrote to this address, and from what code? ABI v10.
- *
- * The core had breakpoints on PC and nothing on memory, so "which routine fills this
- * tilemap, and why does it stop" could only be guessed at. Arm a window, run, read
- * back every write that landed inside it. `ngpc_write_log_count` is the TRUE total,
- * so a caller can always tell the ring dropped some rather than trust a partial
- * history. Pass lo > hi to disarm. */
-typedef struct {
-    uint32_t pc;      /* the PC the core held as the write went through */
-    uint32_t addr;
-    uint8_t  value;
-} ngpc_write_t;
 
-NGPC_API void     ngpc_set_write_log(ngpc_t*, uint32_t lo, uint32_t hi);
-NGPC_API uint64_t ngpc_write_log_count(ngpc_t*);
-/* Copies up to `n` of the MOST RECENT records, oldest first. Returns how many. */
-NGPC_API uint32_t ngpc_get_write_log(ngpc_t*, ngpc_write_t* out, uint32_t n);
-
-/* -------------------------------------------------------------- read log --
- * Who READ this address? ABI v11. The write log's missing half: a debugger that
- * only watches writes can see what sets a flag but never what acts on it.
- *
- * Same shape and same rules as the write log. ONE difference, and it matters:
- * instruction fetches are NOT recorded. They all go through the same read path, so
- * logging them would drown the one data read you are hunting -- and arming a window
- * over ROM would log every instruction in it. Only reads from outside the current
- * fetch window are logged. Pass lo > hi to disarm. */
-typedef struct {
-    uint32_t pc;      /* the PC the core held as the read went through */
-    uint32_t addr;
-    uint8_t  value;   /* the byte handed back */
-} ngpc_read_t;
-
-NGPC_API void     ngpc_set_read_log(ngpc_t*, uint32_t lo, uint32_t hi);
-NGPC_API uint64_t ngpc_read_log_count(ngpc_t*);
-/* Copies up to `n` of the MOST RECENT records, oldest first. Returns how many. */
-NGPC_API uint32_t ngpc_get_read_log(ngpc_t*, ngpc_read_t* out, uint32_t n);
 
 /* ------------------------------------------------------------ call stack --
  * "How did I get here?" ABI v12.
@@ -892,32 +843,6 @@ typedef struct {
     uint32_t entry_sp;    /* SP before the call pushed anything */
 } ngpc_frame_t;
 
-/* ------------------------------------------------------------ event log --
- * WHEN in the frame did that happen? ABI v12.
- *
- * The write log says a register changed and who changed it; it cannot say at which
- * SCANLINE. For raster work -- a mid-frame scroll split, an HBlank HUD, a palette
- * swap on a given line -- the timing IS the behaviour, and it was invisible.
- *
- * Every event carries its exact raster position, so a debugger can plot a frame as
- * a scanline x cycle grid. Armed over an address window (typically the video
- * registers at 0x8000..0x83FF); interrupt deliveries are logged whenever the window
- * is armed at all, with `addr` holding the vector index. Pass lo > hi to disarm. */
-#define NGPC_EVENT_WRITE 0
-#define NGPC_EVENT_IRQ   1
-
-typedef struct {
-    uint32_t pc;
-    uint32_t addr;      /* the address written, or the vector index for an IRQ */
-    uint16_t scanline;
-    uint16_t cycle;     /* cycles elapsed into that scanline (0..514) */
-    uint8_t  value;
-    uint8_t  type;      /* NGPC_EVENT_* */
-} ngpc_event_t;
-
-NGPC_API void     ngpc_set_event_log(ngpc_t*, uint32_t lo, uint32_t hi);
-NGPC_API uint64_t ngpc_event_log_count(ngpc_t*);
-NGPC_API uint32_t ngpc_get_event_log(ngpc_t*, ngpc_event_t* out, uint32_t n);
 
 /* -------------------------------------------------------------- hygiene --
  * What a ROM does that hardware tolerates but that is almost always a bug. ABI v13.

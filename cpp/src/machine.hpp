@@ -1719,17 +1719,13 @@ struct Machine {
     uint64_t z80_port_writes = 0;
     Apu apu;                     /* the T6W28 -- wired, see apu.hpp */
 
-    /* The APU write log. The T6W28 is modelled (core/apu.py) but not yet wired;
-     * until it is, every write aimed at it is RECORDED -- not just counted -- so
-     * that the audio chantier starts from what the real sound drivers actually
-     * do, rather than from an assumption about which door they use. */
-    static constexpr size_t kApuLogSize = 4096;
-    ngpc_apu_write_t apu_log[kApuLogSize] = {};
-    uint64_t apu_writes = 0;      /* TOTAL ever seen; the log holds the last 4096 */
-    uint64_t total_cycles = 0;    /* what the log timestamps against */
+    /* The APU is modelled (apu.hpp) but not yet wired; writes aimed at it are
+     * counted and timestamped against total_cycles. */
+    uint64_t apu_writes = 0;      /* total APU writes seen */
+    uint64_t total_cycles = 0;    /* cycle timestamp base */
 
     void log_apu_write(uint16_t address, uint8_t value, uint8_t kind) {
-        apu_log[apu_writes % kApuLogSize] = {total_cycles, address, value, kind};
+        (void)address; (void)value; (void)kind;
         ++apu_writes;
         ++z80_port_writes;
     }
@@ -2017,8 +2013,7 @@ struct Machine {
                     else
                         access_wait += cart_wait;
                 }
-                if (a >= rlog_lo && a <= rlog_hi) note_read(a, mem[a]);
-                return mem[a];
+                        return mem[a];
             }
             /* Silicon (cpu_calib_v2: CRND == RRND) says a cart DATA read costs the same
              * as RAM -- only the instruction FETCH is wait-stated. So data reads get
@@ -2039,7 +2034,6 @@ struct Machine {
              * N+1, same region, active display vs vblank). */
             access_wait += is_fetch ? cart_wait : cart_data_wait;
         }
-        if (a >= rlog_lo && a <= rlog_hi) note_read(a, mem[a]);   // disarmed by default
         if (hygiene_on) check_uninit_read(a);
         return mem[a];
     }
@@ -2071,65 +2065,13 @@ struct Machine {
         return true;
     }
 
-    /* Every path that lands a byte in memory must come through here, or the write log
-     * lies by omission. There are TWO such paths, and that is not an accident: the
-     * CPU's `store()` does its own region check because it must also feed the flash
-     * command latch and the Z80 control registers, so it writes `mem[]` directly. A
-     * log hooked only into `write8()` reported ZERO writes to a tilemap that was
-     * visibly changing -- an instrument that cannot fire is worse than none. */
     inline void note_write(uint32_t a, uint8_t v) { note_write_from(a, v, cpu.pc); }
 
-    /* Same, for a write that did NOT come from the main CPU.
-     *
-     * The Z80 writes the shared RAM straight into `mem[]` too, so the log was blind
-     * to it -- and the shared RAM is exactly where the two processors talk. Asking
-     * "does the sound driver ever answer?" returned a confident ZERO, from an
-     * instrument that could not fire. That is the SECOND time this log has lied by
-     * omission; see the note above about `store()`.
-     *
-     * A Z80 program counter is 16-bit and a main-CPU one is 24-bit, so they would be
-     * indistinguishable in the log. `kWlogZ80Pc` marks them: a reader that ignores
-     * the flag still sees a plausible address, which is precisely the failure we are
-     * refusing, so the flag is set OUTSIDE the 24-bit bus where it cannot be missed. */
-    static constexpr uint32_t kWlogZ80Pc = 0x80000000u;
-
     inline void note_write_from(uint32_t a, uint8_t v, uint32_t pc) {
-        if (a >= wlog_lo && a <= wlog_hi) {          // disarmed by default: lo > hi
-            wlog[wlog_count % kWlogSize] = {pc, a, v};
-            ++wlog_count;
-        }
-        if (a >= elog_lo && a <= elog_hi) note_event(kEventWrite, a, v, pc);
+        (void)v; (void)pc;
         if (hygiene_on) mark_ram_written(a);
     }
 
-    /* THE EVENT LOG -- WHEN in the frame did that happen?
-     *
-     * A write log says a register changed and who changed it. It cannot say the one
-     * thing that matters for raster work: at which SCANLINE and how far into it. A
-     * mid-frame scroll split, an HBlank HUD, a palette swap on line 100 -- all of
-     * them are correct or broken purely as a function of raster timing, and until
-     * now the only way to check was to guess.
-     *
-     * Every event carries its exact raster position, so the debugger can plot the
-     * frame as a scanline x cycle grid: one pixel per cycle, per line.
-     *
-     * Armed over an address window (the video registers, typically). Off by default. */
-    static constexpr uint8_t kEventWrite = 0;
-    static constexpr uint8_t kEventIrq   = 1;
-
-    struct EventRec {
-        uint32_t pc;
-        uint32_t addr;
-        uint16_t scanline;
-        uint16_t cycle;      /* cycles elapsed INTO that scanline */
-        uint8_t  value;
-        uint8_t  type;       /* kEventWrite / kEventIrq */
-    };
-    static constexpr uint32_t kElogSize = 4096;
-    uint32_t elog_lo = 1;        /* lo > hi  ==  logging off */
-    uint32_t elog_hi = 0;
-    uint64_t elog_count = 0;
-    EventRec elog[kElogSize] = {};
 
     /* THE HYGIENE COUNTERS -- what a ROM does that hardware tolerates but that is
      * almost always a bug.
@@ -2223,61 +2165,6 @@ struct Machine {
         uint8_t& cell = coverage[i >> 3];
         const uint8_t bit = uint8_t(1u << (i & 7));
         if (!(cell & bit)) { cell |= bit; ++coverage_hits; }
-    }
-
-    inline void note_event(uint8_t type, uint32_t a, uint8_t v, uint32_t pc) {
-        elog[elog_count % kElogSize] = {
-            pc, a, uint16_t(scanline), uint16_t(cycle_residue), v, type};
-        ++elog_count;
-    }
-
-    /* THE WRITE LOG -- who wrote here, and from what code?
-     *
-     * The native core had breakpoints on PC and nothing on memory, so the only way
-     * to ask "which routine filled this tilemap, and why did it stop" was to guess.
-     * This answers it: arm an address window, run, and read back (PC, address, value)
-     * for every write that landed inside it. It is the native half of the Python
-     * core's watchpoints, and it is the instrument this project's own method calls
-     * for -- trace, first anomaly, then disassemble THE GAME'S code.
-     *
-     * Off by default (lo > hi), so the hot path pays two compares and nothing else.
-     * The ring keeps the most recent kWlogSize writes; `wlog_count` is the TRUE total,
-     * so a caller can always tell that it missed some rather than quietly seeing a
-     * partial history. */
-    struct WriteRec { uint32_t pc; uint32_t addr; uint8_t value; };
-    static constexpr uint32_t kWlogSize = 8192;
-    uint32_t wlog_lo = 1;      /* lo > hi  ==  logging off */
-    uint32_t wlog_hi = 0;
-    uint64_t wlog_count = 0;   /* every write seen, even the ones the ring dropped */
-    WriteRec wlog[kWlogSize] = {};
-
-    /* THE READ LOG -- who READ this address?
-     *
-     * The mirror of the write log, and the half that was missing. "Which routine
-     * writes this?" was answerable; "which routine READS this?" was not, and that is
-     * the question you ask about a flag nobody seems to act on, or a table you think
-     * is dead. A debugger that can only watch writes can only see half of any
-     * conversation.
-     *
-     * ⚠️ INSTRUCTION FETCHES ARE NOT LOGGED. Every fetch goes through `read8`, so
-     * logging them all would bury the one data read you care about under thousands
-     * of fetches of the code doing the reading -- and arming a window over ROM would
-     * log essentially every instruction in it. Only reads from OUTSIDE the current
-     * fetch window are recorded, which is exactly the "the program loaded a value"
-     * event. Same test the cart wait-state accounting already uses.
-     *
-     * Off by default (lo > hi): the hot path pays two compares, like the write log. */
-    struct ReadRec { uint32_t pc; uint32_t addr; uint8_t value; };
-    static constexpr uint32_t kRlogSize = 8192;
-    mutable uint32_t rlog_lo = 1;      /* lo > hi  ==  logging off */
-    mutable uint32_t rlog_hi = 0;
-    mutable uint64_t rlog_count = 0;   /* every logged read, including ring-dropped */
-    mutable ReadRec rlog[kRlogSize] = {};
-
-    inline void note_read(uint32_t a, uint8_t v) const {
-        if ((a - fetch_window) < 8u) return;      /* an instruction fetch, not a data read */
-        rlog[rlog_count % kRlogSize] = {cpu.pc, a, v};
-        ++rlog_count;
     }
 
     /* THE CALL STACK -- "how did I get here?"

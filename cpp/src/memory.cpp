@@ -1297,8 +1297,6 @@ bool Machine::micro_dma_service(unsigned vector_index) {
                  * NOTHING on the lines where the split actually happens -- a silence that
                  * reads as "this game does no raster effect". It does; the CPU just is not
                  * the one doing it. Same window, same fields, `pc` = the DMA'd source. */
-                if (a >= elog_lo && a <= elog_hi)
-                    note_event(kEventWrite, a, mem[a], src + i);
             }
             switch (kind) {
                 case 0: dst += size; break;         /* (DMAD+) <- (DMAS)  */

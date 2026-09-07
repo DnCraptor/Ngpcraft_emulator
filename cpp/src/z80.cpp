@@ -75,7 +75,7 @@ static inline void z80_write(Machine& m, uint16_t addr, uint8_t v) {
         /* The shared RAM is where the two processors TALK. A write log that cannot
          * see the Z80's half of the conversation answers "does the sound driver ever
          * reply?" with a confident, wrong ZERO. */
-        m.note_write_from(a, v, Machine::kWlogZ80Pc | m.z80.pc);
+        m.note_write_from(a, v, m.z80.pc);
         return;
     }
     if (addr < 0x8000) {
@@ -88,7 +88,7 @@ static inline void z80_write(Machine& m, uint16_t addr, uint8_t v) {
     }
     if (addr < 0xC000) {
         m.mem[kZ80CommRegister] = v;
-        m.note_write_from(kZ80CommRegister, v, Machine::kWlogZ80Pc | m.z80.pc);
+        m.note_write_from(kZ80CommRegister, v, m.z80.pc);
         return;
     }
 
