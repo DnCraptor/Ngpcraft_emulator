@@ -74,6 +74,9 @@ static uint32_t load_first_rom(uint8_t *dst, uint32_t cap) {
 }
 
 extern "C" void video_show_trap(uint32_t status, uint32_t pc, uint32_t op, uint32_t frames);
+extern "C" void video_init_ngp(void);
+extern "C" void video_present_ngp(const uint16_t *src);
+
 extern "C" void emu_run(void) {
     // Two cartridge regions in PSRAM: [0,cap) live window, [cap,2*cap) pristine.
     // cap = half the PSRAM, capped at a 4 MiB cart (a 4 MiB cart needs 8 MiB PSRAM).
@@ -100,6 +103,8 @@ extern "C" void emu_run(void) {
 
     ngpc_reset(emu, NGPC_RESET_HANDOFF);
 
+    video_init_ngp();                               // palette + clear
+
     uint32_t fc = 0;
     while (true) {
         ngpc_summary_t s;
@@ -112,6 +117,7 @@ extern "C" void emu_run(void) {
                 gpio_put(PICO_DEFAULT_LED_PIN, 0); sleep_ms(700);
             }
         }
+        video_present_ngp(ngpc_framebuffer_ptr(emu));   // direct view, no 47 KB copy
         if ((++fc % 30u) == 0) gpio_xor_mask(1u << PICO_DEFAULT_LED_PIN);
     }
 }

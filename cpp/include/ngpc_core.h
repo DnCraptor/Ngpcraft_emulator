@@ -245,6 +245,7 @@ NGPC_API void        ngpc_rtc_advance(ngpc_t*, uint32_t seconds);
 #define NGPC_SCREEN_W 160
 #define NGPC_SCREEN_H 152
 NGPC_API uint32_t    ngpc_get_framebuffer(ngpc_t*, uint16_t* out, uint32_t max_pixels);
+NGPC_API const uint16_t* ngpc_framebuffer_ptr(ngpc_t*);   /* direct 160x152 view, no copy */
 
 /* -------------------------------------------------------------- hot path --
  * Run up to max_instrs. If out_records is NULL (or cap 0) the core runs in

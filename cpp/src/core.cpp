@@ -176,6 +176,11 @@ NGPC_API uint32_t ngpc_get_framebuffer(ngpc_t* h, uint16_t* out, uint32_t max_pi
     return want;
 }
 
+NGPC_API const uint16_t* ngpc_framebuffer_ptr(ngpc_t* h) {
+    if (!h) return nullptr;
+    return reinterpret_cast<Machine*>(h)->framebuffer;   // 160x152, valid after a frame
+}
+
 NGPC_API int ngpc_load_bios(ngpc_t* h, const uint8_t* data, size_t len) {
     if (!h || !data || len != 65536) return -1;
     Machine* m = reinterpret_cast<Machine*>(h);

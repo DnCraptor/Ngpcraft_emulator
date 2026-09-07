@@ -109,3 +109,39 @@ void video_show_trap(uint32_t status, uint32_t pc, uint32_t op, uint32_t frames)
     put_hex(16, 170, 3, frames, 4, 7);
     graphics_set_buffer(&fb[0][0], FB_W, FB_H_VIS);
 }
+
+
+// ── Seam 2: present the NGP framebuffer ──────────────────────────────────────
+// ngpc_get_framebuffer() gives 160x152 pixels, 12-bit 0BGR (R=bits0-3, G=4-7,
+// B=8-11). We map each to an RGB332 index (256-entry palette set once) and blit
+// centred, 1:1, into the 320x240 scanout buffer. Lossy (12->8 bit) but no core
+// change; a palette-index path for full fidelity can come later.
+void video_init_ngp(void) {
+    // RGB232 in indices 0..127 only. The HDMI driver reserves 240..255 (control),
+    // 184..237 (data island, when audio is on) and uses bit 0x40 for dither, so a
+    // full 256-entry palette lands in slots whose conv_color is never rebuilt --
+    // that is the "colour table" corruption. 0..127 is below all of that.
+    for (int i = 0; i < 128; i++) {
+        uint8_t r2 = (i >> 5) & 3, g3 = (i >> 2) & 7, b2 = i & 3;
+        uint8_t r8 = (uint8_t)(r2 * 255 / 3), g8 = (uint8_t)(g3 * 255 / 7), b8 = (uint8_t)(b2 * 255 / 3);
+        graphics_set_palette((uint8_t)i, ((uint32_t)r8 << 16) | ((uint32_t)g8 << 8) | b8);
+    }
+    for (int y = 0; y < FB_H_ALLOC; y++) for (int x = 0; x < FB_W; x++) fb[y][x] = 0;  // black border
+    graphics_set_buffer(&fb[0][0], FB_W, FB_H_VIS);
+}
+
+void video_present_ngp(const uint16_t *src) {
+    const int OX = (FB_W - 160) / 2;        // 80
+    const int OY = (FB_H_VIS - 152) / 2;    // 44
+    for (int y = 0; y < 152; y++) {
+        uint8_t *dst = &fb[OY + y][OX];
+        const uint16_t *s = &src[y * 160];
+        for (int x = 0; x < 160; x++) {
+            uint16_t p = s[x];
+            uint8_t r2 = (uint8_t)((p & 0x0F) >> 2);          // top 2 of R4
+            uint8_t g3 = (uint8_t)(((p >> 4) & 0x0F) >> 1);   // top 3 of G4
+            uint8_t b2 = (uint8_t)(((p >> 8) & 0x0F) >> 2);   // top 2 of B4
+            dst[x] = (uint8_t)((r2 << 5) | (g3 << 2) | b2);   // 0..127
+        }
+    }
+}
