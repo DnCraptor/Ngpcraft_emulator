@@ -620,6 +620,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
 
         const bool want_record = out_records && s.emitted < records_cap;
         ngpc_record_t* rec = want_record ? &out_records[s.emitted] : &scratch;
+        m->recording = want_record;
 
         const uint32_t pc_before = m->cpu.pc;
         if (m->coverage_on) m->note_exec(pc_before);

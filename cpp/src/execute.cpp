@@ -56,8 +56,9 @@ static inline void finish(ngpc_record_t* rec, const Machine& m, uint32_t pc,
     rec->raw_len = len;
     /* Raw bytes are for the log only, so read the memory image directly -- going
      * through read8() would double-charge the cart wait-state the decode already paid. */
-    for (uint8_t i = 0; i < len && i < NGPC_MAX_RAW; ++i)
-        rec->raw[i] = m.mem[(pc + i) & kAddrMask];
+    if (m.recording)
+        for (uint8_t i = 0; i < len && i < NGPC_MAX_RAW; ++i)
+            rec->raw[i] = m.mem[(pc + i) & kAddrMask];
     rec->next_pc = m.cpu.pc;
     rec->cycles = cycles;
     rec->status = NGPC_OK;
@@ -118,7 +119,7 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
         for (uint8_t i = 0; i < size; ++i)
             if (m.flash_command(addr + i, uint8_t(value >> (8 * i)))) consumed = true;
         if (consumed) {
-            if (rec && rec->n_writes < NGPC_MAX_ACCESS) {
+            if (rec && m.recording && rec->n_writes < NGPC_MAX_ACCESS) {
                 ngpc_access_t& a = rec->writes[rec->n_writes++];
                 a.address = addr; a.size = size; a.discarded = 1;
                 for (uint8_t i = 0; i < size; ++i) a.data[i] = uint8_t(value >> (8 * i));
@@ -190,7 +191,7 @@ void store(Machine& m, ngpc_record_t* rec, uint32_t addr, uint32_t value, uint8_
     if (!writable && m.hygiene_on && region_of(addr) == Region::Unmapped)
         m.note_lost_write(addr);
 
-    if (rec && rec->n_writes < NGPC_MAX_ACCESS) {
+    if (rec && m.recording && rec->n_writes < NGPC_MAX_ACCESS) {
         ngpc_access_t& a = rec->writes[rec->n_writes++];
         a.address = addr;
         a.size = size;
@@ -217,7 +218,7 @@ uint8_t step(Machine& m, ngpc_record_t* rec) {
     const uint32_t pc = c.pc;
     const uint8_t op = m.read8(pc);
 
-    if (rec) std::memset(rec, 0, sizeof(*rec));
+    if (rec && m.recording) std::memset(rec, 0, sizeof(*rec));
 
     switch (op) {
         case 0x00: {  // nop
