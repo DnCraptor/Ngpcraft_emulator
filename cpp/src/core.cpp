@@ -939,14 +939,22 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
         /* Frame pacing and the peripherals live in the core, not across the FFI
          * seam (CPP_CORE_PORT.md §4 hazard 4): crossing it per instruction costs
          * 292 ns and would erase the whole speedup. */
-        advance_raster(*m, rec->cycles);
-        m->adc_tick(rec->cycles);
-        m->rtc_step(rec->cycles);
-        m->timer_tick(rec->cycles);
-        m->serial_tick(rec->cycles);
-        z80_tick(*m, rec->cycles);
-        m->apu.tick(rec->cycles);
-        if (m->watchdog_tick(rec->cycles) && note_watchdog(*m, s, pc_before)) break;
+        advance_raster(*m, rec->cycles);   // per-instruction: raster/render timing
+        /* Peripherals advance by cycles and accumulate internally, so batch them a
+         * scanline at a time instead of once per instruction. Removes ~6 calls +
+         * apu.tick's two divisions from the hot path; IRQ sources (timer/serial)
+         * now fire on a scanline grain, delivered within one line by deliver_irq. */
+        m->peri_accum += rec->cycles;
+        if (m->peri_accum >= kCyclesPerScanline) {
+            const uint32_t pc = m->peri_accum; m->peri_accum = 0;
+            m->adc_tick(pc);
+            m->rtc_step(pc);
+            m->timer_tick(pc);
+            m->serial_tick(pc);
+            z80_tick(*m, pc);
+            m->apu.tick(pc);
+            if (m->watchdog_tick(pc) && note_watchdog(*m, s, pc_before)) break;
+        }
 
         /* ...and so does interrupt delivery, BETWEEN instructions. */
         if (m->irq_pending && deliver_irq(*m)) {

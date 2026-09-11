@@ -2166,6 +2166,7 @@ struct Machine {
 
     bool coverage_on = false;
     bool recording    = false;   // build the per-instruction diagnostic record?
+    uint32_t peri_accum = 0;     // cycles batched before ticking the peripherals
     uint32_t coverage_hits = 0;                  /* distinct addresses executed */
     std::vector<uint8_t> coverage;               /* allocated on first enable */
 
