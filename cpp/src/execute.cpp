@@ -213,7 +213,7 @@ static inline uint32_t pop32(Machine& m) {
 /* Execute exactly one instruction. Returns an ngpc_status_t. On any status
  * other than NGPC_OK the CPU state is left UNTOUCHED — the machine stops where
  * it is, so the trap names the real offender. */
-uint8_t step(Machine& m, ngpc_record_t* rec) {
+uint8_t NGPC_HOT step(Machine& m, ngpc_record_t* rec) {
     ngpc_cpu_t& c = m.cpu;
     const uint32_t pc = c.pc;
     const uint8_t op = m.read8(pc);

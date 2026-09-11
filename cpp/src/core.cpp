@@ -1051,7 +1051,7 @@ NGPC_API int ngpc_run(ngpc_t* h, uint32_t max_instrs,
     return 0;
 }
 
-NGPC_API int ngpc_run_frames(ngpc_t* h, uint32_t frames, uint32_t max_instrs,
+NGPC_API int NGPC_HOT ngpc_run_frames(ngpc_t* h, uint32_t frames, uint32_t max_instrs,
                              ngpc_summary_t* out_summary) {
     if (!h) return -1;
     Machine* m = reinterpret_cast<Machine*>(h);

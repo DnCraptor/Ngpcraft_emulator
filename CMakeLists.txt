@@ -90,6 +90,7 @@ add_library(ngpc_core STATIC
     cpp/src/render.cpp)
 target_include_directories(ngpc_core PUBLIC cpp/include PRIVATE cpp/src)
 target_compile_options(ngpc_core PRIVATE -fno-exceptions -fno-rtti -O2)
+target_compile_definitions(ngpc_core PRIVATE NGPC_HOT_IN_RAM)   # hottest code -> SRAM
 # ⚠ SEAM 1 NOT YET DONE: Machine() allocates a flat 16 MB `mem` vector, which
 # cannot fit RP2350 SRAM — ngpc_create() will fail until read8/write8 are moved
 # to region dispatch (RAM/VRAM/IO/BIOS in SRAM, cart ROM in PSRAM). That is why

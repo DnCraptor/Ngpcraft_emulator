@@ -1,8 +1,7 @@
 MEMORY
 {
     INCLUDE "pico_flash_region.ld"
-    RAM_128K(rwx)          : ORIGIN = 0x20000000, LENGTH = 128k
-    RAM(rwx)               : ORIGIN = 0x20020000, LENGTH = 384k
+    RAM(rwx)               : ORIGIN = 0x20000000, LENGTH = 512k
     SCRATCH_X(rwx)         : ORIGIN = 0x20080000, LENGTH = 4k
     SCRATCH_Y(rwx)         : ORIGIN = 0x20081000, LENGTH = 4k
 }
@@ -117,7 +116,7 @@ SECTIONS
         . = ALIGN(4);
         *(.ram_128k*)
         . = ALIGN(4);
-    } > RAM_128K
+    } > RAM
 
     .ram_vector_table (NOLOAD): {
         *(.ram_vector_table)

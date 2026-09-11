@@ -20,6 +20,15 @@
 #include "apu.hpp"
 #include "z80.hpp"
 
+/* On RP2350 the hottest interpreter code is placed in SRAM (.time_critical -> RAM)
+ * so it neither misses the 8 KB XIP cache nor evicts cart data from it. No-op on
+ * desktop. Enabled by -DNGPC_HOT_IN_RAM for the on-device build. */
+#ifdef NGPC_HOT_IN_RAM
+#define NGPC_HOT __attribute__((section(".time_critical.ngpc")))
+#else
+#define NGPC_HOT
+#endif
+
 namespace ngpc {
 
 constexpr uint32_t kAddrMask = 0x00FFFFFF;   /* 24-bit address space */
